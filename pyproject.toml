@@ -129,7 +129,7 @@ dependencies = [
     # Muse Glimmer target registration and live KV snapshots on mlx-lm 0.32
     # (PR 11), and Muse Glimmer prefix snapshots (PR 5).
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c1dc1548a446417602ac16c5e719a18efbbfadd0",
-    "markitdown[pdf,docx,pptx]==0.1.7",
+    "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
 [project.optional-dependencies]
