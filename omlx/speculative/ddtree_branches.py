@@ -481,6 +481,9 @@ def plan_tree_cycle(gen_batch: Any, state: Any, spec: dict):
             capture_layer_ids=bg._drafter_capture_ids(model),
             skip_logits=bg._verify_skip_logits(gen_batch),
         )
+    if coordinator is not None:
+        # Peer choices are host constants, so they do not evaluate the lazy target.
+        mx.eval(logits, hidden)
     if not greedy:
         # Rank zero walks the target distribution over the verified rows; one bounded
         # decision (row, accepted count, bonus) is shared with every rank.

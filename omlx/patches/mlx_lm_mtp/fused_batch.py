@@ -219,6 +219,9 @@ def _tree_group(batch, depth, rows, replacements, cache, draft_jobs, drafter):
             capture_layer_ids=bg._drafter_capture_ids(model),
             skip_logits=all(bg._verify_skip_logits(row) for _, row, _ in rows),
         )
+    if coordinator is not None:
+        # Finish expert collectives before broadcasting the owner's branch choice.
+        mx.eval(logits, hidden)
     decision = [[0, 0, 0] for _ in range(count)]
     if coordinator is None or coordinator.rank == 0:
         lp = bg._logprobs(logits)

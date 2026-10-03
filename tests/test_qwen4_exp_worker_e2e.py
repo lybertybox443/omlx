@@ -124,6 +124,7 @@ def served(
     trace_cohort=False,
     trace_image_cohort=False,
     trace_native_mtp=False,
+    trace_dflash_draft=False,
     expert_parallel_size=1,
 ):
     import os
@@ -147,6 +148,18 @@ def served(
         argv.append("--prompt-cache-ssd")
     size = len(ranges)
     environment = {}
+    if trace_dflash_draft:
+        injection = tmp_path / "trace-worker"
+        injection.mkdir(exist_ok=True)
+        _append_text(injection / "sitecustomize.py",
+            "from omlx.cluster.dflash import SharedDFlash\n"
+            "original_draft = SharedDFlash.draft\n"
+            "def traced_draft(self, jobs, *args, **kwargs):\n"
+            "    result = original_draft(self, jobs, *args, **kwargs)\n"
+            "    if self.rank == 0: print('EP_DFLASH_DRAFT', len(jobs), flush=True)\n"
+            "    return result\n"
+            "SharedDFlash.draft = traced_draft\n")
+        environment["PYTHONPATH"] = str(injection) + os.pathsep + os.environ.get("PYTHONPATH", "")
     if trace_native_mtp:
         injection = tmp_path / "trace-worker"
         injection.mkdir(exist_ok=True)
