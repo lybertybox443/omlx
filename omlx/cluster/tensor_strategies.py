@@ -52,6 +52,11 @@ NEMOTRON_H = TensorStrategy(
     model_types=("nemotron_h",),
     source="oMLX adapter derived from Exo's attention/Mamba/MoE strategy",
 )
+QWEN4_EXP = TensorStrategy(
+    name="qwen4_exp",
+    model_types=("qwen4_exp", "qwen4_exp_text"),
+    source="oMLX adapter: GDN/QSA/MoE sharding; PLE and QSA indexer replicated",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -620,6 +625,138 @@ def _shard_nemotron_h(
         )
 
 
+def _qwen4_attr(obj: Any, *names: str) -> str:
+    for name in names:
+        if hasattr(obj, name):
+            return name
+    raise RuntimeError(f"qwen4_exp {type(obj).__name__} lacks any of {names}")
+
+
+def _shard_qwen4_exp_preflight(layers: list[Any], size: int, rank: int = 0) -> None:
+    """Validate every layer before any mutation so failure leaves the model intact."""
+
+    if size <= 0:
+        raise ValueError(f"group size ({size}) must be positive")
+    if not 0 <= rank < size:
+        raise ValueError(f"rank ({rank}) must be in [0, {size})")
+    for layer in layers:
+        if layer.is_linear:
+            attn = layer.linear_attn
+            _require_divisible(attn.num_k_heads, size, "linear key heads")
+            _require_divisible(attn.num_v_heads, size, "linear value heads")
+        else:
+            attn = layer.self_attn
+            _require_divisible(attn.num_attention_heads, size, "attention heads")
+            _require_divisible(attn.num_key_value_heads, size, "KV heads")
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp") and hasattr(mlp, "shared_expert"):
+            _require_divisible(
+                int(mlp.switch_mlp.gate_proj.weight.shape[1]), size, "MoE intermediate"
+            )
+            _require_divisible(
+                int(mlp.shared_expert.gate_proj.weight.shape[0]),
+                size,
+                "shared expert intermediate",
+            )
+
+
+@_register(QWEN4_EXP)
+def _shard_qwen4_exp(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_inplace, shard_linear
+
+    _, layers = _common_layer_owner(model)
+    layers = list(layers)
+    size = int(group.size())
+    rank = int(group.rank())
+    total = len(layers)
+    _shard_qwen4_exp_preflight(layers, size, rank)
+    for index, layer in enumerate(layers):
+        # PLE (resident or mmap-backed) stays replicated: admission is owned
+        # by the loader and rank-local rewiring is not applied here.
+        if layer.is_linear:
+            attn = layer.linear_attn
+            key_dim = int(attn.key_dim)
+            value_dim = int(attn.value_dim)
+            attn.in_proj_qkv = shard_linear(
+                attn.in_proj_qkv,
+                "all-to-sharded",
+                segments=[key_dim, 2 * key_dim],
+                group=group,
+            )
+            for name in ("in_proj_z", "in_proj_b", "in_proj_a"):
+                setattr(
+                    attn,
+                    name,
+                    shard_linear(getattr(attn, name), "all-to-sharded", group=group),
+                )
+            attn.out_proj = shard_linear(attn.out_proj, "sharded-to-all", group=group)
+            key_shard = key_dim // size
+            value_shard = value_dim // size
+            indices = mx.concatenate(
+                [
+                    mx.arange(rank * key_shard, (rank + 1) * key_shard),
+                    mx.arange(
+                        key_dim + rank * key_shard, key_dim + (rank + 1) * key_shard
+                    ),
+                    mx.arange(
+                        2 * key_dim + rank * value_shard,
+                        2 * key_dim + (rank + 1) * value_shard,
+                    ),
+                ]
+            )
+            attn.conv1d.weight = mx.contiguous(attn.conv1d.weight[indices])
+            if getattr(attn.conv1d, "bias", None) is not None:
+                attn.conv1d.bias = mx.contiguous(attn.conv1d.bias[indices])
+            attn.conv1d.groups = key_shard * 2 + value_shard
+            heads = attn.num_v_heads // size
+            attn.A_log = mx.contiguous(attn.A_log[rank * heads : (rank + 1) * heads])
+            attn.dt_bias = mx.contiguous(
+                attn.dt_bias[rank * heads : (rank + 1) * heads]
+            )
+            attn.num_k_heads //= size
+            attn.num_v_heads //= size
+            attn.key_dim = key_shard
+            attn.value_dim = value_shard
+            attn.conv_dim = key_shard * 2 + value_shard
+        else:
+            attn = layer.self_attn
+            for name in ("q_proj", "k_proj", "v_proj"):
+                setattr(
+                    attn,
+                    name,
+                    shard_linear(getattr(attn, name), "all-to-sharded", group=group),
+                )
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            for name in ("num_attention_heads", "num_key_value_heads"):
+                setattr(attn, name, getattr(attn, name) // size)
+            # QSA indexer intentionally replicated: its keep-mask must be
+            # identical on every rank.
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp") and hasattr(mlp, "shared_expert"):
+            for name, sharding in (
+                ("gate_proj", "all-to-sharded"),
+                ("down_proj", "sharded-to-all"),
+                ("up_proj", "all-to-sharded"),
+            ):
+                shard_inplace(getattr(mlp.switch_mlp, name), sharding, group=group)
+                shard_inplace(getattr(mlp.shared_expert, name), sharding, group=group)
+            layer.mlp = _wrap_sharded_moe(mlp, group, mx)
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=QWEN4_EXP.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
@@ -647,6 +784,7 @@ def apply_tensor_strategy(
 __all__ = [
     "NEMOTRON_H",
     "QWEN3_NEXT",
+    "QWEN4_EXP",
     "TensorStrategy",
     "apply_tensor_strategy",
     "native_shard_is_layer_local",

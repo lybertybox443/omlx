@@ -1836,7 +1836,9 @@ def main() -> int:
             mx.clear_cache()
             before = mx.get_active_memory()
             with install_pipeline_compatibility(assignments):
-                stage_model, _tokenizer = progressive_sharded_load(options.checkpoint)
+                stage_model, _tokenizer = progressive_sharded_load(
+                    options.checkpoint, pipeline_group=group
+                )
             mx.eval(stage_model.parameters())
             loader_evidence = {
                 "active_bytes_after_stage_load": mx.get_active_memory() - before,

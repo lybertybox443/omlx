@@ -118,3 +118,95 @@ def test_uneven_switch_mlp_shard_shapes():
     assert rank1.fc2.weight.shape[-1] == 112
     # No dropped groups.
     assert rank0.fc2.scales.shape[-1] + rank1.fc2.scales.shape[-1] == 29
+
+
+class _FakeGroup:
+    def __init__(self, size, rank):
+        self._s, self._r = size, rank
+
+    def size(self):
+        return self._s
+
+    def rank(self):
+        return self._r
+
+
+def _qwen4_layers():
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    return model, list(model.model.layers)
+
+
+def _patch_collectives(monkeypatch):
+    import mlx.nn.layers.distributed as d
+
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, *a, **k: x)
+    monkeypatch.setattr(d, "sum_gradients", lambda group: (lambda x: x))
+
+
+def test_qwen4_exp_registered_and_preflight_real_layers():
+    from omlx.cluster import tensor_strategies as ts
+
+    assert {"qwen4_exp", "qwen4_exp_text"} <= ts.registered_model_types()
+    _, layers = _qwen4_layers()
+    ts._shard_qwen4_exp_preflight(layers, 2, 1)
+    for size, rank in ((0, 0), (2, 2), (2, -1)):
+        with pytest.raises(ValueError):
+            ts._shard_qwen4_exp_preflight(layers, size, rank)
+    with pytest.raises(ValueError, match="linear key heads"):
+        ts._shard_qwen4_exp_preflight(layers, 4)
+
+
+def test_qwen4_exp_preflight_rejects_late_layer_before_mutation(monkeypatch):
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model, layers = _qwen4_layers()
+    layers[1].mlp.switch_mlp.gate_proj.weight = mx.zeros((4, 15, 32))
+    before = layers[0].linear_attn.in_proj_qkv.weight.shape
+    with pytest.raises(ValueError, match="MoE intermediate"):
+        ts._shard_qwen4_exp(model, _FakeGroup(2, 0), mx, None)
+    attn = layers[0].linear_attn
+    assert attn.in_proj_qkv.weight.shape == before
+    assert (attn.num_k_heads, attn.num_v_heads) == (2, 4)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_qwen4_exp_real_shard_dimensions_and_forward(monkeypatch, rank):
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model, layers = _qwen4_layers()
+    gdn, att = layers[0].linear_attn, layers[1].self_attn
+    qkv = mx.array(gdn.in_proj_qkv.weight)
+    conv = mx.array(gdn.conv1d.weight)
+    indexer = att.indexer
+    ts._shard_qwen4_exp(model, _FakeGroup(2, rank), mx, None)
+    # key_dim=16, value_dim=32 -> local 8/16, conv 8+8+16
+    assert (gdn.num_k_heads, gdn.num_v_heads) == (1, 2)
+    assert (gdn.key_dim, gdn.value_dim, gdn.conv_dim) == (8, 16, 32)
+    assert gdn.in_proj_qkv.weight.shape == (32, 32)
+    assert gdn.conv1d.weight.shape[0] == 32 and gdn.conv1d.groups == 32
+    assert gdn.A_log.shape == (2,) and gdn.dt_bias.shape == (2,)
+    expect = mx.concatenate(
+        [qkv[rank * 8:(rank + 1) * 8], qkv[16 + rank * 8:16 + (rank + 1) * 8],
+         qkv[32 + rank * 16:32 + (rank + 1) * 16]]
+    )
+    assert mx.array_equal(gdn.in_proj_qkv.weight, expect)
+    assert mx.array_equal(gdn.conv1d.weight[:8], conv[rank * 8:(rank + 1) * 8])
+    assert (att.num_attention_heads, att.num_key_value_heads) == (2, 1)
+    assert att.q_proj.weight.shape[0] == 2 * 2 * 8  # q+gate per local head
+    assert att.k_proj.weight.shape[0] == 8
+    assert att.indexer is indexer
+    assert indexer.index_qk_proj.weight.shape[1] == 32
+    mlp = layers[0].mlp
+    assert type(mlp).__name__ == "ShardedMoE"
+    assert mlp.inner.switch_mlp.gate_proj.weight.shape[1] == 8
+    assert mlp.inner.shared_expert.gate_proj.weight.shape[0] == 8
+    out = gdn(mx.random.normal((1, 3, 32)))
+    mx.eval(out)
+    assert out.shape == (1, 3, 32)
