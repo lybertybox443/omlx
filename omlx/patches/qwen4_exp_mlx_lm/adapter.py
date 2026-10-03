@@ -318,7 +318,13 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
             ),
             install_mtp_sampling(model, mlx_server, options),
             install_vision_serving(model, provider, mlx_server),
-            install_specprefill_serving(model, provider, mlx_server, options),
+            install_specprefill_serving(
+                model,
+                provider,
+                mlx_server,
+                options,
+                group=getattr(provider, "_omlx_world_group", None),
+            ),
         ):
             yield
 

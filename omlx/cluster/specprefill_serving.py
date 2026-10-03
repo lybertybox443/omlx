@@ -37,7 +37,7 @@ class _UncachedPrompt:
 
 
 @contextmanager
-def install_specprefill_serving(model, provider, server, options):
+def install_specprefill_serving(model, provider, server, options, *, group=None):
     if not options.get("specprefill_draft_model"):
         yield
         return
@@ -56,7 +56,9 @@ def install_specprefill_serving(model, provider, server, options):
     original_sampler = server._make_sampler
     from .mtp_coordination import MTPRankCoordinator
 
-    coordinator = MTPRankCoordinator(mx.distributed.init())
+    coordinator = MTPRankCoordinator(
+        group if group is not None else mx.distributed.init()
+    )
     active = None
     scorer = None
 
