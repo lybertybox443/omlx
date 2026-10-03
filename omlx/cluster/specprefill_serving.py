@@ -206,10 +206,11 @@ def install_specprefill_serving(model, provider, server, options, *, group=None)
             yield from original_generate(*args, **kwargs)
             return
         tokens, started = active
-        drafter = getattr(
-            getattr(model, "language_model", None), "_omlx_drafter", None
-        )
-        if drafter is not None:
+        language = getattr(model, "language_model", None)
+        if (
+            getattr(language, "_omlx_drafter", None) is not None
+            or getattr(language, "_omlx_mtp_decode_enabled", False) is True
+        ):
             from .mtp_stream import stream_mtp
 
             generate_fn = stream_mtp

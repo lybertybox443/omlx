@@ -202,8 +202,6 @@ def runtime_settings(settings):
     """Serializable request policy, separate from inspected memory accounting."""
     if not getattr(settings, "specprefill_enabled", False):
         return {}
-    if getattr(settings, "mtp_enabled", False):
-        raise ValueError("distributed SpecPrefill cannot be combined with MTP")
     path = getattr(settings, "specprefill_draft_model", None)
     if not isinstance(path, str) or not path.strip():
         raise ValueError("SpecPrefill requires a draft model path")

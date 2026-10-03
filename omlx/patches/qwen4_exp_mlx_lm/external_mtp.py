@@ -12,11 +12,7 @@ def runtime_settings(settings):
         raise ValueError("vlm_mtp_enabled must be a boolean")
     if not enabled:
         return {}
-    for name in (
-        "mtp_enabled",
-        "dflash_enabled",
-        "specprefill_enabled",
-    ):
+    for name in ("mtp_enabled", "dflash_enabled"):
         if getattr(settings, name, False):
             raise ValueError(f"distributed VLM MTP cannot be combined with {name}")
     path = getattr(settings, "vlm_mtp_draft_model", None)

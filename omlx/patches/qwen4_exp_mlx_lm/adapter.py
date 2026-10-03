@@ -152,8 +152,6 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
                 value = options[key]
                 if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                     raise ValueError("invalid SpecPrefill reservation")
-            if enabled:
-                raise ValueError("distributed SpecPrefill cannot be combined with MTP")
             from types import SimpleNamespace
 
             from omlx.cluster.specprefill import runtime_settings
@@ -212,8 +210,6 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
                         "external MTP requires an approved memory reservation"
                     )
                 expected.add(key)
-            if draft_keys.intersection(options):
-                raise ValueError("external MTP cannot be combined with SpecPrefill")
         if set(options) != expected or not isinstance(enabled, bool):
             raise ValueError("invalid Qwen4-Exp runtime options")
         mode = options.get("ple_mode")

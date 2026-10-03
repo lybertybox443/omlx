@@ -8,7 +8,11 @@ from omlx.cluster import mtp_coordination, mtp_stream, planner, specprefill, spe
 from omlx.patches import specprefill as patch
 
 
-def test_install_specprefill_serving_sparse_capture_single(monkeypatch):
+import pytest
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_install_specprefill_serving_sparse_capture_single(monkeypatch, native):
     group = NS(rank=lambda: 0, size=lambda: 1)
     monkeypatch.setattr(
         mtp_coordination,
@@ -42,7 +46,12 @@ def test_install_specprefill_serving_sparse_capture_single(monkeypatch):
         "specprefill_draft_model": "stub",
     }
     provider = NS(tokenizer=None, cli_args=NS(trust_remote_code=False, prefill_step_size=3))
-    model = NS(language_model=NS(_omlx_drafter=NS(window=4, sink_size=2)))
+    language = (
+        NS(_omlx_mtp_decode_enabled=True)
+        if native
+        else NS(_omlx_drafter=NS(window=4, sink_size=2))
+    )
+    model = NS(language_model=language)
     previous_hook = object()
     model._omlx_dflash_prefill_capture = previous_hook
     sentinel = NS(cache=["cache"])
@@ -67,10 +76,10 @@ def test_install_specprefill_serving_sparse_capture_single(monkeypatch):
     def sparse_prefill(model, tokens, positions, cache, **kw):
         positions = [int(p) for p in positions.tolist()] if hasattr(positions, "tolist") else list(positions)
         positions_seen.append(positions)
+        hook = getattr(model, "_omlx_dflash_prefill_capture", None)
         for chunk in (positions[:3], positions[3:]):
-            model._omlx_dflash_prefill_capture(
-                [mx.array(chunk)[None, :, None]], len(chunk)
-            )
+            if callable(hook):
+                hook([mx.array(chunk)[None, :, None]], len(chunk))
 
     class Gen:
         def _tokenize(self, *a, **kw):
@@ -83,7 +92,7 @@ def test_install_specprefill_serving_sparse_capture_single(monkeypatch):
             return obj
 
         def _serve_single(self, request, stream):
-            seen["sparse"] = model._omlx_dflash_sparse_prefill
+            seen["sparse"] = getattr(model, "_omlx_dflash_sparse_prefill", None)
             seen["hook"] = model._omlx_dflash_prefill_capture
             responses.extend(
                 server.stream_generate(
@@ -118,10 +127,14 @@ def test_install_specprefill_serving_sparse_capture_single(monkeypatch):
         )
 
     assert result == "OK"
-    assert positions_seen[0] == [0, 1, 3, 6, 7, 8]
-    assert seen["sparse"]["prefix_length"] == 9
-    assert seen["sparse"]["positions"] == [0, 1, 3, 6, 7, 8]
-    assert seen["sparse"]["captured"][0][:, :, 0].tolist() == [[0, 1, 3, 6, 7, 8]]
+    if native:
+        assert positions_seen[0] == [0, 3, 6]
+        assert seen["sparse"] is None
+    else:
+        assert positions_seen[0] == [0, 1, 3, 6, 7, 8]
+        assert seen["sparse"]["prefix_length"] == 9
+        assert seen["sparse"]["positions"] == [0, 1, 3, 6, 7, 8]
+        assert seen["sparse"]["captured"][0][:, :, 0].tolist() == [[0, 1, 3, 6, 7, 8]]
     assert calls[0]["prompt"] == [9]
     assert calls[0]["prompt_prefix"] == list(range(9))
     assert calls[0]["logits_processors"][0] is processor

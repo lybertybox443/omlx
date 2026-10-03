@@ -229,7 +229,6 @@ def test_route_reserves_inspected_draft_for_requested_context(monkeypatch):
 @pytest.mark.parametrize(
     "change",
     [
-        {"mtp_enabled": True},
         {"specprefill_keep_pct": float("nan")},
         {"specprefill_keep_pct": 0},
         {"specprefill_threshold": True},

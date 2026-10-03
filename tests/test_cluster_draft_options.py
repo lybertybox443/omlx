@@ -40,7 +40,10 @@ def test_runtime_options_are_portable_and_strict(resolve, enabled, path):
         compatible = (
             "turboquant_kv_enabled" in (enabled, other)
             and "specprefill_enabled" not in (enabled, other)
-        ) or {enabled, other} == {"dflash_enabled", "specprefill_enabled"}
+        ) or {enabled, other} in (
+            {"dflash_enabled", "specprefill_enabled"},
+            {"vlm_mtp_enabled", "specprefill_enabled"},
+        )
         if other != enabled and not compatible:
             with pytest.raises(ValueError, match="combined"):
                 resolve(SimpleNamespace(**{**values, other: True}))
@@ -129,6 +132,23 @@ def test_compressed_cache_composes_with_one_speculative_strategy(draft):
     assert options[draft] is True
     assert options["turboquant_kv_enabled"] is True
     assert options["turboquant_kv_bits"] == 3.5
+
+
+def test_external_mtp_composes_with_specprefill():
+    from omlx.cluster.specprefill import runtime_settings as spec_settings
+
+    settings = SimpleNamespace(
+        vlm_mtp_enabled=True,
+        vlm_mtp_draft_model="draft",
+        specprefill_enabled=True,
+        specprefill_draft_model="scorer",
+    )
+    mtp = mtp_settings(settings)
+    spec = spec_settings(settings)
+    assert mtp["vlm_mtp_enabled"] is True
+    assert mtp["vlm_mtp_draft_model"] == "draft"
+    assert spec["specprefill_draft_model"] == settings.specprefill_draft_model
+    assert spec["specprefill_draft_model"] == "scorer"
 
 
 @pytest.mark.parametrize("skip", [False, True])

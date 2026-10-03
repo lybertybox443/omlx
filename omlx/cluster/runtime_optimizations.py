@@ -465,10 +465,18 @@ def install_runtime_optimizations(
         local_state.pending_prefill_sends = []
         local_state.inflight_prefill_sends = []
 
+        capturing = callable(getattr(model, "_omlx_dflash_prefill_capture", None))
+
         def forward(callback, *args, **kwargs):
+            if capturing and not async_capture:
+                # Hidden captures perform collectives before a queued send can flush.
+                return callback(*args, **kwargs)
             local_state.queue_prefill_sends = True
             try:
-                result = callback(*args, **kwargs)
+                with ExitStack() as scopes:
+                    if capturing:
+                        scopes.enter_context(boundary_capture())
+                    result = callback(*args, **kwargs)
             finally:
                 local_state.queue_prefill_sends = False
             flush_prefill_sends()

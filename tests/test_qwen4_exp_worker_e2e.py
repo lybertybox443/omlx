@@ -1313,3 +1313,90 @@ def test_dflash_ddtree_concurrent_penalized_requests_match_linear_deployment(
         for line in output.splitlines()
     ), output[-800:]
 
+
+
+@pytest.mark.parametrize(
+    "draft,async_capture",
+    [("native", False), ("external", False), ("dflash", False),
+     ("ddtree", False), ("dflash", True), ("ddtree", True)],
+)
+def test_specprefill_speculative_http_matches_sparse_baseline(
+    mtp_checkpoint, dflash_checkpoint, tmp_path, draft, async_capture
+):
+    """Speculation after sparse prefill must equal the sparse greedy baseline."""
+    from types import SimpleNamespace
+
+    from mlx_lm.utils import load_tokenizer
+
+    from omlx.cluster.dflash import runtime_settings as dflash_settings
+    from omlx.cluster.planner import inspect_safetensors_layout
+    from omlx.cluster.specprefill import DraftReservation
+
+    tokenizer = load_tokenizer(Path(mtp_checkpoint))
+    repeats = next(
+        n for n in range(8, 200)
+        if len(tokenizer.encode(" ".join([PROMPTS[0]] * n))) > 300
+    )
+    prompt = " ".join([PROMPTS[0]] * repeats)
+    assert 256 < len(tokenizer.encode(prompt)) < 1024
+    reservation = DraftReservation.from_layout(
+        inspect_safetensors_layout(mtp_checkpoint),
+        max_prompt_tokens=1024, workspace_bytes=1024**3,
+    )
+    sparse = dict(
+        specprefill_draft_model=str(mtp_checkpoint),
+        specprefill_max_prompt_tokens=1024,
+        specprefill_reserved_bytes=reservation.total_bytes,
+        specprefill_threshold=2,
+        specprefill_keep_pct=0.25,
+    )
+
+    def run(directory, depth, options):
+        directory.mkdir()
+        with served(mtp_checkpoint, TWO_RANKS, directory, mtp_depth=depth,
+                    extra_runtime_options=options) as server:
+            first = server.chat(prompt, timeout=25)
+            again = server.chat(prompt, timeout=25)
+            streamed = server.chat(prompt, stream=True)
+        return first, again, streamed
+
+    base_first, base_again, base_stream = run(tmp_path / "baseline", None, sparse)
+    text = _content(base_first)
+    assert _content(base_again) == text and base_stream == text
+
+    options = dict(sparse)
+    depth = 2 if draft == "native" else None
+    if draft == "external":
+        from omlx.patches.qwen4_exp_mlx_lm.external_mtp import (
+            inspect_head,
+            runtime_settings as external_settings,
+        )
+
+        options.update(external_settings(SimpleNamespace(
+            vlm_mtp_enabled=True, vlm_mtp_draft_model=str(mtp_checkpoint),
+            vlm_mtp_draft_block_size=3,
+        )))
+        _layout, reserve = inspect_head(mtp_checkpoint, 1024)
+        options.update(vlm_mtp_reserved_bytes=reserve,
+                       vlm_mtp_max_prompt_tokens=1024)
+    if draft in ("dflash", "ddtree"):
+        options.update(dflash_settings(SimpleNamespace(
+            dflash_enabled=True, dflash_draft_model=str(dflash_checkpoint),
+            dflash_block_size=3, dflash_async_prefill=async_capture,
+        )))
+        dflash = DraftReservation.from_layout(
+            inspect_safetensors_layout(dflash_checkpoint),
+            max_prompt_tokens=1024, workspace_bytes=1024**3,
+        )
+        options.update(dflash_reserved_bytes=dflash.total_bytes,
+                       dflash_max_prompt_tokens=1024,
+                       dflash_draft_window_size=16)
+    if draft == "ddtree":
+        options.update(dflash_verify_mode="ddtree", dflash_ddtree_max_branches=3,
+                       dflash_ddtree_max_nodes=7, dflash_ddtree_memory_bytes=1 << 40)
+    first, again, streamed = run(tmp_path / "speculative", depth, options)
+    assert _content(first) == text
+    assert _content(again) == text
+    assert streamed == text
+    assert first["usage"]["prompt_tokens"] == base_first["usage"]["prompt_tokens"]
+    assert first["usage"]["completion_tokens"] == base_first["usage"]["completion_tokens"]
