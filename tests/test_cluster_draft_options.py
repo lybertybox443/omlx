@@ -37,10 +37,10 @@ def test_runtime_options_are_portable_and_strict(resolve, enabled, path):
         "specprefill_enabled",
         "turboquant_kv_enabled",
     ):
-        compatible = "turboquant_kv_enabled" in (
-            enabled,
-            other,
-        ) and "specprefill_enabled" not in (enabled, other)
+        compatible = (
+            "turboquant_kv_enabled" in (enabled, other)
+            and "specprefill_enabled" not in (enabled, other)
+        ) or {enabled, other} == {"dflash_enabled", "specprefill_enabled"}
         if other != enabled and not compatible:
             with pytest.raises(ValueError, match="combined"):
                 resolve(SimpleNamespace(**{**values, other: True}))

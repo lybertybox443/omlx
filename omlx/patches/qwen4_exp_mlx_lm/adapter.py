@@ -195,10 +195,6 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
                 if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                     raise ValueError("DFlash requires an approved memory reservation")
                 expected.add(key)
-            if draft_keys.intersection(options):
-                raise ValueError(
-                    "distributed DFlash cannot be combined with SpecPrefill"
-                )
         external_mtp = options.get("vlm_mtp_enabled", False)
         if external_mtp:
             from types import SimpleNamespace

@@ -75,6 +75,8 @@ def install_specprefill_serving(model, provider, server, options, *, group=None)
         if enabled is False or getattr(args, "_omlx_image", None) is not None:
             return original_single(self, request, stream)
         previous_cache = self.prompt_cache
+        missing = object()
+        previous_sparse = getattr(model, "_omlx_dflash_sparse_prefill", missing)
         self.prompt_cache = _UncachedPrompt(None)
         try:
             tokens, _, _, _ = self._tokenize(provider.tokenizer, request[1], args)
@@ -94,6 +96,11 @@ def install_specprefill_serving(model, provider, server, options, *, group=None)
             cleanup_rope(model)
             active = None
             self.prompt_cache = previous_cache
+            if previous_sparse is missing:
+                if hasattr(model, "_omlx_dflash_sparse_prefill"):
+                    del model._omlx_dflash_sparse_prefill
+            else:
+                model._omlx_dflash_sparse_prefill = previous_sparse
 
     def share(owner, outcome):
         # Sequential telemetry temporarily clears this flag to bypass an
@@ -144,13 +151,54 @@ def install_specprefill_serving(model, provider, server, options, *, group=None)
                 prefill_step_size=step_size,
             )
             # Leave the final prompt token to the standard generation loop.
-            sparse_prefill(
-                model,
-                tokens[:-1],
-                selected[:-1],
-                cache,
-                step_size=step_size,
+            prefix_length = len(tokens) - 1
+            positions = selected[:-1].tolist()
+            drafter = getattr(
+                getattr(model, "language_model", None), "_omlx_drafter", None
             )
+            chunks = []
+            hook = None
+            if drafter is not None:
+                keep = set(positions)
+                keep.update(range(min(drafter.sink_size, prefix_length)))
+                keep.update(range(max(0, prefix_length - (drafter.window - 1)), prefix_length))
+                # Mirror sparse_prefill's rotating-cache tail union.
+                for c in cache:
+                    if type(c).__name__ == "RotatingKVCache":
+                        keep.update(range(max(0, prefix_length - c.max_size), prefix_length))
+                positions = sorted(keep)
+
+                def hook(hidden, width):
+                    if hidden:
+                        mx.eval(hidden)
+                        if coordinator.rank == 0:
+                            chunks.append([layer[:, :width] for layer in hidden])
+
+            previous = getattr(model, "_omlx_dflash_prefill_capture", None)
+            if hook is not None:
+                model._omlx_dflash_prefill_capture = hook
+            try:
+                sparse_prefill(
+                    model,
+                    tokens[:-1],
+                    positions,
+                    cache,
+                    step_size=step_size,
+                )
+            finally:
+                if hook is not None:
+                    model._omlx_dflash_prefill_capture = previous
+            if drafter is not None:
+                captured = (
+                    [mx.concatenate(layer, axis=1) for layer in zip(*chunks)]
+                    if chunks
+                    else []
+                )
+                model._omlx_dflash_sparse_prefill = {
+                    "captured": captured,
+                    "positions": positions,
+                    "prefix_length": prefix_length,
+                }
         return cache
 
     def generate(*args, **kwargs):
@@ -158,20 +206,31 @@ def install_specprefill_serving(model, provider, server, options, *, group=None)
             yield from original_generate(*args, **kwargs)
             return
         tokens, started = active
-        original_prefix = mx.array(tokens[:-1])
-        processors = kwargs.get("logits_processors") or []
-        kwargs["logits_processors"] = [
-            (
-                lambda history, logits, processor=processor: processor(
-                    mx.concatenate([original_prefix, history]), logits
+        drafter = getattr(
+            getattr(model, "language_model", None), "_omlx_drafter", None
+        )
+        if drafter is not None:
+            from .mtp_stream import stream_mtp
+
+            generate_fn = stream_mtp
+            # BatchGenerator all_tokens already carries the full prefix.
+            kwargs["prompt_prefix"] = tokens[:-1]
+        else:
+            generate_fn = original_generate
+            original_prefix = mx.array(tokens[:-1])
+            processors = kwargs.get("logits_processors") or []
+            kwargs["logits_processors"] = [
+                (
+                    lambda history, logits, processor=processor: processor(
+                        mx.concatenate([original_prefix, history]), logits
+                    )
                 )
-            )
-            for processor in processors
-        ]
+                for processor in processors
+            ]
         kwargs["prompt"] = tokens[-1:]
         prompt_tps = None
         try:
-            for response in original_generate(*args, **kwargs):
+            for response in generate_fn(*args, **kwargs):
                 if prompt_tps is None:
                     prompt_tps = len(tokens) / max(perf_counter() - started, 1e-9)
                 yield replace(

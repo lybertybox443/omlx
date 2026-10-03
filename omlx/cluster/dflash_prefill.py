@@ -20,7 +20,10 @@ def install_dflash_prefill(model, drafter):
     def prompt(batch, tokens):
         if batch.model is not model:
             return original_prompt(batch, tokens)
-        starts = [len(row) for row in batch.tokens]
+        sparse = getattr(batch, "_omlx_dflash_sparse_positions", {})
+        starts = [
+            sparse.get(uid, 0) + len(row) for uid, row in zip(batch.uids, batch.tokens)
+        ]
         lengths = [len(row) for row in tokens]
         full = [
             list(prefix) + list(suffix) for prefix, suffix in zip(batch.tokens, tokens)
@@ -42,9 +45,10 @@ def install_dflash_prefill(model, drafter):
                         [layer[index : index + 1, :count] for layer in hidden],
                         position=start,
                     )
-                    drafter.store_request_captures(
-                        str(uid), full[index], start + count, media()
-                    )
+                    if uid not in sparse:
+                        drafter.store_request_captures(
+                            str(uid), full[index], start + count, media()
+                        )
             consumed += width
 
         previous = getattr(model, "_omlx_dflash_prefill_capture", None)
@@ -57,6 +61,24 @@ def install_dflash_prefill(model, drafter):
     def prepare(batch):
         prepared = getattr(batch, "_omlx_dflash_prepared", set())
         if set(batch.uids).issubset(prepared):
+            return
+        pending = getattr(model, "_omlx_dflash_sparse_prefill", None)
+        if pending is not None:
+            # Sequential serving path: one sparse request, no dense replay.
+            if len(batch.uids) != 1:
+                raise RuntimeError("sparse DFlash prefill requires exactly one request")
+            uid = batch.uids[0]
+            # Stored value is the base offset; prompt starts at base + len(row).
+            base = pending["prefix_length"] - len(batch.tokens[0])
+            if base < 0:
+                raise RuntimeError("sparse DFlash prefix shorter than batch history")
+            drafter.seed_sparse_request(str(uid), **pending)
+            batch._omlx_dflash_sparse_positions = {
+                **getattr(batch, "_omlx_dflash_sparse_positions", {}),
+                uid: base,
+            }
+            batch._omlx_dflash_prepared = set(prepared) | {uid}
+            model._omlx_dflash_sparse_prefill = None
             return
         restored = []
         for uid, prefix in zip(batch.uids, batch.tokens):
@@ -104,12 +126,21 @@ def install_dflash_prefill(model, drafter):
         prepared = getattr(batch, "_omlx_dflash_prepared", None)
         if prepared is not None:
             new_batch._omlx_dflash_prepared = set(prepared)
+        positions = getattr(batch, "_omlx_dflash_sparse_positions", None)
+        if positions:
+            new_batch._omlx_dflash_sparse_positions = dict(positions)
         return new_batch
 
     def extend(batch, other):
         prepared = getattr(batch, "_omlx_dflash_prepared", None)
         incoming = getattr(other, "_omlx_dflash_prepared", None)
+        positions = {
+            **getattr(batch, "_omlx_dflash_sparse_positions", {}),
+            **getattr(other, "_omlx_dflash_sparse_positions", {}),
+        }
         original_extend(batch, other)
+        if positions:
+            batch._omlx_dflash_sparse_positions = positions
         if prepared is not None or incoming is not None:
             batch._omlx_dflash_prepared = (prepared or set()) | (incoming or set())
 

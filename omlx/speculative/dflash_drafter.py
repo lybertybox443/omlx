@@ -345,6 +345,50 @@ class DFlashDrafter:
             row.pending.append(context)
             self._bound_pending(row)
 
+    def seed_sparse_request(
+        self,
+        request_id: str,
+        captured: Sequence[mx.array],
+        *,
+        positions: Sequence[int],
+        prefix_length: int,
+    ) -> None:
+        """Seed a request from sparse captures at exact original positions.
+
+        ``positions`` must hold every sink position and the contiguous last
+        ``ring_slots`` positions of the prefix; other positions are ignored.
+        """
+        if isinstance(prefix_length, bool) or not isinstance(prefix_length, int) or prefix_length < 0:
+            raise ValueError("DFlash prefix length must be a nonnegative integer")
+        positions = list(positions)
+        previous = -1
+        for position in positions:
+            if isinstance(position, bool) or not isinstance(position, int):
+                raise ValueError("DFlash capture positions must be integers")
+            if not previous < position < prefix_length:
+                raise ValueError("DFlash capture positions must be sorted unique prefix positions")
+            previous = position
+        captured = list(captured)
+        if any(layer.ndim != 3 or int(layer.shape[1]) != len(positions) for layer in captured):
+            raise ValueError("DFlash capture widths must match positions")
+        sink_count = min(self.sink_size, prefix_length)
+        tail_count = min(self.ring_slots, prefix_length)
+        index = {position: i for i, position in enumerate(positions)}
+        sink_index = [index.get(p) for p in range(sink_count)]
+        tail_index = [index.get(p) for p in range(prefix_length - tail_count, prefix_length)]
+        if None in sink_index or None in tail_index:
+            raise ValueError("DFlash sparse captures miss required sink or ring positions")
+        row = _RowContext(fed=prefix_length - tail_count)
+        if sink_index or tail_index:
+            if not captured:
+                raise ValueError("DFlash sparse captures are missing")
+            context = _concat_captured(captured)
+            if sink_index:
+                row.sinks = mx.take(context, mx.array(sink_index, dtype=mx.int32), axis=1)
+            if tail_index:
+                row.pending = [mx.take(context, mx.array(tail_index, dtype=mx.int32), axis=1)]
+        self._request_seeds[request_id] = row
+
     def store_request_captures(self, request_id, tokens, boundary, media=None):
         row = self._request_seeds.get(request_id)
         if self.capture_store is None or row is None or not row.pending:

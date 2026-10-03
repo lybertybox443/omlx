@@ -58,6 +58,10 @@ class SharedDFlash:
         if self.rank == 0:
             self.draft_model.seed_request(request_id, captured, **kwargs)
 
+    def seed_sparse_request(self, request_id, captured, **kwargs):
+        if self.rank == 0:
+            self.draft_model.seed_sparse_request(request_id, captured, **kwargs)
+
     def store_request_captures(self, request_id, tokens, boundary, media=None):
         if self.rank == 0:
             self.draft_model.store_request_captures(request_id, tokens, boundary, media)
@@ -210,7 +214,6 @@ def runtime_settings(settings):
     for other in (
         "mtp_enabled",
         "vlm_mtp_enabled",
-        "specprefill_enabled",
     ):
         if getattr(settings, other, False):
             raise ValueError(f"distributed DFlash cannot be combined with {other}")
@@ -469,7 +472,7 @@ def install_dflash_serving(model, server, options, provider=None):
         from contextlib import nullcontext
 
         from .dflash_prefill import install_dflash_prefill
-        with install_dflash_prefill(model, shared) if shared.sink_size or options.get("dflash_capture_cache") else nullcontext():
+        with install_dflash_prefill(model, shared) if shared.sink_size or options.get("dflash_capture_cache") or options.get("specprefill_draft_model") else nullcontext():
             yield
     finally:
         shared.clear()
