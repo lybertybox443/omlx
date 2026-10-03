@@ -910,6 +910,8 @@ def _runtime_assignment(
         "headroom_bytes": assignment.headroom_bytes,
         "tensor_parallel_rank": assignment.tensor_parallel_rank,
         "tensor_parallel_size": assignment.tensor_parallel_size,
+        "expert_parallel_rank": assignment.expert_parallel_rank,
+        "expert_parallel_size": assignment.expert_parallel_size,
         "sharded_weight_bytes": assignment.sharded_weight_bytes,
     }
     if assignment.predicted_stage_seconds is not None:
@@ -1296,7 +1298,7 @@ def _build_worker_topology(
 
     tp = tensor_parallel_size
     ep = expert_parallel_size
-    width = max(tp, ep)
+    width = tp * ep
     hybrid = width > 1 and group.size() // width > 1
     member = group.rank() % width
     links = (

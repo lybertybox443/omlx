@@ -704,23 +704,25 @@ def decode_worker_expert_parallel_size(encoded: str) -> int:
 def _validate_expert_parallel(
     size: Any, tensor_parallel_size: int, assignments: Any
 ) -> None:
-    """Shared by deployment and worker so both enforce one EP contract."""
+    """Shared by deployment and worker so both enforce one parallel contract."""
 
     world = len(assignments)
     if type(size) is not int or not 1 <= size <= world:
         raise ValueError("expert_parallel_size must be between 1 and the world size")
-    if world % size != 0:
-        raise ValueError("world size must be divisible by expert_parallel_size")
-    if size > 1 and tensor_parallel_size > 1:
-        raise ValueError("tensor and expert parallelism are mutually exclusive")
+    tp = tensor_parallel_size
+    if type(tp) is not int or not 1 <= tp <= world:
+        raise ValueError("tensor_parallel_size must be between 1 and the world size")
+    if world % (size * tp) != 0:
+        raise ValueError("world size must be divisible by tensor_parallel_size * expert_parallel_size")
     for item in assignments:
         if item.expert_parallel_size != size:
             raise ValueError("assignment expert_parallel_size mismatch")
-        if size > 1 and (
-            item.expert_parallel_rank != item.rank % size
-            or item.tensor_parallel_size != 1
-        ):
+        if item.tensor_parallel_size != tp:
+            raise ValueError("assignment tensor_parallel_size mismatch")
+        if item.expert_parallel_rank != (item.rank // tp) % size:
             raise ValueError("assignment expert-parallel rank mismatch")
+        if item.tensor_parallel_rank != item.rank % tp:
+            raise ValueError("assignment tensor-parallel rank mismatch")
 
 
 def _validated_runtime_options(value: Any) -> dict[str, Any]:

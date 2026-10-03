@@ -939,23 +939,14 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
 
 
 def _create_cluster_plan(request: ClusterPlanRequest):
-    if request.tensor_parallel_size > 1 and request.expert_parallel_size > 1:
+    width = request.tensor_parallel_size * request.expert_parallel_size
+    needs_subgroups = (
+        (request.tensor_parallel_size > 1 and request.expert_parallel_size > 1)
+        or (width > 1 and width != len(request.nodes))
+    )
+    if needs_subgroups and not request.allow_experimental_subgroups:
         raise PlanningError(
-            "Tensor parallelism and expert parallelism cannot be combined; "
-            "choose one of them."
-        )
-    width = max(request.tensor_parallel_size, request.expert_parallel_size)
-    if (
-        width > 1
-        and width != len(request.nodes)
-        and not request.allow_experimental_subgroups
-    ):
-        raise PlanningError(
-            "Tensor parallelism must use every detected node. Combining tensor "
-            "parallelism with multiple pipeline stages is not supported by the "
-            "pinned MLX model sharding path; choose 1 for pipeline-only or "
-            f"{len(request.nodes)} for one tensor-parallel stage. Explicit "
-            "subgroups require a patched MLX with Group.split and the "
+            "This TP/EP layout requires a patched MLX with Group.split and the "
             "allow_experimental_subgroups opt-in."
         )
     model, nodes = _model_and_nodes(request)
@@ -992,6 +983,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             model,
             nodes,
             expert_parallel_size=request.expert_parallel_size,
+            tensor_parallel_size=request.tensor_parallel_size,
             workload_profile=request.execution_profile,
             microbatch_size=(
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
@@ -3069,6 +3061,7 @@ def _build_performance_plan(
             model,
             nodes,
             expert_parallel_size=expert_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,

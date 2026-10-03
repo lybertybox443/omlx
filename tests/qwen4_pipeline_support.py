@@ -518,6 +518,7 @@ def make_deployment(
     mtp_adaptive: bool = False,
     extra_runtime_options: dict | None = None,
     expert_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
 ):
     """A signed-style ``ClusterDeployment`` for local ranks, ranks in reverse order."""
 
@@ -527,6 +528,7 @@ def make_deployment(
     from omlx.cluster.planner import PipelineAssignment
 
     ep = expert_parallel_size
+    tp = tensor_parallel_size
     hosts = tuple(
         ClusterHost(
             node_id=f"node-{rank}",
@@ -546,8 +548,10 @@ def make_deployment(
             fixed_weight_bytes=1_000_000,
             reserve_bytes=gib,
             capacity_bytes=64 * gib,
+            tensor_parallel_rank=rank % tp,
+            tensor_parallel_size=tp,
             **(
-                {"expert_parallel_rank": rank % ep, "expert_parallel_size": ep}
+                {"expert_parallel_rank": (rank // tp) % ep, "expert_parallel_size": ep}
                 if ep > 1
                 else {}
             ),
@@ -557,9 +561,13 @@ def make_deployment(
     plan_payload = list(map(list, ranges))
     if ep > 1:
         plan_payload = {"ranges": plan_payload, "expert_parallel_size": ep}
+    if tp > 1:
+        plan_payload = {"ranges": list(map(list, ranges)),
+                        "tensor_parallel_size": tp, "expert_parallel_size": ep}
     plan_hash = hashlib.sha256(json.dumps(plan_payload).encode()).hexdigest()
     return ClusterDeployment(
         **({"expert_parallel_size": ep} if ep > 1 else {}),
+        tensor_parallel_size=tp,
         deployment_id=deployment_id,
         model=str(checkpoint),
         backend="ring",
@@ -594,6 +602,7 @@ def worker_argv_and_state(
     mtp_adaptive: bool = False,
     extra_runtime_options: dict | None = None,
     expert_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
     load_timeout: float = 120.0,
 ) -> list[str]:
     """Worker argv a real launch would run on every rank, built by the launcher.
@@ -614,6 +623,7 @@ def worker_argv_and_state(
         mtp_adaptive=mtp_adaptive,
         extra_runtime_options=extra_runtime_options,
         expert_parallel_size=expert_parallel_size,
+        tensor_parallel_size=tensor_parallel_size,
     )
     state = Path(state_dir)
     state.mkdir(parents=True, exist_ok=True)

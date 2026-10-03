@@ -1,8 +1,11 @@
+import pytest
+
 from omlx.cluster import routes
 from omlx.cluster.routes import _build_performance_plan
 
 
-def test_expert_branch_dispatches_keyword_only(monkeypatch):
+@pytest.mark.parametrize("tp", [1, 2])
+def test_expert_branch_dispatches_keyword_only(monkeypatch, tp):
     sentinel = object()
     captured = {}
 
@@ -11,6 +14,7 @@ def test_expert_branch_dispatches_keyword_only(monkeypatch):
         nodes,
         *,
         expert_parallel_size,
+        tensor_parallel_size,
         workload_profile,
         microbatch_size,
         context_tokens,
@@ -19,6 +23,7 @@ def test_expert_branch_dispatches_keyword_only(monkeypatch):
             model=model,
             nodes=nodes,
             expert_parallel_size=expert_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
@@ -35,7 +40,7 @@ def test_expert_branch_dispatches_keyword_only(monkeypatch):
     result = _build_performance_plan(
         model,
         nodes,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tp,
         expert_parallel_size=3,
         workload_profile="balanced",
         microbatch_size=2,
@@ -47,6 +52,7 @@ def test_expert_branch_dispatches_keyword_only(monkeypatch):
         "model": model,
         "nodes": nodes,
         "expert_parallel_size": 3,
+        "tensor_parallel_size": tp,
         "workload_profile": "balanced",
         "microbatch_size": 2,
         "context_tokens": 1024,

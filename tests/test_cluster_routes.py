@@ -753,7 +753,7 @@ def test_selected_context_is_the_runtime_kv_ceiling():
     assert execution.max_kv_size == 262144
 
 
-def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch):
+def test_cluster_plan_route_requires_hybrid_subgroup_opt_in(monkeypatch):
     gib = 1024**3
 
     from omlx.cluster.planner import ModelLayout
@@ -800,7 +800,8 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
     )
 
     assert response.status_code == 400
-    assert "must use every detected node" in response.json()["detail"]
+    assert "Group.split" in response.json()["detail"]
+    assert "allow_experimental_subgroups" in response.json()["detail"]
 
 
 def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch):
