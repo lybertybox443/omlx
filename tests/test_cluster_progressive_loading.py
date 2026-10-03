@@ -529,6 +529,129 @@ def test_hybrid_rejects_unknown_native_before_download(monkeypatch):
     )
 
 
+def _expert_env(monkeypatch, plan=("plan",)):
+    """Hybrid env with traced EP symbols patched where progressive_loading uses them."""
+    import omlx.cluster.progressive_loading as pl
+    import omlx.utils.model_loading as ml
+
+    events, utils, mx = _hybrid_env()
+    monkeypatch.setattr(ml, "ensure_model_code_trusted", lambda *a, **k: None)
+    mx.distributed = SimpleNamespace(init=lambda: events.append(("init",)))
+    tensor_calls = []
+    monkeypatch.setattr(
+        pl,
+        "apply_tensor_strategy",
+        lambda *a, **k: tensor_calls.append(a) or "tensor",
+    )
+    applied = {}
+
+    def inspect(model):
+        events.append(("inspect", tuple(model.model.layers)))
+        return "owner", list(plan)
+
+    def apply(model, group, *, mx_module, progress=None, plan=None):
+        events.append(("apply", tuple(model.model.layers), group.name))
+        applied["model"] = model
+        applied["plan"] = plan
+        return SimpleNamespace(moe_layers=[])
+
+    monkeypatch.setattr(pl, "inspect_expert_layers", inspect)
+    monkeypatch.setattr(pl, "apply_expert_strategy", apply)
+    return pl, events, utils, mx, tensor_calls, applied
+
+
+def test_explicit_expert_group_never_auto_inits_or_selects_tensor(monkeypatch):
+    pl, events, utils, mx, tensor_calls, applied = _expert_env(monkeypatch)
+
+    model, tok, cfg = pl.progressive_sharded_load(
+        "repo",
+        expert_group=_group("ep"),
+        return_config=True,
+        utils_module=utils,
+        mx_module=mx,
+    )
+
+    assert [e[0] for e in events if e[0] in ("init", "inspect", "apply")] == [
+        "inspect",
+        "inspect",
+        "apply",
+    ]
+    assert not tensor_calls
+    assert ("init",) not in events
+    assert not any(e[0] == "pipeline" for e in events)
+    assert model is applied["model"]
+    assert applied["plan"] == ["plan"]
+    assert tok == "tok"
+    assert cfg == {}
+
+
+def test_pipeline_partitions_before_expert_inspect_apply_and_eval(monkeypatch):
+    pl, events, utils, mx, tensor_calls, applied = _expert_env(monkeypatch)
+
+    model, _tok = pl.progressive_sharded_load(
+        "repo",
+        _group("pp"),
+        expert_group=_group("ep"),
+        utils_module=utils,
+        mx_module=mx,
+    )
+
+    kinds = [e[0] for e in events]
+    apply_at = kinds.index("apply")
+    # Final partition is the last pipeline call before the post-partition inspect.
+    last_inspect = len(kinds) - 1 - kinds[::-1].index("inspect")
+    assert last_inspect < apply_at
+    assert max(i for i, k in enumerate(kinds) if k == "pipeline") < last_inspect
+    assert events[last_inspect] == ("inspect", ("l2", "l3"))
+    assert events[apply_at] == ("apply", ("l2", "l3"), "ep")
+    # Pipeline-only materialization is skipped when EP owns evaluation.
+    assert "eval" not in kinds[:apply_at]
+    assert not tensor_calls
+    assert model is applied["model"]
+    assert list(model.model.layers) == ["l2", "l3"]
+
+
+def test_tensor_plus_expert_rejects_before_mutation_or_evaluation(monkeypatch):
+    pl, events, utils, mx, tensor_calls, applied = _expert_env(monkeypatch)
+    events.clear()
+
+    with pytest.raises(ValueError, match="3D TP\\+EP"):
+        pl.progressive_sharded_load(
+            "repo",
+            _group("pp"),
+            _group("tp"),
+            expert_group=_group("ep"),
+            utils_module=utils,
+            mx_module=mx,
+        )
+
+    kinds = [e[0] for e in events]
+    assert "download" in kinds  # reached the validation, not skipped earlier
+    assert not {"pipeline", "eval", "inspect", "apply", "init"} & set(kinds)
+    assert not tensor_calls
+    assert not applied
+
+
+def test_expert_without_moe_raises_before_evaluation(monkeypatch):
+    pl, events, utils, mx, tensor_calls, applied = _expert_env(monkeypatch, plan=())
+    events.clear()
+
+    with pytest.raises(ValueError, match="supported MoE layer"):
+        pl.progressive_sharded_load(
+            "repo",
+            _group("pp"),
+            expert_group=_group("ep"),
+            utils_module=utils,
+            mx_module=mx,
+        )
+
+    kinds = [e[0] for e in events]
+    assert kinds.count("inspect") == 1  # EP preflight actually ran
+    assert not {"pipeline", "eval", "apply", "init"} & set(kinds)
+    assert not tensor_calls
+    assert not applied
+
+
 def test_hybrid_requires_distinct_groups(monkeypatch):
     _events, utils, mx = _hybrid_env()
     import omlx.utils.model_loading as ml

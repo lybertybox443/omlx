@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
+from .expert_strategies import apply_expert_strategy, inspect_expert_layers
 from .tensor_strategies import (
     apply_tensor_strategy,
     native_shard_is_layer_local,
@@ -91,6 +92,7 @@ def progressive_sharded_load(
     progress: ProgressCallback | None = None,
     utils_module: Any = None,
     mx_module: Any = None,
+    expert_group: Any = None,
 ) -> Any:
     """Pinned ``mlx_lm.utils.sharded_load`` with bounded materialization.
 
@@ -161,7 +163,19 @@ def progressive_sharded_load(
             "The model does not support tensor parallelism but a tensor_group "
             "was provided"
         )
-    if not has_pipeline and not has_tensor and tensor_group is None:
+    if expert_group is not None:
+        if tensor_group is not None:
+            raise ValueError(
+                "tensor_group and expert_group together (3D TP+EP) is not implemented"
+            )
+        if pipeline_group is expert_group:
+            raise ValueError("pipeline_group and expert_group must be distinct")
+        if int(expert_group.size()) < 1:
+            raise ValueError(f"expert_group has invalid size {expert_group.size()}")
+        # Preflight on the lazy model: no evaluation, no mutation.
+        if not inspect_expert_layers(model)[1]:
+            raise ValueError("expert parallelism requires a supported MoE layer")
+    elif not has_pipeline and not has_tensor and tensor_group is None:
         raise ValueError("The model does not support any sharding")
     if pipeline_group is not None and tensor_group is not None:
         if pipeline_group is tensor_group:
@@ -169,7 +183,7 @@ def progressive_sharded_load(
         for name, grp in (("pipeline", pipeline_group), ("tensor", tensor_group)):
             if int(grp.size()) < 1:
                 raise ValueError(f"{name}_group has invalid size {grp.size()}")
-    if pipeline_group is tensor_group is None:
+    if pipeline_group is tensor_group is expert_group is None:
         group = mx_module.distributed.init()
         if has_tensor:
             tensor_group = group
@@ -206,7 +220,7 @@ def progressive_sharded_load(
     if pipeline_group is not None:
         # Partition before any evaluation so only stage-local layers exist.
         model.model.pipeline(pipeline_group)
-        if tensor_group is None:
+        if tensor_group is None and expert_group is None:
             materialize_parameters_progressively(
                 model.parameters(),
                 mx_module=mx_module,
@@ -214,6 +228,36 @@ def progressive_sharded_load(
                 progress=progress,
                 layer_index=layer_index,
             )
+    if expert_group is not None:
+        # Re-preflight after pipeline partition; nothing evaluated yet.
+        _owner, plan = inspect_expert_layers(model)
+        meta = apply_expert_strategy(
+            model,
+            expert_group,
+            mx_module=mx_module,
+            progress=progress,
+            plan=plan,
+        )
+        done = {entry["layer"] for entry in meta.moe_layers}
+        flat = utils_module.tree_flatten(model.parameters())
+        fixed = [v for path, v in flat if layer_index(path) is None]
+        rest: dict[int, list[Any]] = {}
+        for path, value in flat:
+            index = layer_index(path)
+            if index is not None and index not in done:
+                rest.setdefault(index, []).append(value)
+        del flat
+        _eval_values(mx_module, fixed)
+        mx_module.clear_cache()
+        del fixed
+        for index in sorted(rest):
+            _eval_values(mx_module, rest[index])
+            mx_module.clear_cache()
+        del rest
+        gc.collect()
+        mx_module.clear_cache()
+        if progress is not None:
+            progress({"phase": "expert_ready", "strategy": meta})
     if tensor_group is not None:
         # Fixed embeddings/head weights are replicated. Materialize them first;
         # each strategy then materializes, shards, evaluates and releases one
