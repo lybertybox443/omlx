@@ -44,6 +44,7 @@ class ParallelismChoice:
     plan: ShardPlan
     reason: str
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    expert_parallel_size: int = 1
 
 
 def _divides_heads(model: ModelLayout, tensor_parallel_size: int) -> bool:
@@ -136,6 +137,15 @@ STRATEGIES = {
             "than one Mac."
         ),
     },
+    "expert": {
+        "label": "Expert — MoE experts",
+        "summary": "Each Mac holds part of the routed experts",
+        "detail": (
+            "Partitions the routed MoE experts across your Macs. Every Mac "
+            "keeps the full attention weights and KV cache, and the shared "
+            "expert lives on owner 0. Measured performance is pending."
+        ),
+    },
 }
 
 
@@ -168,6 +178,29 @@ def choose_parallelism(
         raise ValueError("prefer must be 'speed' or 'capacity'")
     if strategy not in STRATEGIES:
         raise ValueError(f"strategy must be one of {sorted(STRATEGIES)}")
+
+    if strategy == "expert":
+        if len(nodes) < 2:
+            raise PlanningError("expert parallelism needs at least 2 nodes")
+        from .expert_planner import plan_expert_parallel
+
+        plan = plan_expert_parallel(
+            model,
+            nodes,
+            expert_parallel_size=len(nodes),
+            workload_profile=workload_profile,
+            context_tokens=context_tokens,
+        )
+        return ParallelismChoice(
+            tensor_parallel_size=1,
+            pipeline_stages=1,
+            plan=plan,
+            reason=(
+                f"Expert parallelism was requested: routed experts are "
+                f"partitioned across {len(nodes)} nodes."
+            ),
+            expert_parallel_size=len(nodes),
+        )
 
     candidates = candidate_tensor_parallel_sizes(model, len(nodes))
     if strategy == "pipeline":

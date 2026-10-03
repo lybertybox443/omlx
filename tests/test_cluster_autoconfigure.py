@@ -1182,7 +1182,7 @@ def test_auto_does_not_compare_one_measured_strategy_with_one_unknown():
 def test_every_strategy_is_described_for_the_ui():
     from omlx.cluster.autoconfigure import STRATEGIES
 
-    assert set(STRATEGIES) == {"auto", "tensor", "pipeline"}
+    assert set(STRATEGIES) == {"auto", "tensor", "pipeline", "expert"}
     for key, meta in STRATEGIES.items():
         assert meta["label"] and meta["summary"] and meta["detail"], key
         # The description must say what it is FOR, not just what it does.

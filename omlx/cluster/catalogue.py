@@ -99,6 +99,8 @@ class ModelFit:
     # skips them must not advertise capabilities nobody verified.
     supports_pipeline: bool = False
     supports_tensor_parallel: bool = False
+    # Verified expert inventory only (ModelLayout), never guessed from name.
+    supports_expert_parallel: bool = False
 
     @property
     def strategy(self) -> str:
@@ -165,6 +167,7 @@ class ModelFit:
             "standalone_max_context_tokens": self.standalone_max_context_tokens,
             "supports_pipeline": self.supports_pipeline,
             "supports_tensor_parallel": self.supports_tensor_parallel,
+            "supports_expert_parallel": self.supports_expert_parallel,
         }
 
 
@@ -433,6 +436,9 @@ def assess_model(
             warnings=tuple(warnings),
             supports_pipeline=bool(pipeline_ok),
             supports_tensor_parallel=bool(tensor_parallel_ok),
+            supports_expert_parallel=bool(
+                layout.layer_expert_counts and any(layout.layer_expert_counts)
+            ),
         )
 
     (
@@ -511,6 +517,9 @@ def assess_model(
         standalone_max_context_tokens=standalone_context,
         supports_pipeline=bool(pipeline_ok),
         supports_tensor_parallel=bool(tensor_parallel_ok),
+        supports_expert_parallel=bool(
+            layout.layer_expert_counts and any(layout.layer_expert_counts)
+        ),
     )
 
 

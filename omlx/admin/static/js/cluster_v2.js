@@ -135,7 +135,14 @@ function clusterV2Wizard() {
         'cluster.v2.strategy.auto': 'Auto',
         'cluster.v2.strategy.tensor': 'Tensor',
         'cluster.v2.strategy.pipeline': 'Pipeline',
+        'cluster.v2.strategy.expert': 'Expert parallelism',
         'cluster.v2.strategy.recommended': 'Recommended',
+        'cluster.v2.strategy.hint.expert':
+            'Routed experts are distributed across Macs; attention and KV cache are replicated',
+        'cluster.v2.strategy.expert_needs_two':
+            'Expert parallelism needs 2+ Macs',
+        'cluster.v2.strategy.expert_unsupported':
+            'Expert inventory is unsupported or unverified for this model',
         'cluster.v2.strategy.hint.auto':
             'oMLX picks the split that fits this model and your link',
         'cluster.v2.strategy.hint.tensor':
@@ -1254,6 +1261,13 @@ function clusterV2Wizard() {
         // Step-4 hint is strategy-aware: a tensor split gives every Mac every
         // layer, so "Layers per Mac" would describe the wrong thing.
         planStepHint() {
+            if (this.planStrategy === 'expert') {
+                const key = 'cluster.v2.steps.plan_hint_expert';
+                const text = window.t(key);
+                return text && text !== key
+                    ? text
+                    : 'Routed experts are placed per Mac; attention and KV cache are replicated.';
+            }
             return this.planStrategy === 'tensor'
                 ? t('cluster.v2.steps.plan_hint_tensor')
                 : window.t('cluster.v2.steps.plan_hint_pipeline');
@@ -2391,6 +2405,8 @@ function clusterV2Wizard() {
             const pipelineUnsupported =
                 !!entry && entry.supports_pipeline === false;
             const tensorDisabled = nodeCount < 2 || tensorUnsupported;
+            const expertDisabled =
+                nodeCount < 2 || entry?.supports_expert_parallel !== true;
             return [
                 {
                     key: 'auto',
@@ -2415,6 +2431,16 @@ function clusterV2Wizard() {
                     disabledReason: pipelineUnsupported
                         ? t('cluster.v2.strategy.pipeline_unsupported')
                         : '',
+                },
+                {
+                    key: 'expert',
+                    label: t('cluster.v2.strategy.expert'),
+                    disabled: expertDisabled,
+                    disabledReason: !expertDisabled
+                        ? ''
+                        : nodeCount < 2
+                        ? t('cluster.v2.strategy.expert_needs_two')
+                        : t('cluster.v2.strategy.expert_unsupported'),
                 },
             ];
         },
@@ -3380,6 +3406,10 @@ function clusterV2Wizard() {
         membershipPlanDetail(assignment) {
             const gib = Number(assignment?.planned_weight_bytes || 0) / (1024 ** 3);
             const tp = Number(assignment?.tensor_parallel_size || 1);
+            const ep = Number(assignment?.expert_parallel_size || 1);
+            if (ep > 1) {
+                return `Expert shard ${Number(assignment?.expert_parallel_rank || 0) + 1}/${ep} · ${gib.toFixed(1)} GiB`;
+            }
             return tp > 1
                 ? window.t('cluster.v2.membership.tensor_rank').replace('{rank}', String(Number(assignment?.tensor_parallel_rank || 0) + 1)).replace('{tp}', String(tp)).replace('{gib}', gib.toFixed(1))
                 : window.t('cluster.v2.membership.layers').replace('{start}', String(assignment?.start_layer ?? 0)).replace('{end}', String(assignment?.end_layer ?? 0)).replace('{gib}', gib.toFixed(1));

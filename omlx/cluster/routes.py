@@ -1000,7 +1000,7 @@ class ClusterAutoconfigureRequest(BaseModel):
     hosts: list[ClusterHostRequest] = Field(default_factory=list, max_length=64)
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
     prefer: Literal["speed", "capacity"] = "speed"
-    strategy: Literal["auto", "tensor", "pipeline"] = "auto"
+    strategy: Literal["auto", "tensor", "pipeline", "expert"] = "auto"
     detect_transports: bool = True
     preflight: bool = True
     auto_tune: bool = True
@@ -1366,10 +1366,12 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     # stage. Measured bandwidth is used where a node has been probed, so two
     # links of the same kind are not treated as interchangeable.
     link_profiles = _measured_link_profiles(request)
+    ep = getattr(choice, "expert_parallel_size", 1)
+    group_width = max(choice.tensor_parallel_size, ep)
     placement = order_hosts_for_topology(
         [host.ssh for host in request.hosts],
         transports,
-        choice.tensor_parallel_size,
+        group_width,
         link_profiles,
     )
     warnings.extend(placement.warnings)
@@ -1408,22 +1410,34 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # Host order defines rank order. Rebuild the plan against that exact
         # order so assignments, memory budgets and transport endpoints cannot
         # describe three different rank maps.
-        ordered_plan = plan_hybrid(
-            model,
-            ordered_budgets,
-            tensor_parallel_size=choice.tensor_parallel_size,
-            workload_profile=request.execution_profile,
-            context_tokens=request.target_context_tokens,
-        )
+        if ep > 1:
+            ordered_plan = _build_performance_plan(
+                model,
+                ordered_budgets,
+                tensor_parallel_size=choice.tensor_parallel_size,
+                expert_parallel_size=ep,
+                workload_profile=request.execution_profile,
+                microbatch_size=1,  # plan_hybrid default
+                context_tokens=request.target_context_tokens,
+            )
+        else:
+            ordered_plan = plan_hybrid(
+                model,
+                ordered_budgets,
+                tensor_parallel_size=choice.tensor_parallel_size,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+            )
         choice = replace(choice, plan=ordered_plan)
+    group_label = "Expert" if ep > 1 else "Tensor"
     for group in tp_groups_spanning_slow_links(
         [host.ssh for host in ordered_hosts],
         transports,
-        choice.tensor_parallel_size,
+        group_width,
         link_profiles,
     ):
         warnings.append(
-            f"Tensor-parallel group {' + '.join(group)} spans a slow link; "
+            f"{group_label}-parallel group {' + '.join(group)} spans a slow link; "
             f"every layer's all-reduce will cross it."
         )
 
@@ -1520,6 +1534,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 runtime_options=dict(choice.plan.model.runtime_options),
                 execution=probe_execution,
                 tensor_parallel_size=choice.tensor_parallel_size,
+                expert_parallel_size=ep,
                 target_context_tokens=request.target_context_tokens,
             )
             performance_probe = await asyncio.to_thread(
@@ -1546,6 +1561,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 model,
                 measured_budgets,
                 tensor_parallel_size=choice.tensor_parallel_size,
+                expert_parallel_size=ep,
                 workload_profile=request.execution_profile,
                 microbatch_size=probe_execution.pipeline_microbatch_size,
                 context_tokens=request.target_context_tokens,
@@ -1607,6 +1623,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "fabric_ready": fabric_ready,
         "fabric_blocker": _redact_diagnostic(fabric_blocker),
         "tensor_parallel_size": choice.tensor_parallel_size,
+        **({"expert_parallel_size": ep} if ep != 1 else {}),
         "pipeline_stages": choice.pipeline_stages,
         "summary": choice.reason,
         "link": describe_transports(transports),
@@ -1651,6 +1668,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 request.ring_connections_per_ip if backend == "ring" else None
             ),
             "tensor_parallel_size": choice.tensor_parallel_size,
+            **({"expert_parallel_size": ep} if ep != 1 else {}),
             "nodes": [node.model_dump() for node in profiled_request_nodes],
             "hosts": activation_hosts,
             "preflight": True,
