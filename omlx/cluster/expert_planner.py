@@ -16,6 +16,7 @@ from .planner import (
     _kv_bytes_for_stage,
     _kv_bytes_per_token_for_stage,
     _max_context_for_stage,
+    _reserve_specprefill_draft,
     plan_unequal_pipeline,
 )
 
@@ -68,11 +69,7 @@ def plan_expert_parallel(
         raise PlanningError("model has no verified expert inventory")
     if world // ep > 1 and not model.supports_pipeline:
         raise PlanningError("model does not support pipeline stages")
-    for key, opt in (model.runtime_options or {}).items():
-        get = opt.get if isinstance(opt, dict) else lambda k, d=None: getattr(opt, k, d)
-        if get("kind", key) in ("specprefill", "dflash", "vlm_mtp") and get(
-                "reserved_bytes", 0):
-            raise PlanningError("expert parallel does not support reserved drafts yet")
+    nodes = _reserve_specprefill_draft(model, nodes, context_tokens)
 
     groups = [nodes[i:i + ep] for i in range(0, world, ep)]
     vnodes = [
