@@ -119,8 +119,21 @@ class ModelLayout:
     layer_kv_bytes_per_token: tuple[int, ...] = ()
     layer_kv_fixed_bytes: tuple[int, ...] = ()
     kv_cache_step: int = 1
+    # Per-layer bytes every TP member holds whole (not sharded). Empty = none.
+    layer_tp_replicated_bytes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        replicated = tuple(self.layer_tp_replicated_bytes)
+        object.__setattr__(self, "layer_tp_replicated_bytes", replicated)
+        if replicated:
+            if len(replicated) != len(self.layer_weight_bytes) or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in replicated
+            ) or any(r > w for r, w in zip(replicated, self.layer_weight_bytes)):
+                raise ValueError(
+                    "layer_tp_replicated_bytes must be non-negative integers "
+                    "matching layers and not exceeding layer weights"
+                )
         object.__setattr__(
             self, "runtime_options", validate_runtime_options(self.runtime_options)
         )
@@ -204,6 +217,8 @@ class ModelLayout:
             ),
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
+            **({"layer_tp_replicated_bytes": list(self.layer_tp_replicated_bytes)}
+               if self.layer_tp_replicated_bytes else {}),
             **({"layer_kv_bytes_per_token": list(self.layer_kv_bytes_per_token),
                 "layer_kv_fixed_bytes": list(self.layer_kv_fixed_bytes),
                 "kv_cache_step": self.kv_cache_step} if self.layer_kv_bytes_per_token else {}),
@@ -247,6 +262,9 @@ class ModelLayout:
                 layer_kv_bytes_per_token=tuple(payload.get("layer_kv_bytes_per_token", ())),
                 layer_kv_fixed_bytes=tuple(payload.get("layer_kv_fixed_bytes", ())),
                 kv_cache_step=payload.get("kv_cache_step", 1),
+                layer_tp_replicated_bytes=tuple(
+                    payload.get("layer_tp_replicated_bytes", ())
+                ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
                 ),
@@ -1082,9 +1100,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
 
     fixed_bytes = 0
     layer_sizes: dict[int, int] = {}
+    replicated_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
-    adapter = adapter_for_config(_model_config(root))
+    config = _model_config(root)
+    classify_tp = str(config.get("model_type", "")) in _QWEN4_TP_MODEL_TYPES
+    adapter = adapter_for_config(config)
     for weight_file in _model_weight_files(root):
         header, payload_bytes = _safetensors_header(weight_file)
         intervals: list[tuple[int, int, str]] = []
@@ -1119,6 +1140,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 layer_sizes[layer_index] = (
                     layer_sizes.get(layer_index, 0) + tensor_bytes
                 )
+                if classify_tp:
+                    replicated_sizes.setdefault(layer_index, 0)
+                    if _qwen4_tensor_replicated(name):
+                        replicated_sizes[layer_index] += tensor_bytes
             tensor_count += 1
         intervals.sort()
         for previous, current in zip(intervals, intervals[1:]):
@@ -1175,7 +1200,31 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         ),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(_model_config(root)),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(_model_config(root)),
+        layer_tp_replicated_bytes=(
+            tuple(replicated_sizes.get(index, 0) for index in expected_indices)
+            if classify_tp
+            else ()
+        ),
     )
+
+
+_QWEN4_TP_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+_QWEN4_LAYER_RE = re.compile(
+    r"(?:model\.language_model|language_model\.model)\.layers\.\d+\.(.+)"
+)
+# Explicit TP-sharded module paths; quantization tensors (weight/scales/biases)
+# are one trailing segment under a projection. Everything else is replicated.
+_QWEN4_SHARDED_RE = re.compile(
+    r"linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj|conv1d)\.[^.]+"
+    r"|linear_attn\.(?:A_log|dt_bias)"
+    r"|self_attn\.(?:q_proj|k_proj|v_proj|o_proj)\.[^.]+"
+    r"|mlp\.(?:switch_mlp|shared_expert)\.(?:gate_proj|up_proj|down_proj)\.[^.]+"
+)
+
+
+def _qwen4_tensor_replicated(name: str) -> bool:
+    match = _QWEN4_LAYER_RE.fullmatch(name)
+    return match is None or _QWEN4_SHARDED_RE.fullmatch(match.group(1)) is None
 
 
 # Directory mtime + config mtime + per-shard (name, mtime, size). The shard
@@ -2197,14 +2246,19 @@ def plan_hybrid(
     kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
     if model.kv_replicated_across_tp:
         kv_bytes_per_layer *= tensor_parallel_size
+    replicated_bytes = model.layer_tp_replicated_bytes or (0,) * len(
+        model.layer_weight_bytes
+    )
     try:
         ranges = _partition_layers(
             model.layer_weight_bytes,
             stage_budgets,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + (tensor_parallel_size - 1) * replicated + kv_bytes_per_layer
+                for weight_bytes, replicated in zip(
+                    model.layer_weight_bytes, replicated_bytes
+                )
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
@@ -2222,16 +2276,18 @@ def plan_hybrid(
     assignments: list[PipelineAssignment] = []
     for stage, group in enumerate(stage_groups):
         start, end = stage_ranges[stage]
-        stage_layer_bytes = sum(model.layer_weight_bytes[start:end])
-        # The stage's layer weights are split across its TP members; the first
-        # `remainder` ranks carry one extra byte so the parts sum exactly.
+        stage_replicated = sum(replicated_bytes[start:end])
+        stage_layer_bytes = sum(model.layer_weight_bytes[start:end]) - stage_replicated
+        # Only the sharded part is split; replicas are held whole by every
+        # member. The first `remainder` ranks carry one extra byte.
         per_member = stage_layer_bytes // tensor_parallel_size
         remainder = stage_layer_bytes % tensor_parallel_size
         kv_bytes = _kv_bytes_for_stage(
             model, end - start, context_tokens, tensor_parallel_size
         )
         for tp_rank, node in enumerate(group):
-            held_layer_bytes = per_member + (1 if tp_rank < remainder else 0)
+            sharded_bytes = per_member + (1 if tp_rank < remainder else 0)
+            held_layer_bytes = sharded_bytes + stage_replicated
             planned = model.fixed_weight_bytes + held_layer_bytes + kv_bytes
             if planned > node.usable_bytes:
                 raise PlanningError(
@@ -2272,7 +2328,7 @@ def plan_hybrid(
                         tensor_parallel_size=tensor_parallel_size,
                     ),
                     sharded_weight_bytes=(
-                        held_layer_bytes if tensor_parallel_size > 1 else 0
+                        sharded_bytes if tensor_parallel_size > 1 else 0
                     ),
                     predicted_compute_seconds=(
                         compute_seconds if performance_aware else None
