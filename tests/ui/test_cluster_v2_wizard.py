@@ -1765,14 +1765,16 @@ component.setPlanStrategy('tensor');
 process.stdout.write(JSON.stringify({
   keys: options.map((option) => option.key),
   tensor: options.find((option) => option.key === 'tensor'),
+  expert: options.find((option) => option.key === 'expert'),
   afterPick: component.planStrategy,
   recommended: component.recommendedStrategy(),
 }));
 """,
     )
 
-    assert result["keys"] == ["auto", "tensor", "pipeline"]
+    assert result["keys"] == ["auto", "tensor", "pipeline", "expert"]
     assert result["tensor"]["disabled"] is True
+    assert result["expert"]["disabled"] is True
     assert result["tensor"]["disabledReason"] == "Tensor parallelism needs 2+ Macs"
     assert result["afterPick"] == "auto", "a disabled option cannot be picked"
     # No catalogue call ever fired on a one-Mac setup → no badge, no errors.
@@ -2500,6 +2502,170 @@ process.stdout.write(JSON.stringify({
         ["node-e", "checking what is already there…"],
     ]
     assert result["overall"] == "Copying the model to your Macs — 1 of 5 ready"
+
+
+_RUNTIME_OPTS = (
+    "mtp_enabled", "vlm_mtp_enabled", "dflash_enabled",
+    "specprefill_enabled", "turboquant_kv_enabled",
+)
+_RUNTIME_SETUP = (
+    "component.modelOptions = [{model_path: 'target', available_optimizations: "
+    + json.dumps(list(_RUNTIME_OPTS))
+    + "}];\ncomponent.selectedModelPath = 'target';\n"
+)
+
+
+def test_runtime_overrides_serialize_exact_dicts():
+    result = _run_wizard(
+        _RUNTIME_SETUP
+        + """
+const inherit = component.runtimeOverrides();
+component.runtimeMode = 'ddtree';
+component.runtimeDraftPath = ' /draft ';
+component.runtimeTreeMemoryGiB = .5;
+component.runtimeTreeBranches = 3;
+component.runtimeTreeNodes = 7;
+component.runtimeSpecPrefill = 'on';
+component.runtimeSpecDraftPath = '/spec';
+component.runtimeSpecKeepPct = .2;
+component.runtimeSpecThreshold = 8192;
+component.runtimeTurboQuant = 'on';
+component.runtimeTurboBits = 3.5;
+component.runtimeTurboSkipLast = false;
+process.stdout.write(JSON.stringify({inherit, full: component.runtimeOverrides()}));
+"""
+    )
+    assert result["inherit"] == {}
+    assert result["full"] == {
+        "mtp_enabled": False,
+        "vlm_mtp_enabled": False,
+        "dflash_enabled": True,
+        "dflash_draft_model": "/draft",
+        "dflash_verify_mode": "ddtree",
+        "dflash_ddtree_memory_bytes": 536870912,
+        "dflash_ddtree_max_branches": 3,
+        "dflash_ddtree_max_nodes": 7,
+        "specprefill_enabled": True,
+        "specprefill_draft_model": "/spec",
+        "specprefill_keep_pct": 0.2,
+        "specprefill_threshold": 8192,
+        "turboquant_kv_enabled": True,
+        "turboquant_kv_bits": 3.5,
+        "turboquant_skip_last": False,
+    }
+
+
+def test_runtime_unsupported_ignored_and_missing_path_errors():
+    result = _run_wizard(
+        """
+component.modelOptions = [{model_path: 'target', available_optimizations: []}];
+component.selectedModelPath = 'target';
+component.runtimeMode = 'ddtree';
+component.runtimeSpecPrefill = 'on';
+component.runtimeTurboQuant = 'on';
+const unsupported = {
+  modes: component.runtimeModeOptions().map((o) => o.key),
+  overrides: component.runtimeOverrides(),
+};
+component.modelOptions[0].available_optimizations = ['vlm_mtp_enabled'];
+component.runtimeMode = 'external';
+component.runtimeDraftPath = '  ';
+let message = null;
+try { component.runtimeOverrides(); } catch (e) { message = e.message; }
+process.stdout.write(JSON.stringify({unsupported, message}));
+"""
+    )
+    assert result["unsupported"] == {"modes": ["inherit", "ordinary"], "overrides": {}}
+    assert result["message"] != "cluster.v2.runtime.choose_draft"
+    assert result["message"]
+    assert "draft" in result["message"].lower()
+
+
+def test_runtime_model_select_resets_and_native_ordinary_flags():
+    result = _run_wizard(
+        _RUNTIME_SETUP
+        + """
+let plans = 0;
+component.runPlan = async () => { plans += 1; };
+component.runtimeMode = 'ddtree';
+component.runtimeTurboQuant = 'on';
+(async () => {
+  await component.selectModel(component.modelOptions[0]);
+  const reset = {mode: component.runtimeMode, tq: component.runtimeTurboQuant, plans};
+  component.runtimeMode = 'native';
+  component.runtimeMtpDepth = '4';
+  const native = component.runtimeOverrides();
+  component.runtimeMode = 'ordinary';
+  const ordinary = component.runtimeOverrides();
+  process.stdout.write(JSON.stringify({reset, native, ordinary}));
+})();
+"""
+    )
+    assert result["reset"] == {"mode": "inherit", "tq": "inherit", "plans": 1}
+    assert result["native"]["mtp_fixed_depth"] == 4
+    assert result["native"]["mtp_enabled"] is True
+    assert result["ordinary"] == {
+        "mtp_enabled": False, "vlm_mtp_enabled": False, "dflash_enabled": False,
+    }
+
+
+def test_deployment_runtime_overrides_copies_user_fields_only():
+    result = _run_wizard(
+        """
+const src = {
+  mtp_enabled: true, mtp_depth: 4, vlm_mtp_enabled: false, dflash_enabled: false,
+  specprefill_enabled: true, specprefill_draft_model: '/spec',
+  specprefill_keep_pct: .2, specprefill_threshold: 8192,
+  turboquant_kv_enabled: true, turboquant_kv_bits: 3.5,
+  turboquant_skip_last: false,
+  kv_reserved_bytes: 1, draft_reserved_bytes: 2, specprefill_max_prompt_tokens: 9,
+};
+const before = JSON.stringify(src);
+const out = component.deploymentRuntimeOverrides({runtime_options: src});
+const empty = component.deploymentRuntimeOverrides({runtime_options: {}});
+const dflash = component.deploymentRuntimeOverrides({runtime_options: {dflash_enabled: true}});
+process.stdout.write(JSON.stringify({out, empty, dflash, same: before === JSON.stringify(src)}));
+"""
+    )
+    out = result["out"]
+    assert out["mtp_enabled"] is True
+    assert out["mtp_fixed_depth"] == 4
+    assert out["mtp_adaptive_max_depth"] is None
+    assert out["specprefill_draft_model"] == "/spec"
+    assert out["specprefill_keep_pct"] == 0.2
+    assert out["specprefill_threshold"] == 8192
+    assert out["turboquant_kv_enabled"] is True
+    assert out["turboquant_kv_bits"] == 3.5
+    assert out["turboquant_skip_last"] is False
+    assert out["vlm_mtp_enabled"] is False
+    assert out["dflash_enabled"] is False
+    assert not [k for k in out if k.endswith("_reserved_bytes") or k.endswith("_max_prompt_tokens")]
+    assert all(result["empty"][k] is False for k in _RUNTIME_OPTS)
+    assert result["dflash"]["dflash_enabled"] is True
+    assert result["dflash"]["dflash_capture_cache"] is False
+    assert result["dflash"]["dflash_sink_kv_cache"] is True
+    assert result["dflash"]["dflash_verify_mode"] == "dflash"
+    assert result["same"] is True
+
+
+def test_runtime_template_bindings_and_i18n():
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-runtime" in template
+    for model in (
+        "runtimeMode", "runtimeDraftPath", "runtimeMtpDepth",
+        "runtimeTreeMemoryGiB", "runtimeSpecPrefill", "runtimeTurboQuant",
+    ):
+        assert f'x-model="{model}"' in template
+    keys = set(re.findall(r"t\('(cluster\.v2\.runtime\.[a-z_]+)'\)", template))
+    keys |= {
+        f"cluster.v2.runtime.{k}"
+        for k in ("inherit", "ordinary", "native", "external", "dflash", "ddtree")
+    }
+    for lang in ("en", "fr"):
+        catalog = json.loads(
+            (ROOT / f"omlx/admin/i18n/{lang}.json").read_text(encoding="utf-8")
+        )
+        assert not [k for k in sorted(keys) if not catalog.get(k)], lang
 
 
 def test_old_server_without_stage_degrades_to_direct_activation():

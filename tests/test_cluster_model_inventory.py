@@ -28,6 +28,53 @@ def _model(
     }
 
 
+def test_merge_publishes_central_adapter_optimizations(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "omlx.cluster.model_adapters.adapter_for_type",
+        lambda t: SimpleNamespace(
+            optimizations=("mtp_enabled", "specprefill_enabled")
+        )
+        if t == "future_backbone"
+        else None,
+    )
+    future, unknown = merge_model_inventories(
+        [
+            (
+                "local",
+                "127.0.0.1",
+                [
+                    {
+                        "id": "future",
+                        "model_path": "/future",
+                        "model_type": "vlm",
+                        "config_model_type": "future_backbone",
+                        "estimated_size": 10,
+                    },
+                    {
+                        "id": "unknown",
+                        "model_path": "/unknown",
+                        "model_type": "vlm",
+                        "config_model_type": "unknown",
+                        "estimated_size": 10,
+                        "available_optimizations": ["forged"],
+                    },
+                ],
+            )
+        ]
+    )
+
+    assert future["available_optimizations"] == [
+        "mtp_enabled",
+        "specprefill_enabled",
+    ]
+    assert unknown["available_optimizations"] == []
+    assert future["model_source"] == "127.0.0.1"
+    assert future["source_node_id"] == "local"
+    assert future["locations"][0]["model_path"] == "/future"
+
+
 def test_a_shared_model_is_listed_once_with_every_location():
     local = _model(size=62, path="/Users/omlx/.omlx/models/MiniMax-M3-4bit")
     studio = _model(size=236, path="/Users/omlx/.omlx/models/MiniMax-M3-4bit")

@@ -778,6 +778,93 @@
                     </div>
                 </div>
 
+                <div class="mt-4 rounded-xl border border-neutral-200 px-3 py-2.5 space-y-2"
+                     data-cluster-v2-runtime
+                     x-show="selectedModel()?.available_optimizations?.length" x-cloak>
+                    <span class="block text-xs font-semibold text-neutral-900">{{ t('cluster.v2.runtime.title') }}</span>
+                    <span class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.blurb') }}</span>
+                    <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.decode') }}
+                        <select x-model="runtimeMode" @change="runPlan()" :disabled="planLoading"
+                                class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 bg-white disabled:opacity-40">
+                            <template x-for="o in runtimeModeOptions()" :key="o.key">
+                                <option :value="o.key" x-text="o.label"></option>
+                            </template>
+                        </select>
+                    </label>
+                    <label class="block text-[10px] text-neutral-500" x-show="['external','dflash','ddtree'].includes(runtimeMode)">{{ t('cluster.v2.runtime.draft') }}
+                        <input type="text" x-model="runtimeDraftPath" @change="runPlan()" :disabled="planLoading"
+                               placeholder="{{ t('cluster.v2.runtime.choose_draft') }}"
+                               class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                    </label>
+                    <label class="block text-[10px] text-neutral-500" x-show="runtimeMode === 'native'">{{ t('cluster.v2.runtime.native_depth') }}
+                        <input type="number" min="1" max="8" step="1" x-model="runtimeMtpDepth" @change="runPlan()" :disabled="planLoading"
+                               class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                    </label>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2" x-show="runtimeMode === 'ddtree'">
+                        <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.tree_memory') }}
+                            <input type="number" min="0" step="any" x-model="runtimeTreeMemoryGiB" @change="runPlan()" :disabled="planLoading"
+                                   class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                        </label>
+                        <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.tree_branches') }}
+                            <input type="number" min="2" max="16" step="1" x-model="runtimeTreeBranches" @change="runPlan()" :disabled="planLoading"
+                                   class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                        </label>
+                        <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.tree_nodes') }}
+                            <input type="number" min="2" max="64" step="1" x-model="runtimeTreeNodes" @change="runPlan()" :disabled="planLoading"
+                                   class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                        </label>
+                    </div>
+                    <div x-show="runtimeSupports('specprefill')" class="space-y-2">
+                        <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.specprefill') }}
+                            <select x-model="runtimeSpecPrefill" @change="runPlan()" :disabled="planLoading"
+                                    class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 bg-white disabled:opacity-40">
+                                <option value="inherit">{{ t('cluster.v2.runtime.inherit') }}</option>
+                                <option value="on">{{ t('cluster.v2.common.on') }}</option>
+                                <option value="off">{{ t('cluster.v2.common.off') }}</option>
+                            </select>
+                        </label>
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2" x-show="runtimeSpecPrefill === 'on'">
+                            <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.draft') }}
+                                <input type="text" x-model="runtimeSpecDraftPath" @change="runPlan()" :disabled="planLoading"
+                                       placeholder="{{ t('cluster.v2.runtime.choose_draft') }}"
+                                       class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                            </label>
+                            <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.keep_pct') }}
+                                <input type="number" min="0" max="1" step="any" x-model="runtimeSpecKeepPct" @change="runPlan()" :disabled="planLoading"
+                                       class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                            </label>
+                            <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.threshold') }}
+                                <input type="number" min="2" step="1" x-model="runtimeSpecThreshold" @change="runPlan()" :disabled="planLoading"
+                                       class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 disabled:opacity-40">
+                            </label>
+                        </div>
+                    </div>
+                    <div x-show="runtimeSupports('turboquant')" class="space-y-2">
+                        <label class="block text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.turboquant') }}
+                            <select x-model="runtimeTurboQuant" @change="runPlan()" :disabled="planLoading"
+                                    class="mt-1 block w-full text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 bg-white disabled:opacity-40">
+                                <option value="inherit">{{ t('cluster.v2.runtime.inherit') }}</option>
+                                <option value="on">{{ t('cluster.v2.common.on') }}</option>
+                                <option value="off">{{ t('cluster.v2.common.off') }}</option>
+                            </select>
+                        </label>
+                        <div class="flex items-center gap-3" x-show="runtimeTurboQuant === 'on'">
+                            <label class="text-[10px] text-neutral-500">{{ t('cluster.v2.runtime.bits') }}
+                                <select x-model="runtimeTurboBits" @change="runPlan()" :disabled="planLoading"
+                                        class="ml-1 text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 bg-white disabled:opacity-40">
+                                    <option value="3.5">3.5</option>
+                                    <option value="4">4</option>
+                                </select>
+                            </label>
+                            <label class="inline-flex items-center gap-1.5 text-[10px] text-neutral-500">
+                                <input type="checkbox" x-model="runtimeTurboSkipLast" @change="runPlan()" :disabled="planLoading"
+                                       class="h-4 w-4 rounded border-neutral-300 disabled:opacity-40">
+                                {{ t('cluster.v2.runtime.skip_last') }}
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- The rank-local memory prompt cache is always on. Durable
                      SSD snapshots are opt-in because the first request writes
                      one shard-local snapshot per rank at each boundary. -->

@@ -177,6 +177,12 @@ def merge_model_inventories(
             ),
         )
         result = dict(source_model)
+        from .model_adapters import adapter_for_type
+
+        adapter = adapter_for_type(str(source_model.get("config_model_type") or ""))
+        result["available_optimizations"] = (
+            list(adapter.optimizations) if adapter is not None else []
+        )
         result.update(
             {
                 "model_key": identity,

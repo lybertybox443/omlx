@@ -264,6 +264,19 @@ function clusterV2Wizard() {
         promptCacheSsd: true,
         promptCacheSsdMaxGiB: 20,
         targetContextTokens: 32768,
+        runtimeMode: 'inherit',
+        runtimeDraftPath: '',
+        runtimeMtpDepth: '',
+        runtimeSpecPrefill: 'inherit',
+        runtimeSpecDraftPath: '',
+        runtimeSpecKeepPct: .2,
+        runtimeSpecThreshold: 8192,
+        runtimeTurboQuant: 'inherit',
+        runtimeTurboBits: 4,
+        runtimeTurboSkipLast: true,
+        runtimeTreeMemoryGiB: 1,
+        runtimeTreeBranches: 3,
+        runtimeTreeNodes: 7,
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
         // (null = not attempted yet). catalogueFailed switches the
         // recommendation badge to the fast-transport heuristic.
@@ -2290,7 +2303,130 @@ function clusterV2Wizard() {
             this.planProposal = null;
             this.checks.benchmark = null;
             this.normalizePlanStrategy();
+            this.resetRuntimeOptions();
             await this.runPlan();
+        },
+
+        runtimeSupports(name) {
+            const list = this.selectedModel()?.available_optimizations;
+            return Array.isArray(list) && list.includes(name);
+        },
+
+        runtimeModeOptions() {
+            const keys = ['inherit', 'ordinary'];
+            if (this.runtimeSupports('mtp_enabled')) keys.push('native');
+            if (this.runtimeSupports('vlm_mtp_enabled')) keys.push('external');
+            if (this.runtimeSupports('dflash_enabled')) keys.push('dflash', 'ddtree');
+            return keys.map((key) => ({
+                key,
+                label: window.t(`cluster.v2.runtime.${key}`),
+            }));
+        },
+
+        resetRuntimeOptions() {
+            this.runtimeMode = 'inherit';
+            this.runtimeDraftPath = '';
+            this.runtimeMtpDepth = '';
+            this.runtimeSpecPrefill = 'inherit';
+            this.runtimeSpecDraftPath = '';
+            this.runtimeSpecKeepPct = .2;
+            this.runtimeSpecThreshold = 8192;
+            this.runtimeTurboQuant = 'inherit';
+            this.runtimeTurboBits = 4;
+            this.runtimeTurboSkipLast = true;
+            this.runtimeTreeMemoryGiB = 1;
+            this.runtimeTreeBranches = 3;
+            this.runtimeTreeNodes = 7;
+        },
+
+        runtimeOverrides() {
+            const out = {};
+            const need = (path) => {
+                const p = String(path || '').trim();
+                if (!p) throw new Error(window.t('cluster.v2.runtime.choose_draft'));
+                return p;
+            };
+            const mode = this.runtimeMode;
+            const allowed = this.runtimeModeOptions().some((o) => o.key === mode);
+            if (mode !== 'inherit' && allowed) {
+                out.mtp_enabled = mode === 'native';
+                out.vlm_mtp_enabled = mode === 'external';
+                out.dflash_enabled = mode === 'dflash' || mode === 'ddtree';
+                if (mode === 'native' && String(this.runtimeMtpDepth).trim() !== '') {
+                    out.mtp_fixed_depth = Number(this.runtimeMtpDepth);
+                } else if (mode === 'external') {
+                    out.vlm_mtp_draft_model = need(this.runtimeDraftPath);
+                } else if (mode === 'dflash' || mode === 'ddtree') {
+                    out.dflash_draft_model = need(this.runtimeDraftPath);
+                    out.dflash_verify_mode = mode === 'ddtree' ? 'ddtree' : 'dflash';
+                    if (mode === 'ddtree') {
+                        out.dflash_ddtree_memory_bytes = Math.round(
+                            Number(this.runtimeTreeMemoryGiB) * 1024 ** 3,
+                        );
+                        out.dflash_ddtree_max_branches = Number(this.runtimeTreeBranches);
+                        out.dflash_ddtree_max_nodes = Number(this.runtimeTreeNodes);
+                    }
+                }
+            }
+            if (
+                this.runtimeSpecPrefill !== 'inherit' &&
+                this.runtimeSupports('specprefill_enabled')
+            ) {
+                const on = this.runtimeSpecPrefill === 'on';
+                out.specprefill_enabled = on;
+                if (on) {
+                    out.specprefill_draft_model = need(this.runtimeSpecDraftPath);
+                    out.specprefill_keep_pct = Number(this.runtimeSpecKeepPct);
+                    out.specprefill_threshold = Number(this.runtimeSpecThreshold);
+                }
+            }
+            if (
+                this.runtimeTurboQuant !== 'inherit' &&
+                this.runtimeSupports('turboquant_kv_enabled')
+            ) {
+                const on = this.runtimeTurboQuant === 'on';
+                out.turboquant_kv_enabled = on;
+                if (on) {
+                    out.turboquant_kv_bits = Number(this.runtimeTurboBits);
+                    out.turboquant_skip_last = !!this.runtimeTurboSkipLast;
+                }
+            }
+            return out;
+        },
+
+        deploymentRuntimeOverrides(deployment) {
+            const options = deployment?.runtime_options || {};
+            const out = {};
+            const prefixes = ['dflash_', 'vlm_mtp_', 'specprefill_', 'turboquant_'];
+            for (const [key, value] of Object.entries(options)) {
+                if (!Object.prototype.hasOwnProperty.call(options, key)) continue;
+                if (!prefixes.some((p) => key.startsWith(p))) continue;
+                if (key.endsWith('_reserved_bytes') || key.endsWith('_max_prompt_tokens')) continue;
+                if (value === null || !['string', 'number', 'boolean'].includes(typeof value)) continue;
+                out[key] = value;
+            }
+            out.specprefill_enabled = Boolean(options.specprefill_draft_model);
+            for (const flag of ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled', 'turboquant_kv_enabled']) {
+                out[flag] = options[flag] === true;
+            }
+            if (options.mtp_depth !== undefined && options.mtp_depth !== null) {
+                const depth = Number(options.mtp_depth);
+                if (options.mtp_adaptive) {
+                    out.mtp_adaptive_max_depth = depth;
+                    out.mtp_fixed_depth = null;
+                } else {
+                    out.mtp_fixed_depth = depth;
+                    out.mtp_adaptive_max_depth = null;
+                }
+            }
+            if (out.dflash_enabled === true) {
+                for (const k of ['dflash_capture_cache', 'dflash_async_prefill', 'dflash_predraft', 'dflash_evict_on_fallback']) {
+                    if (out[k] === undefined) out[k] = false;
+                }
+                if (out.dflash_sink_kv_cache === undefined) out.dflash_sink_kv_cache = true;
+                if (out.dflash_verify_mode === undefined) out.dflash_verify_mode = 'dflash';
+            }
+            return out;
         },
 
         // =====================================================================
@@ -2623,6 +2759,7 @@ function clusterV2Wizard() {
                         1,
                         Number(this.targetContextTokens) || 32768,
                     ),
+                    runtime_overrides: this.runtimeOverrides(),
                 };
                 if (
                     model?.model_source &&
@@ -3344,6 +3481,8 @@ function clusterV2Wizard() {
                         method: 'POST',
                         body: JSON.stringify({
                             deployment_id: deployment.deployment_id,
+                            runtime_overrides:
+                                this.deploymentRuntimeOverrides(deployment),
                             path_map: deployment.path_map || {},
                             model_path: deployment.model,
                             nodes,
