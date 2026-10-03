@@ -4089,6 +4089,16 @@ class Qwen4ExpModel(nn.Module):
             if self.fa_idx is None
             else _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
         )
+        decode_left_padding = (
+            getattr(cache[self.fa_idx], "_qwen3_5_decode_left_padding", None)
+            if self.fa_idx is not None
+            and isinstance(fa_mask, str)
+            and fa_mask == "left_padded_decode"
+            else None
+        )
+        q35_language._set_qwen3_5_decode_left_padding(
+            cache, layers, decode_left_padding
+        )
         ssm_mask = (
             None
             if self.ssm_idx is None

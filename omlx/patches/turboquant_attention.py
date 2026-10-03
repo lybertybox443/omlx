@@ -479,6 +479,10 @@ def _patch_vlm_target_verify_attention() -> None:
             return original(queries, keys, values, cache=cache, scale=scale, mask=mask)
 
         sdpa = q35_lang.scaled_dot_product_attention
+        # Decode: keep packed cache and per-row padding metadata so the shared
+        # patched_sdpa restores the boolean mask and uses quantized kernels.
+        if queries.shape[-2] == 1:
+            return sdpa(queries, keys, values, cache=cache, scale=scale, mask=mask)
         if queries.shape[0] == 1 and not isinstance(mask, mx.array):
             return sdpa(
                 queries, keys, values, cache=cache, scale=scale, mask="causal"
@@ -561,6 +565,18 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache, _VLMBatchTQCache)):
+            if queries.shape[-2] == 1 and mask is None:
+                # Qwen3.5 sets mask=None for 'left_padded_decode' before the
+                # helper runs, so padded keys would be attended unmasked.
+                # Rebuild the lost mask from the per-row pads marker.
+                pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+                if pads is not None:
+                    width = _state_length(getattr(keys, "_state", keys))
+                    pads_arr = pads if isinstance(pads, mx.array) else mx.array(pads)
+                    mask = (
+                        mx.arange(width)[None, None, None, :]
+                        >= pads_arr[:, None, None, None]
+                    )
             if sinks is not None:
                 # TurboQuant's quantized kernels do not implement attention
                 # sinks. Preserve correctness by falling back to MLX's
