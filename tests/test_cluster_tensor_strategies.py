@@ -349,3 +349,39 @@ def test_invalid_owned_range_rejected_before_mutation(shape):
         apply_tensor_strategy(model, _FakeGroup(2, 0), mx_module=mx)
     assert model.model.layers is layers
     assert a.sharded == b.sharded == 0
+
+
+def test_tensor_finalizer_runs_after_sharding_before_layer_eval(monkeypatch):
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model, layers = _qwen4_layers()
+    events = []
+    original_eval = mx.eval
+
+    def finalize(layer):
+        assert layer.mlp.inner.switch_mlp.gate_proj.weight.shape[1] == 8
+        events.append("finalize")
+
+    def evaluate(*values):
+        if len(values) == 1 and isinstance(values[0], dict):
+            assert events[-1] == "finalize"
+            events.append("eval")
+        return original_eval(*values)
+
+    monkeypatch.setattr(mx, "eval", evaluate)
+    ts.apply_tensor_strategy(model, _FakeGroup(2, 0), mx_module=mx,
+                             finalize_layer=finalize)
+    assert events == [event for _ in layers for event in ("finalize", "eval")]
+
+
+def test_unsupported_finalizer_refuses_before_native_mutation():
+    from types import SimpleNamespace
+    from omlx.cluster import tensor_strategies as ts
+
+    called = []
+    model = SimpleNamespace(model_type="unknown", shard=lambda group: called.append(group))
+    with pytest.raises(RuntimeError, match="layer finalizer"):
+        ts.apply_tensor_strategy(model, _FakeGroup(2, 0), mx_module=mx,
+                                 finalize_layer=lambda layer: None)
+    assert called == []

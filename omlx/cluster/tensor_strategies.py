@@ -670,6 +670,8 @@ def _shard_qwen4_exp(
     group: Any,
     mx: Any,
     progress: ProgressCallback | None,
+    *,
+    finalize_layer: Callable[[Any], None] | None = None,
 ) -> None:
     from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
@@ -751,6 +753,8 @@ def _shard_qwen4_exp(
                 shard_inplace(getattr(mlp.switch_mlp, name), sharding, group=group)
                 shard_inplace(getattr(mlp.shared_expert, name), sharding, group=group)
             layer.mlp = _wrap_sharded_moe(mlp, group, mx)
+        if finalize_layer is not None:
+            finalize_layer(layer)
         mx.eval(layer.parameters())
         mx.clear_cache()
         _emit(
@@ -762,17 +766,26 @@ def _shard_qwen4_exp(
         )
 
 
+def supports_layer_finalizer(model: Any) -> bool:
+    """Whether the registered tensor strategy can finalize a lazy layer."""
+    adapter = _ADAPTERS.get(_model_type(model))
+    return getattr(adapter, "_omlx_tensor_strategy", None) is QWEN4_EXP
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
     *,
     mx_module: Any,
     progress: ProgressCallback | None = None,
+    finalize_layer: Callable[[Any], None] | None = None,
 ) -> str:
     """Shard ``model`` with the registered adapter or its native implementation."""
 
     model_type = _model_type(model)
     adapter = _ADAPTERS.get(model_type)
+    if finalize_layer is not None and not supports_layer_finalizer(model):
+        raise RuntimeError("tensor strategy has no pre-evaluation layer finalizer")
     if adapter is None and not callable(getattr(model, "shard", None)):
         raise RuntimeError(
             f"tensor parallelism is unsupported for model type {model_type!r}: "
@@ -798,7 +811,10 @@ def apply_tensor_strategy(
             _native_layerwise_shard(model, group, mx_module, progress)
             return "native"
         strategy = adapter._omlx_tensor_strategy  # type: ignore[attr-defined]
-        adapter(model, group, mx_module, progress)
+        if finalize_layer is None:
+            adapter(model, group, mx_module, progress)
+        else:
+            adapter(model, group, mx_module, progress, finalize_layer=finalize_layer)
         return strategy.name
     finally:
         owner.layers = original

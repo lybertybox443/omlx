@@ -8,12 +8,14 @@ import re
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
+from types import SimpleNamespace
 
-from .expert_strategies import apply_expert_strategy, inspect_expert_layers
+from .expert_strategies import apply_expert_strategy, inspect_expert_layers, shard_expert_layer
 from .tensor_strategies import (
     apply_tensor_strategy,
     native_shard_is_layer_local,
     supports_model_type,
+    supports_layer_finalizer,
 )
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
@@ -165,9 +167,10 @@ def progressive_sharded_load(
         )
     if expert_group is not None:
         if tensor_group is not None:
-            raise ValueError(
-                "tensor_group and expert_group together (3D TP+EP) is not implemented"
-            )
+            if tensor_group is expert_group:
+                raise ValueError("tensor_group and expert_group must be distinct")
+            if not supports_layer_finalizer(model):
+                raise ValueError("3D TP+EP requires a pre-evaluation tensor layer finalizer")
         if pipeline_group is expert_group:
             raise ValueError("pipeline_group and expert_group must be distinct")
         if int(expert_group.size()) < 1:
@@ -228,7 +231,24 @@ def progressive_sharded_load(
                 progress=progress,
                 layer_index=layer_index,
             )
-    if expert_group is not None:
+    expert_finalize = None
+    expert_owner = None
+    expert_entries = []
+    if expert_group is not None and tensor_group is not None:
+        # Keep only this stage's layers; the discarded pipeline weights can die.
+        expert_owner, expert_plan = inspect_expert_layers(model)
+        expert_layers = {id(layer): (index, mlp, experts)
+                         for index, layer, mlp, experts in expert_plan}
+
+        def expert_finalize(layer):
+            planned = expert_layers.get(id(layer))
+            if planned is not None:
+                index, mlp, experts = planned
+                entry = shard_expert_layer(layer, mlp, experts, expert_group,
+                                           mx_module=mx_module)
+                expert_entries.append({"layer": index, **entry})
+
+    if expert_group is not None and tensor_group is None:
         # Re-preflight after pipeline partition; nothing evaluated yet.
         _owner, plan = inspect_expert_layers(model)
         meta = apply_expert_strategy(
@@ -290,7 +310,15 @@ def progressive_sharded_load(
             tensor_group,
             mx_module=mx_module,
             progress=progress,
+            **({"finalize_layer": expert_finalize} if expert_finalize is not None else {}),
         )
+        if expert_owner is not None:
+            meta = SimpleNamespace(strategy="expert", size=expert_group.size(),
+                                   rank=expert_group.rank(), moe_layers=expert_entries,
+                                   has_moe=bool(expert_entries))
+            expert_owner._expert_strategy = meta
+            if progress is not None:
+                progress({"phase": "expert_ready", "strategy": vars(meta)})
         # A native strategy may also replace a replicated embedding or output
         # head outside its layer loop. Re-flatten after sharding so those new
         # arrays, rather than stale pre-shard references, are materialized.

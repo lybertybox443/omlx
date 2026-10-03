@@ -119,6 +119,40 @@ def test_quantized_expert_slices_are_made_contiguous():
     assert all(s[0] == local_n for s in calls)
 
 
+def test_shard_layer_wraps_current_mlp_without_eval():
+    from omlx.cluster.expert_strategies import shard_expert_layer
+
+    ref, cfg = _moe()
+    original = ref
+
+    class _Pre(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+    pre = _Pre(original)
+    layer = _Layer(original)
+    layer.mlp = pre
+
+    class _SpyMx(_FakeMx):
+        def eval(self, *a, **k):
+            raise AssertionError("eval called")
+
+        def clear_cache(self):
+            raise AssertionError("clear_cache called")
+
+    entry = shard_expert_layer(
+        layer, original, cfg.num_experts, _group(3, 1), mx_module=_SpyMx()
+    )
+    assert layer.mlp is not pre
+    assert layer.mlp.inner is pre
+    assert pre.inner is original
+    assert (entry["lo"], entry["hi"]) == expert_range(cfg.num_experts, 3, 1)
+    assert entry["experts"] == cfg.num_experts
+    assert entry["shared_owner"] is False
+    assert original.switch_mlp.inner.gate_proj.weight.shape[0] == entry["hi"] - entry["lo"]
+
+
 def test_expert_range_uneven_and_empty():
     assert [expert_range(4, 3, r) for r in range(3)] == [(0, 2), (2, 3), (3, 4)]
     assert [expert_range(4, 6, r) for r in range(6)][4:] == [(4, 4), (4, 4)]

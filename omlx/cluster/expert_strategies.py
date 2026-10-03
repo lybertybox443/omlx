@@ -129,28 +129,7 @@ def apply_expert_strategy(model, group, *, mx_module, progress=None, plan=None):
 
     moe_layers = []
     for n, (i, layer, mlp, experts) in enumerate(plan, start=1):
-        lo, hi = expert_range(experts, size, rank)
-        sw = mlp.switch_mlp
-        hidden = sw.down_proj.weight.shape[-2]
-        for name in _PROJS:
-            p = getattr(sw, name)
-            for a in _ARRAYS:
-                arr = getattr(p, a, None)
-                if arr is not None:
-                    # contiguous releases the full parent buffer after slicing
-                    setattr(p, a, mx_module.contiguous(arr[lo:hi]))
-                del arr
-            if hasattr(p, "num_experts"):  # cached local count; router stays global
-                try:
-                    p.num_experts = hi - lo
-                except Exception:
-                    pass
-            del p
-        mlp.switch_mlp = LocalExperts(sw, lo, hi, hidden)
-        del sw
-        if rank != 0:
-            mlp.shared_expert = _ZeroShared()
-        layer.mlp = _wrap_sharded_moe(mlp, group, mx_module)
+        entry = shard_expert_layer(layer, mlp, experts, group, mx_module=mx_module)
         values = [v for _, v in tree_flatten(layer.parameters())]
         if values:
             mx_module.eval(*values)
@@ -165,10 +144,7 @@ def apply_expert_strategy(model, group, *, mx_module, progress=None, plan=None):
                     "count": len(plan),
                 }
             )
-        moe_layers.append(
-            {"layer": i, "experts": experts, "lo": lo, "hi": hi,
-             "shared_owner": rank == 0}
-        )
+        moe_layers.append({"layer": i, **entry})
 
     meta = SimpleNamespace(
         strategy="expert",
@@ -182,3 +158,31 @@ def apply_expert_strategy(model, group, *, mx_module, progress=None, plan=None):
     except Exception:  # ponytail: owner may reject attrs; metadata still returned
         pass
     return meta
+
+
+def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
+    """Lazily slice ``mlp`` experts and wrap CURRENT ``layer.mlp`` (no eval)."""
+    size, rank = group.size(), group.rank()
+    lo, hi = expert_range(experts, size, rank)
+    sw = mlp.switch_mlp
+    hidden = sw.down_proj.weight.shape[-2]
+    for name in _PROJS:
+        p = getattr(sw, name)
+        for a in _ARRAYS:
+            arr = getattr(p, a, None)
+            if arr is not None:
+                # contiguous releases the full parent buffer after slicing
+                setattr(p, a, mx_module.contiguous(arr[lo:hi]))
+            del arr
+        if hasattr(p, "num_experts"):  # cached local count; router stays global
+            try:
+                p.num_experts = hi - lo
+            except Exception:
+                pass
+        del p
+    mlp.switch_mlp = LocalExperts(sw, lo, hi, hidden)
+    del sw
+    if rank != 0:
+        mlp.shared_expert = _ZeroShared()
+    layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
+    return {"experts": experts, "lo": lo, "hi": hi, "shared_owner": rank == 0}
