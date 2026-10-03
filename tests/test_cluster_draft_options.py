@@ -37,10 +37,10 @@ def test_runtime_options_are_portable_and_strict(resolve, enabled, path):
         "specprefill_enabled",
         "turboquant_kv_enabled",
     ):
-        compatible = (
-            "turboquant_kv_enabled" in (enabled, other)
-            and "specprefill_enabled" not in (enabled, other)
-        ) or {enabled, other} in (
+        compatible = "turboquant_kv_enabled" in (enabled, other) or {
+            enabled,
+            other,
+        } in (
             {"dflash_enabled", "specprefill_enabled"},
             {"vlm_mtp_enabled", "specprefill_enabled"},
         )

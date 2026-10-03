@@ -171,10 +171,6 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
                 options.get(key) != value for key, value in tq_options.items()
             ):
                 raise ValueError("invalid TurboQuant runtime options")
-            if draft_keys.intersection(options):
-                raise ValueError(
-                    "distributed TurboQuant cannot be combined with SpecPrefill"
-                )
             expected.update(tq_options)
         external = options.get("dflash_enabled", False)
         if external:
@@ -300,7 +296,6 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
         last_attention = attention_layers[-1] if len(attention_layers) > 1 else -1
         with (
             install_external_mtp(model, options),
-            install_dflash_serving(model, mlx_server, options, provider),
             install_turboquant_serving(
                 model,
                 mlx_server,
@@ -308,6 +303,7 @@ class Qwen4ExpAdapter(PipelineModelAdapter):
                 convert=convert,
                 last_attention_layer=last_attention,
             ),
+            install_dflash_serving(model, mlx_server, options, provider),
             install_mtp_sampling(model, mlx_server, options),
             install_vision_serving(model, provider, mlx_server),
             install_specprefill_serving(

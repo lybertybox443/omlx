@@ -13,8 +13,80 @@ from mlx_vlm.turboquant import (
 )
 
 
+def _pos_int(value):
+    if hasattr(value, "size") and hasattr(value, "item"):
+        if value.size != 1:
+            return None
+        value = value.item()
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _branch_memory_terms(entry, rows, width):
+    """Bound compressed-cache branch bytes from geometry only (no dequantization)."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    from omlx.speculative.branch_memory import UnboundedBranchMemory, _nbytes
+
+    def bad(why):
+        return UnboundedBranchMemory(f"{type(entry).__name__} TurboQuant {why}")
+
+    if _pos_int(rows) is None or _pos_int(width) is None:
+        raise bad("rows/width invalid")
+    inner = entry._cache
+    keys, values = getattr(inner, "keys", None), getattr(inner, "values", None)
+    if keys is None or values is None:
+        raise bad("cache not initialized")
+    length = _pos_int(getattr(inner, "_idx", None))
+    if length is None:
+        length = _pos_int(getattr(inner, "offset", None))
+    step = _pos_int(getattr(inner, "cache_step", None))
+    if length is None or step is None:
+        raise bad("geometry unknown")
+    packed = 0
+    for state in (keys, values):
+        leaves = [v for _, v in tree_flatten(state) if isinstance(v, mx.array)]
+        if not leaves:
+            raise bad("packed state unknown")
+        for leaf in leaves:
+            if leaf.ndim not in (3, 4) or leaf.shape[0] != 1 or leaf.shape[2] < length:
+                raise bad("packed leaf geometry unknown")
+            packed += int(leaf.nbytes) // int(leaf.shape[2])
+    heads = int(next(v for _, v in tree_flatten(keys) if isinstance(v, mx.array)).shape[1])
+    dims = []
+    for name in ("key_codec", "value_codec"):
+        dim = getattr(getattr(inner, name, None), "dim", None)
+        if _pos_int(dim) is None:
+            raise bad("codec dim unknown")
+        dims.append(dim)
+    dense = heads * sum(dims) * 4
+    index = getattr(entry, "index_keys", None)
+    if index is None:
+        index = getattr(entry, "_index_keys", None)
+    pos = getattr(entry, "index_position_ids", None)
+    if pos is None:
+        pos = getattr(entry, "_index_position_ids", None)
+    if not isinstance(index, mx.array) or not isinstance(pos, mx.array) or index.ndim < 2 or pos.ndim < 1:
+        raise bad("index geometry unknown")
+    idx = int(index.nbytes) // max(1, int(index.shape[1])) + int(pos.nbytes) // max(1, int(pos.shape[-1]))
+    static = sum(_nbytes(vars(getattr(inner, n))) for n in ("key_codec", "value_codec"))
+    slack = step * -(-width // step)
+    row = length * (packed + idx) + 16 + static
+    return {
+        "fork": rows * row,
+        "growth": rows * packed * (length + 2 * slack)
+        + rows * idx * (length + width)
+        + 2 * rows * (length + width) * dense,
+        "gdn_steps": 0,
+        "extract": row + width * (packed + idx),
+    }
+
+
 class QSATurboQuantKVCache(_QSAIndexerCache, _BaseCache):
     preserve_auxiliary_kv_state = True
+
+    def _omlx_branch_memory_terms(self, rows, width):
+        return _branch_memory_terms(self, rows, width)
 
     def __init__(self, bits=4, seed=0):
         self._cache = TurboQuantKVCache(bits=bits, seed=seed)
@@ -242,6 +314,9 @@ class _BatchTurboQuantStorage(BatchTurboQuantKVCache):
 
 class BatchQSATurboQuantKVCache(BatchQSAKVCache):
     """Reuse QSA batch position handling around compressed K/V storage."""
+
+    def _omlx_branch_memory_terms(self, rows, width):
+        return _branch_memory_terms(self, rows, width)
 
     def __init__(self, left_padding, bits=4, seed=0):
         super().__init__(left_padding)

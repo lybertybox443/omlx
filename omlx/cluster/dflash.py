@@ -435,14 +435,10 @@ def install_dflash_serving(model, server, options, provider=None):
         # has no byte bound would otherwise fork without admission (or deadlock the
         # ranks that proceed).
         problem = None
-        if options.get("turboquant_kv_enabled"):
-            # TurboQuant is installed after this and converts the QSA caches.
-            problem = "QSATurboQuantKVCache has no branch memory bound"
-        else:
-            try:
-                validate_families(model.make_cache())
-            except UnboundedBranchMemory as exc:
-                problem = str(exc)
+        try:
+            validate_families(model.make_cache())
+        except UnboundedBranchMemory as exc:
+            problem = str(exc)
         flags = mx.distributed.all_gather(mx.array([int(problem is not None)]), group=group)
         if int(mx.max(flags).item()):
             raise ValueError(

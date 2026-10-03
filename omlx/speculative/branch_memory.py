@@ -24,8 +24,10 @@ Terms, each derived from the live cache/model shapes:
                (bytes per row-token), scaled by rows x width and by the context
                growth since. Until one linear cycle has been measured nothing forks.
 
-A cache family without a bound (rotating, quantized, TurboQuant, pooled, unknown) is
-refused with ``UnboundedBranchMemory`` before any fork. The model is conservative by
+A cache family without an explicit owner bound (unknown, rotating, quantized) is
+refused with ``UnboundedBranchMemory`` before any fork. QSA TurboQuant provides an
+owner bound for its packed state, raw index, codec and dense verify workspace;
+ordinary internal workspace is still measured. The model is conservative by
 construction (growth and measured terms overlap with a few exact terms); it is checked
 against MLX's logical peak on the test model, not against physical memory or RDMA
 buffers.
@@ -72,6 +74,8 @@ def cache_entries(cache: Any) -> Iterator[Any]:
 
 
 def cache_kind(entry: Any) -> str:
+    if callable(getattr(entry, "_omlx_branch_memory_terms", None)):
+        return "bounded"
     names = {cls.__name__ for cls in type(entry).__mro__}
     if names & _UNSUPPORTED or any("TurboQuant" in name for name in names):
         raise UnboundedBranchMemory(f"{type(entry).__name__} has no branch memory bound")
@@ -150,7 +154,16 @@ def _recurrent_terms(entry: Any, rows: int, width: int) -> dict[str, int]:
 def cache_terms(cache: Any, rows: int, width: int) -> dict[str, int]:
     total = {"fork": 0, "growth": 0, "gdn_steps": 0, "extract": 0}
     for entry in cache_entries(cache):
-        terms = (_kv_terms if cache_kind(entry) == "kv" else _recurrent_terms)(entry, rows, width)
+        kind = cache_kind(entry)
+        if kind == "bounded":
+            terms = entry._omlx_branch_memory_terms(rows, width)
+            if (
+                not isinstance(terms, dict) or set(terms) != set(total)
+                or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in terms.values())
+            ):
+                raise UnboundedBranchMemory(f"{type(entry).__name__} branch memory callback is invalid")
+        else:
+            terms = (_kv_terms if kind == "kv" else _recurrent_terms)(entry, rows, width)
         for name, value in terms.items():
             total[name] += value
     return total

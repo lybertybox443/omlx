@@ -132,6 +132,51 @@ def test_rows_are_cut_to_the_budget_and_one_row_means_no_fork():
     assert ddtree_branches.admit_rows(memory, cache, paths, 8, 0) == 1
 
 
+@pytest.mark.parametrize("bits", [3.5, 4])
+@pytest.mark.parametrize("source_batch", [False, True])
+@pytest.mark.parametrize("width", [4, 300])  # 300 crosses the 256-token step
+def test_formula_covers_real_qsatt_cache(bits, source_batch, width):
+    from qwen4_pipeline_support import preserved_qwen4_runtime
+
+    rows = 3
+    with preserved_qwen4_runtime():
+        from omlx.patches.qwen4_exp_mlx_lm import apply_qwen4_exp_mlx_lm_patch
+
+        apply_qwen4_exp_mlx_lm_patch()
+        from omlx.patches.qwen4_exp_mlx_lm.turboquant import (
+            BatchQSATurboQuantKVCache,
+            QSATurboQuantKVCache,
+        )
+
+        cache = QSATurboQuantKVCache(bits=bits)
+        cache.update_and_fetch(mx.ones((1, HEADS, 20, DIM)), mx.ones((1, HEADS, 20, DIM)))
+        cache._restore_indexer_state(mx.ones((1, 20, DIM)), mx.arange(20)[None])
+        mx.eval(cache.state)
+        source = cache.to_batch([0]) if source_batch else cache
+        terms = cache_terms([source], rows, width)
+        merger = BatchQSATurboQuantKVCache if source_batch else QSATurboQuantKVCache
+        merged = merger.merge([source] * rows)
+        mx.eval(merged.state)
+        forked = _bytes(merged.state)
+        assert terms["fork"] >= forked
+
+        before = forked
+        merged.update_and_fetch(mx.ones((rows, HEADS, width, DIM)), mx.ones((rows, HEADS, width, DIM)))
+        merged.update_indexer(
+            mx.ones((rows, width, DIM)), mx.broadcast_to(mx.arange(20, 20 + width)[None], (rows, width))
+        )
+        mx.eval(merged.state)
+        after = _bytes(merged.state)
+        assert terms["fork"] + terms["growth"] >= before + after
+        k, v = merged.dequantize()
+        mx.eval(k, v)
+        assert terms["growth"] >= k.nbytes + v.nbytes  # explicit workspace bound
+        extracted = merged.extract(0)
+        assert terms["extract"] >= _bytes(extracted.state)
+        with pytest.raises(NotCalibrated):
+            BranchMemory(DIMS).total([source], rows, width, 20)
+
+
 def test_cohort_estimate_adds_requests_and_reduction_is_deterministic_and_monotone():
     memory = BranchMemory(DIMS, rate=10.0, rate_context=8)
     caches = [[_gdn(), _kv(8)], [_gdn(), _kv(20)], [_gdn(), _kv(5)]]

@@ -16,9 +16,6 @@ def runtime_settings(settings):
     skip = getattr(settings, "turboquant_skip_last", True)
     if not isinstance(skip, bool):
         raise ValueError("turboquant_skip_last must be a boolean")
-    for other in ("specprefill_enabled",):
-        if getattr(settings, other, False):
-            raise ValueError(f"distributed TurboQuant cannot be combined with {other}")
     return {
         "turboquant_kv_enabled": True,
         "turboquant_kv_bits": bits,

@@ -993,7 +993,7 @@ def test_turboquant_ssd_restart(checkpoint, tmp_path):
                 expected = _content(result)
 
 
-@pytest.mark.parametrize("draft", ["native", "external", "dflash"])
+@pytest.mark.parametrize("draft", ["native", "external", "dflash", "ddtree"])
 def test_turboquant_speculative_http(
     mtp_checkpoint, dflash_checkpoint, tmp_path, draft
 ):
@@ -1034,9 +1034,15 @@ def test_turboquant_speculative_http(
         _, reserve = inspect_head(mtp_checkpoint, 1024)
         options.update(vlm_mtp_reserved_bytes=reserve, vlm_mtp_max_prompt_tokens=1024)
     else:
+        kwargs = {}
+        if draft == "ddtree":
+            kwargs = dict(
+                dflash_verify_mode="ddtree", dflash_ddtree_max_branches=3,
+                dflash_ddtree_max_nodes=7, dflash_ddtree_memory_bytes=1 << 40,
+            )
         options.update(dflash_settings(SimpleNamespace(
             dflash_enabled=True, dflash_draft_model=str(dflash_checkpoint),
-            dflash_block_size=3,
+            dflash_block_size=3, **kwargs,
         )))
         reserve = DraftReservation.from_layout(
             inspect_safetensors_layout(dflash_checkpoint),
@@ -1152,19 +1158,6 @@ def test_dflash_ddtree_http_matches_reference(
         checkpoint, dflash_checkpoint, tmp_path, ranges, reference, 4, False,
         sink_size=3, ddtree=True, capture_ssd=capture_ssd,
     )
-
-
-@pytest.mark.parametrize("ranges", [TWO_RANKS, THREE_RANKS])
-def test_ddtree_with_unbounded_turboquant_caches_is_refused_at_startup(
-    checkpoint, dflash_checkpoint, tmp_path, ranges, reference
-):
-    # The cache families are checked and agreed by every rank before serving: the
-    # deployment stops with the reason instead of forking caches it cannot bound.
-    with pytest.raises(pytest.fail.Exception, match="cannot bound the branch memory"):
-        test_dflash_http_matches_reference(
-            checkpoint, dflash_checkpoint, tmp_path, ranges, reference, 4, False,
-            ddtree=True, turboquant=True,
-        )
 
 
 @pytest.mark.parametrize("ranges", [TWO_RANKS, THREE_RANKS])
@@ -1315,13 +1308,15 @@ def test_dflash_ddtree_concurrent_penalized_requests_match_linear_deployment(
 
 
 
+@pytest.mark.parametrize("turboquant", [False, True])
 @pytest.mark.parametrize(
     "draft,async_capture",
     [("native", False), ("external", False), ("dflash", False),
      ("ddtree", False), ("dflash", True), ("ddtree", True)],
 )
 def test_specprefill_speculative_http_matches_sparse_baseline(
-    mtp_checkpoint, dflash_checkpoint, tmp_path, draft, async_capture
+    mtp_checkpoint, dflash_checkpoint, tmp_path, draft, async_capture,
+    turboquant,
 ):
     """Speculation after sparse prefill must equal the sparse greedy baseline."""
     from types import SimpleNamespace
@@ -1350,6 +1345,9 @@ def test_specprefill_speculative_http_matches_sparse_baseline(
         specprefill_threshold=2,
         specprefill_keep_pct=0.25,
     )
+    if turboquant:
+        sparse.update(turboquant_kv_enabled=True, turboquant_kv_bits=3.5,
+                      turboquant_skip_last=False)
 
     def run(directory, depth, options):
         directory.mkdir()
