@@ -455,6 +455,7 @@ class ClusterPlanRequest(BaseModel):
     expert_parallel_size: int = Field(default=1, ge=1, le=64, strict=True)
     allow_experimental_subgroups: bool = False
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    runtime_overrides: dict[str, Any] = Field(default_factory=dict, max_length=64)
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
@@ -511,6 +512,7 @@ class ClusterDeploymentRequest(BaseModel):
     expert_parallel_size: int = Field(default=1, ge=1, le=64, strict=True)
     allow_experimental_subgroups: bool = False
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    runtime_overrides: dict[str, Any] = Field(default_factory=dict, max_length=64)
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -670,23 +672,69 @@ def _coalesce_verified_cuda_groups(
     return ordered
 
 
-def _layout_with_runtime_settings(model: Any, model_path: str, *, context_tokens=8192):
+def _cluster_runtime_settings(settings: Any, overrides: Any, adapter: Any):
+    """Merge validated runtime-only overrides into resolved settings."""
+    if not overrides:
+        return settings
+    from dataclasses import fields
+    from types import SimpleNamespace
+    from typing import get_type_hints
+
+    from pydantic import TypeAdapter
+
+    from omlx.model_settings import ModelSettings
+
+    merged = ModelSettings().to_dict()
+    if settings is not None:
+        merged.update(
+            settings.to_dict() if callable(getattr(settings, "to_dict", None))
+            else vars(settings)
+        )
+    prefixes = ("mtp_", "vlm_mtp_", "dflash_", "specprefill_", "turboquant_")
+    allowed = {f.name for f in fields(ModelSettings) if f.name.startswith(prefixes)}
+    hints = get_type_hints(ModelSettings)
+    for name, value in dict(overrides).items():
+        if name not in allowed:
+            raise PlanningError(f"unsupported runtime override: {name}")
+        try:
+            value = TypeAdapter(hints[name]).validate_python(value, strict=True)
+        except (ValueError, TypeError) as exc:
+            raise PlanningError(f"invalid runtime override {name}: {exc}") from exc
+        if name.endswith("_enabled") and value is True and name not in adapter.optimizations:
+            raise PlanningError(f"runtime override {name} unsupported by model adapter")
+        merged[name] = value
+    return SimpleNamespace(**merged)
+
+
+def _layout_with_runtime_settings(
+    model: Any, model_path: str, *, context_tokens=8192, overrides=None
+):
     """Resolve storage once on the coordinator, before hashing the plan."""
     from .model_adapters import adapter_for_type
 
     adapter = adapter_for_type(model.model_type)
-    if adapter is None or _get_engine_pool is None:
+    if adapter is None:
+        if overrides:
+            raise PlanningError("runtime overrides unsupported for this model type")
         return model
-    pool = _engine_pool()
-    manager = getattr(pool, "_settings_manager", None)
-    if manager is None:
+    settings = None
+    if _get_engine_pool is not None:
+        pool = _engine_pool()
+        manager = getattr(pool, "_settings_manager", None)
+        if manager is not None:
+            try:
+                settings = manager.get_settings(pool.resolve_cluster_model_id(model_path))
+            except (ModelNotFoundError, ValueError):
+                settings = None
+    if settings is None and not overrides:
         return model
+    settings = _cluster_runtime_settings(settings, overrides, adapter)
     try:
-        model_id = pool.resolve_cluster_model_id(model_path)
-    except (ModelNotFoundError, ValueError):
-        return model
-    settings = manager.get_settings(model_id)
-    options = adapter.runtime_options({}, settings)
+        options = adapter.runtime_options({}, settings)
+    except ValueError as exc:
+        if not overrides:
+            raise
+        raise PlanningError(str(exc)) from exc
     if getattr(settings, "specprefill_enabled", False):
         from .specprefill import DraftReservation
 
@@ -743,13 +791,20 @@ def _model_and_nodes(request: ClusterPlanRequest):
             # used to build the next plan.
             model = inspect_safetensors_layout(model_path)
     else:
+        if request.runtime_overrides:
+            raise PlanningError(
+                "runtime_overrides requires a downloaded model_path"
+            )
         model = synthetic_model_layout(
             total_weight_bytes=request.model_size_bytes,
             layer_count=request.layer_count,
         )
     if model_path is not None:
         model = _layout_with_runtime_settings(
-            model, model_path, context_tokens=request.target_context_tokens
+            model,
+            model_path,
+            context_tokens=request.target_context_tokens,
+            overrides=request.runtime_overrides,
         )
     return model, _node_budgets(request.nodes)
 
@@ -1017,6 +1072,7 @@ class ClusterAutoconfigureRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    runtime_overrides: dict[str, Any] = Field(default_factory=dict, max_length=64)
 
 
 def _measured_link_profiles(
@@ -1238,6 +1294,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         layer_count=request.layer_count,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
+        target_context_tokens=request.target_context_tokens,
+        runtime_overrides=request.runtime_overrides,
     )
     try:
         model, nodes = _model_and_nodes(plan_request)
@@ -1664,6 +1722,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "prompt_cache_ssd_max_bytes": request.prompt_cache_ssd_max_bytes,
             "max_kv_size": request.max_kv_size,
             "target_context_tokens": request.target_context_tokens,
+            "runtime_overrides": request.runtime_overrides,
             "ring_connections_per_ip": (
                 request.ring_connections_per_ip if backend == "ring" else None
             ),
@@ -2941,6 +3000,7 @@ def _create_deployment(
         expert_parallel_size=request.expert_parallel_size,
         allow_experimental_subgroups=request.allow_experimental_subgroups,
         target_context_tokens=request.target_context_tokens,
+        runtime_overrides=request.runtime_overrides,
         path_map=request.path_map,
     )
     plan = _create_cluster_plan(plan_request)
