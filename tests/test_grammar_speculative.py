@@ -134,3 +134,107 @@ def test_end_speculative_resumes_deferred_decoding(cg):
     p.accept_token(ord(":"))
     assert not p.pending
     assert _mask(p, []) == _ref(cg, _ids('{"k":'))
+
+
+def _gen_batch(proc, history, next_tokens):
+    from types import SimpleNamespace
+
+    buf = SimpleNamespace(tokens=list(history))
+    return SimpleNamespace(
+        logits_processors=[[proc]],
+        _token_context=[buf],
+        tokens=[list(history)],
+        _next_tokens=next_tokens,
+    )
+
+
+def test_enter_speculative_accepts_pending_token_once(cg):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _grammar_enter_speculative
+
+    committed = PROMPT + _ids('{"k"')
+    p = GrammarConstraintProcessor(cg, VOCAB_SIZE)
+    for t in _ids('{"k"'):
+        p.accept_token(t)
+    _grammar_enter_speculative(_gen_batch(p, committed, mx.array([ord(":")])))
+    assert p.speculative
+    assert _mask(p, committed + [ord(":")]) == _ref(cg, _ids('{"k":'))
+
+
+def test_drop_without_state_syncs_and_defers(cg):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _drop_mtp_state
+
+    p = _proc(cg)
+    _mask(p, PROMPT + _ids('{"k": "a'))
+    gb = _gen_batch(p, PROMPT + _ids('{"k"'), mx.array([ord(":")]))
+    assert getattr(gb, "_omlx_mtp_state", None) is None
+    _drop_mtp_state(gb, "test")
+    assert not p.speculative and p.pending
+    p.accept_token(ord(":"))
+    assert not p.pending
+    assert _mask(p, []) == _ref(cg, _ids('{"k":'))
+
+
+# -- positioned MTPProcessingSampler wiring ---------------------------------
+
+from omlx.speculative.processing_sampler import (  # noqa: E402
+    MTPProcessingSampler,
+    supports_vlm_mtp_processing,
+)
+
+
+def _argmax_sampler(logits):
+    return mx.argmax(logits, axis=-1)
+
+
+def _favor(token_ids):
+    rows = np.zeros((len(token_ids), VOCAB_SIZE), dtype=np.float32)
+    for r, t in enumerate(token_ids):
+        rows[r, t] = 10.0
+    return mx.array(rows)
+
+
+def _first_illegal(cg, generated):
+    allowed = _ref(cg, generated)
+    return next(t for t in range(VOCAB_SIZE) if t not in allowed)
+
+
+class TestProcessingSampler:
+    def test_grammar_processor_passes_the_gate(self, cg):
+        assert supports_vlm_mtp_processing(GrammarConstraintProcessor(cg, VOCAB_SIZE))
+
+    def test_sampled_tokens_are_legal_across_rewinds(self, cg):
+        proc = GrammarConstraintProcessor(cg, VOCAB_SIZE)
+        sampler = MTPProcessingSampler(_argmax_sampler, [proc], PROMPT)
+        assert proc.speculative and not proc.pending
+        target = _ids(TEXT)
+
+        first = sampler.process_first_logits(_favor([_first_illegal(cg, [])]))
+        bonus = int(_argmax_sampler(first).item())
+        assert bonus in _ref(cg, [])
+        assert bonus == target[0]
+        sampler.note_first_bonus(bonus, position=1)
+
+        favored = [target[1], _first_illegal(cg, target[:2]), target[3]]
+        out = sampler.sample_target(_favor(favored), positions=[1, 2, 3])
+        history = [target[0]]
+        for tok in [int(t) for t in out.tolist()]:
+            assert tok in _ref(cg, history)
+            history.append(tok)
+
+        out = sampler.sample_target(_favor([target[2], target[3]]), positions=[2, 3])
+        assert [int(t) for t in out.tolist()] == [target[2], target[3]]
+        zeros = mx.zeros((1, VOCAB_SIZE))
+        assert _allowed(proc(sampler._history, zeros)) == _ref(cg, target[:4])
+
+    def test_reset_hands_back_a_pristine_deferred_processor(self, cg):
+        proc = GrammarConstraintProcessor(cg, VOCAB_SIZE)
+        sampler = MTPProcessingSampler(_argmax_sampler, [proc], PROMPT)
+        sampler.process_first_logits(mx.zeros((1, VOCAB_SIZE)))
+        sampler.note_first_bonus(ord("{"), position=1)
+        sampler.sample_target(_favor([ord('"')]), positions=[1])
+        sampler.reset_processors()
+        assert proc.speculative is False
+        assert proc.pending is False
+        assert _mask(proc, PROMPT) == _ref(cg, [])
+        proc.accept_token(ord("{"))
+        assert _mask(proc, PROMPT + [ord("{")]) == _ref(cg, [ord("{")])
