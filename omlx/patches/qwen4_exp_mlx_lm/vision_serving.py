@@ -61,6 +61,76 @@ def prepare_request(processor, request, args, template_defaults):
     return payload
 
 
+def make_vision_metadata(delta=None, identity=None):
+    """ArraysCache(2): [0] int64 rope delta (B,1); [1] uint8 SHA256 (B,32)."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache
+
+    meta = ArraysCache(size=2)
+    if delta is None:
+        delta = mx.zeros((1, 1), mx.int64)
+    else:
+        delta = mx.array(delta)
+        if delta.dtype not in (
+            mx.int8, mx.int16, mx.int32, mx.int64,
+            mx.uint8, mx.uint16, mx.uint32, mx.uint64,
+        ):
+            raise ValueError("vision delta must be integer")
+        if delta.ndim == 1:
+            delta = delta.reshape(-1, 1)
+        if delta.ndim != 2 or delta.shape[1] != 1:
+            raise ValueError("vision delta shape must be (B,1)")
+        delta = delta.astype(mx.int64)
+    if identity is None:
+        identity = mx.zeros((delta.shape[0], 32), mx.uint8)
+    else:
+        if isinstance(identity, str):
+            identity = bytes.fromhex(identity)
+        if isinstance(identity, (bytes, bytearray)):
+            identity = list(identity)
+        identity = mx.array(identity).astype(mx.uint8)
+        identity = identity.reshape(-1, 32)
+    if identity.shape[0] != delta.shape[0] or identity.shape[1] != 32:
+        raise ValueError("vision metadata shape mismatch")
+    meta.cache[0], meta.cache[1] = delta, identity
+    return meta
+
+
+def ensure_vision_metadata(cache, layer_count, delta=None, identity=None):
+    """Append or update the metadata tail; return it. Tail is never a layer."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache
+
+    if len(cache) == layer_count:
+        tail = make_vision_metadata(delta, identity)
+        cache.append(tail)
+        return tail
+    if len(cache) != layer_count + 1:
+        raise ValueError("vision cache length mismatch")
+    tail = cache[-1]
+    if not isinstance(tail, ArraysCache) or len(tail.cache) != 2:
+        raise ValueError("invalid vision metadata tail")
+    d, h = tail.cache
+    if (
+        d is None or h is None
+        or d.dtype != mx.int64 or h.dtype != mx.uint8
+        or d.ndim != 2 or d.shape[1] != 1
+        or h.ndim != 2 or h.shape != (d.shape[0], 32)
+    ):
+        raise ValueError("invalid vision metadata tail arrays")
+    if delta is not None or identity is not None:
+        new = make_vision_metadata(delta, identity)
+        if delta is not None:
+            if tail.cache[0] is not None and new.cache[0].shape != tail.cache[0].shape:
+                raise ValueError("vision delta shape mismatch")
+            tail.cache[0] = new.cache[0]
+        if identity is not None:
+            if tail.cache[1] is not None and new.cache[1].shape != tail.cache[1].shape:
+                raise ValueError("vision identity shape mismatch")
+            tail.cache[1] = new.cache[1]
+    return tail
+
+
 class VisionRequest:
     def __init__(self, model, payload):
         import mlx.core as mx
@@ -162,6 +232,9 @@ def install_vision_serving(model, provider, server):
     original_single = generator._serve_single
     original_generate = server.stream_generate
     processor = None
+    missing = object()
+    prior_marker = getattr(model, "_omlx_vision_cache_enabled", missing)
+    object.__setattr__(model, "_omlx_vision_cache_enabled", True)
 
     def share(self, request):
         nonlocal processor
@@ -252,6 +325,10 @@ def install_vision_serving(model, provider, server):
     try:
         yield
     finally:
+        if prior_marker is missing:
+            object.__delattr__(model, "_omlx_vision_cache_enabled")
+        else:
+            object.__setattr__(model, "_omlx_vision_cache_enabled", prior_marker)
         server.stream_generate = original_generate
         generator._share_request = original_share
         generator._is_batchable = original_batchable
