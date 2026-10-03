@@ -15,6 +15,7 @@ verify path feeds it the accepted positions after every cycle.
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import time
@@ -47,6 +48,7 @@ class _RowContext:
     and only the newest ``W - 1`` positions are attended.
     """
 
+    sinks: mx.array | None = None
     pending: list[mx.array] = field(default_factory=list)
     fed: int = 0
     keys: list[mx.array] | None = None
@@ -62,6 +64,8 @@ class _Cohort:
     keys: list[mx.array]
     values: list[mx.array]
     pos: mx.array
+    sink_sources: tuple = ()
+    sink_kv: list = field(default_factory=list)
 
 
 @dataclass
@@ -170,7 +174,15 @@ def _concat_captured(captured: Sequence[mx.array]) -> mx.array:
 class DFlashDrafter:
     """Row-wise DFlash drafting against per-request context caches."""
 
-    def __init__(self, model: nn.Module, *, block_size: int, source_path: str):
+    def __init__(self, model: nn.Module, *, block_size: int, source_path: str, sink_size: int = 0, sink_kv_cache: bool = True):
+        if isinstance(sink_size, bool) or not isinstance(sink_size, int) or sink_size < 0:
+            raise ValueError("DFlash sink size must be a nonnegative integer")
+        if not isinstance(sink_kv_cache, bool):
+            raise ValueError("dflash_sink_kv_cache must be a boolean")
+        self.sink_kv_cache = sink_kv_cache
+        self.adaptive_verify = False
+        self.capture_store = None
+        self.sink_size = sink_size
         self.model = model
         self.source_path = source_path
         self.target_layer_ids: list[int] = [
@@ -183,16 +195,63 @@ class DFlashDrafter:
         self._cohort: _Cohort | None = None
         # Prefill captures wait under the request id until the scheduler
         # learns the row uid at insert time.
-        self._request_seeds: dict[str, list[mx.array]] = {}
+        self._request_seeds: dict[str, _RowContext] = {}
         # Row order of the generation batch whose ordinary decode step is
         # running, so a plain forward can be attributed to rows.
         self.scope_uids: tuple | None = None
         self._predraft: _Predraft | None = None
+        self._evicted: tuple | None = None
+        # DDTree: candidates kept per draft slot (0 = linear block only).
+        self.tree_width = 0
+        self._last_topk = None
+
+    @property
+    def evicted(self) -> bool:
+        return self.model is None
+
+    def evict(self) -> bool:
+        """Drop the weights, keep every row's confirmed context and sink state.
+
+        Rings, pending captures, sinks and the capture store hold activations,
+        not weights, so re-entry after ``reload`` continues from them exactly.
+        The caller must not evict during a draft; a queued predraft is dropped.
+        """
+        if self.model is None:
+            return False
+        self._predraft = None
+        self._evicted = (self.model.config, self.kind)
+        self.model = None
+        gc.collect()
+        mx.clear_cache()
+        return True
+
+    def reload(self, loader) -> None:
+        """Restore the weights from ``loader()``; the checkpoint must be the same."""
+        if self.model is not None:
+            return
+        fresh = loader()
+        if (
+            fresh.target_layer_ids != self.target_layer_ids
+            or fresh.block_size != self.block_size
+            or fresh.source_path != self.source_path
+            or fresh.window != self.window
+            or fresh.sink_size != self.sink_size
+        ):
+            raise RuntimeError("reloaded DFlash drafter differs from the evicted one")
+        self.model, self._evicted = fresh.model, None
+
+    def _require_weights(self) -> None:
+        if self.model is None:
+            raise RuntimeError("DFlash drafter weights are evicted")
+
+    @property
+    def _config(self):
+        return self.model.config if self.model is not None else self._evicted[0]
 
     @property
     def window(self) -> int:
         """Context tokens the drafter attends to; older captures are dropped."""
-        config = self.model.config
+        config = self._config
         explicit = getattr(config, "draft_window_size", None)
         if explicit:
             return int(explicit)
@@ -200,6 +259,8 @@ class DFlashDrafter:
 
     @property
     def kind(self) -> str:
+        if self.model is None:
+            return self._evicted[1]
         return "dflash2" if hasattr(self.model, "candidate_selector") else "dflash"
 
     def _row(self, uid: Any) -> _RowContext:
@@ -220,11 +281,24 @@ class DFlashDrafter:
         # without overwriting a position that is still attended.
         return self.ring_slots + self.block_size
 
+    def _remember_sinks(self, row: _RowContext, context: mx.array) -> None:
+        if not self.sink_size:
+            return
+        retained = 0 if row.sinks is None else int(row.sinks.shape[1])
+        position = row.fed + sum(int(part.shape[1]) for part in row.pending)
+        if retained < self.sink_size:
+            if position != retained:
+                raise ValueError("DFlash sinks require captures from the prompt beginning")
+            prefix = context[:, :self.sink_size - retained]
+            row.sinks = prefix if row.sinks is None else mx.concatenate([row.sinks, prefix], axis=1)
+
     def seed(self, uid: Any, captured: Sequence[mx.array]) -> None:
         """Queue prefill captures ``[(1, n, H), ...]`` as context for ``uid``."""
         if captured:
             row = self._row(uid)
-            row.pending.append(_concat_captured(captured))
+            context = _concat_captured(captured)
+            self._remember_sinks(row, context)
+            row.pending.append(context)
             self._bound_pending(row)
 
     def _bound_pending(self, row: _RowContext) -> None:
@@ -250,18 +324,71 @@ class DFlashDrafter:
         for index, uid in enumerate(uids):
             self.seed(uid, [layer[index : index + 1] for layer in captured])
 
-    def seed_request(self, request_id: str, captured: Sequence[mx.array]) -> None:
-        """Queue prefill captures for a request that has no row uid yet."""
+    def seed_request(
+        self, request_id: str, captured: Sequence[mx.array], *, position: int | None = None
+    ) -> None:
+        """Retain the context window until a request receives its row uid."""
         if captured:
-            self._request_seeds.setdefault(request_id, []).append(
-                _concat_captured(captured)
+            row = self._request_seeds.get(request_id)
+            if position is not None:
+                if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                    raise ValueError("DFlash capture position must be a nonnegative integer")
+                if row is not None:
+                    expected = row.fed + sum(int(part.shape[1]) for part in row.pending)
+                    if position != expected:
+                        raise ValueError("DFlash request captures must be contiguous")
+            if row is None:
+                row = _RowContext(fed=position or 0)
+                self._request_seeds[request_id] = row
+            context = _concat_captured(captured)
+            self._remember_sinks(row, context)
+            row.pending.append(context)
+            self._bound_pending(row)
+
+    def store_request_captures(self, request_id, tokens, boundary, media=None):
+        row = self._request_seeds.get(request_id)
+        if self.capture_store is None or row is None or not row.pending:
+            return
+        tail = mx.concatenate(row.pending, axis=1)
+        if row.fed + tail.shape[1] != boundary:
+            return
+        snapshot = {"tail": tail, "position": mx.array([boundary], dtype=mx.int64)}
+        if row.sinks is not None:
+            snapshot["sinks"] = row.sinks
+        self.capture_store.put(tokens, boundary, media, snapshot)
+
+    def restore_request_captures(self, request_id, tokens, boundary, media=None):
+        if self.capture_store is None:
+            return False
+        snapshot = self.capture_store.get(tokens, boundary, media)
+        if snapshot is None:
+            return False
+        try:
+            tail = snapshot["tail"]
+            sinks = snapshot.get("sinks")
+            if snapshot["position"].tolist() != [boundary]:
+                return False
+            if tail.ndim != 3 or tail.shape[0] != 1 or tail.shape[1] != min(boundary, self.ring_slots):
+                return False
+            if self.sink_size and (
+                sinks is None or sinks.ndim != 3
+                or sinks.shape != (1, min(boundary, self.sink_size), tail.shape[-1])
+            ):
+                return False
+            self._request_seeds[request_id] = _RowContext(
+                fed=boundary - tail.shape[1], pending=[tail], sinks=sinks,
             )
+            return True
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            return False
 
     def bind_uid(self, request_id: str, uid: Any) -> None:
         seeds = self._request_seeds.pop(request_id, None)
         if seeds:
             row = self._row(uid)
-            row.pending.extend(seeds)
+            row.sinks = seeds.sinks
+            row.fed += seeds.fed
+            row.pending.extend(seeds.pending)
             self._bound_pending(row)
 
     def release_request(self, request_id: str) -> None:
@@ -279,10 +406,13 @@ class DFlashDrafter:
     def release(self, uids: Iterable[Any]) -> None:
         self._predraft = None
         for uid in uids:
+            self._request_seeds.pop(str(uid), None)
             if self._rows.pop(uid, None) is not None:
                 self._detach_cohort()
 
     def clear(self) -> None:
+        if self.capture_store is not None:
+            self.capture_store.clear()
         self._predraft = None
         self._rows.clear()
         self._cohort = None
@@ -291,6 +421,13 @@ class DFlashDrafter:
     def context_length(self, uid: Any) -> int:
         row = self._rows.get(uid)
         return 0 if row is None else row.fed
+
+    def _verification_depth(self, state) -> int:
+        if not self.adaptive_verify:
+            return self.depth
+        controller = getattr(state, "controller", None)
+        requested = controller.cur if controller is not None else getattr(state, "depth", self.depth)
+        return max(0, min(self.depth, int(requested)))
 
     def draft(self, jobs: Sequence[tuple]) -> None:
         """Draft the next block for every job after its cycle committed.
@@ -301,11 +438,22 @@ class DFlashDrafter:
         ``committed[-1]`` is the newest committed token, which anchors the
         block. Writes ``state.drafts`` and clears the head-only logprob lists.
         """
+        self._require_weights()
         rows = []
+        walked = set()  # sampled rows of a ddtree deployment: target tree walk, no q
         for gen_batch, state, captured, committed, _prev_buf in jobs:
             row = self._row(state.uid)
             if captured:
-                row.pending.append(_concat_captured(captured))
+                context = _concat_captured(captured)
+                self._remember_sinks(row, context)
+                row.pending.append(context)
+            if self._verification_depth(state) == 0:
+                # Keep confirmed captures for re-entry, without running the draft.
+                self._bound_pending(row)
+                state.drafts = mx.array([], dtype=mx.uint32)
+                state.draft_lps = []
+                state.draft_accept_lps = []
+                continue
             if not row.pending:
                 raise RuntimeError(
                     f"DFlash drafter has no context for uid={state.uid!r}"
@@ -321,8 +469,16 @@ class DFlashDrafter:
             # normalized draft distribution feeds Leviathan acceptance.
             sampler = None
             if gen_batch is not None and not bg._is_greedy(gen_batch):
-                sampler = bg._resolve_draft_sampler(gen_batch, state)
+                if self.tree_width > 1:
+                    # Candidates are the drafter's deterministic top-k whatever the
+                    # request samples; acceptance is the target-distribution tree walk.
+                    walked.add(state.uid)
+                else:
+                    sampler = bg._resolve_draft_sampler(gen_batch, state)
             rows.append((state, row, context, anchor, sampler))
+        if not rows:
+            return
+
         # The drafter's projections see rows x block inputs like a verify
         # forward, so the same small-M kernels apply.
         started = time.perf_counter()
@@ -331,11 +487,28 @@ class DFlashDrafter:
             proposals = self._draft_batched(rows)
         finally:
             set_verify_qmm_armed(False)
-        for (state, *_), (tokens, accept_lps) in zip(rows, proposals):
+        topk = self._last_topk
+        self._last_topk = None
+        if topk is not None:
+            mx.eval(topk[0], topk[1], *(tokens for tokens, _ in proposals))
+        for index, ((state, _row, _ctx, _anchor, sampler), (tokens, accept_lps)) in enumerate(
+            zip(rows, proposals)
+        ):
+            state.draft_topk = None
+            if topk is not None and (sampler is None):
+                state.draft_topk = self._tree_candidates(
+                    topk[0][index].tolist(), topk[1][index].tolist(), tokens.reshape(-1).tolist()
+                )
+            if self.adaptive_verify:
+                depth = self._verification_depth(state)
+                tokens = tokens[:, :depth]
+                accept_lps = accept_lps[:depth]
             state.drafts = tokens.reshape(-1).astype(mx.uint32)
             mx.async_eval(state.drafts)
             state.draft_lps = []
-            state.draft_accept_lps = accept_lps
+            # ``None`` marks a block with no draft distribution q: verification
+            # walks the target distribution instead of rejection sampling.
+            state.draft_accept_lps = None if state.uid in walked else accept_lps
         # Dispatch time shared across the rows; the GPU work overlaps the
         # next verify like the MTP head's async draft.
         share = (time.perf_counter() - started) * 1000 / max(1, len(rows))
@@ -343,6 +516,18 @@ class DFlashDrafter:
             stats = getattr(state, "stats", None)
             if stats is not None:
                 stats.mtp_head_ms += share
+
+    @staticmethod
+    def _tree_candidates(ids, scores, chosen):
+        """Per-slot candidates with the drafter's own token first, so the linear
+        block is always one branch; its score is lifted to the slot's best."""
+        out_ids, out_scores = [], []
+        for slot_ids, slot_scores, token in zip(ids, scores, chosen, strict=True):
+            rest = [(i, s) for i, s in zip(slot_ids, slot_scores, strict=True) if i != token]
+            width = len(slot_ids)
+            out_ids.append([token, *(i for i, _ in rest)][:width])
+            out_scores.append([slot_scores[0], *(s for _, s in rest)][:width])
+        return out_ids, out_scores
 
     def predraft(self, gen_batch, state, captured, count, anchor) -> bool:
         """Queue the next block before the host reads this cycle's acceptance.
@@ -352,8 +537,9 @@ class DFlashDrafter:
         drafts while the host settles the cycle; ``adopt_predraft`` then keeps
         the block if the host commits the same count.
         """
-        if not captured:
+        if not captured or self.sink_size or self.adaptive_verify or self.tree_width > 1:
             return False
+        self._require_weights()
         row = self._row(state.uid)
         unfed = sum(int(p.shape[1]) for p in row.pending)
         context = mx.concatenate([*row.pending, _concat_captured(captured)], axis=1)
@@ -376,7 +562,7 @@ class DFlashDrafter:
         mx.async_eval(tokens, *_q_arrays(accept_lps))
         return True
 
-    def adopt_predraft(self, state, count: int) -> None:
+    def adopt_predraft(self, state, count: int, job=None) -> None:
         """Commit the queued block: ``count`` verify rows entered the context."""
         pre = self._predraft
         self._predraft = None
@@ -502,6 +688,25 @@ class DFlashDrafter:
             axis=0,
         )
         h_ctx = model.hidden_norm(model.fc(padded))
+        sink_lengths = [0 if row.sinks is None else int(row.sinks.shape[1]) for _, row, *_ in rows]
+        sink_width = max(sink_lengths) if self.sink_size else 0
+        cohort = self._assemble_cohort(uids, dtype)
+        sink_sources = tuple(row.sinks for _, row, *_ in rows)
+        reuse_sinks = (
+            sink_width
+            and self.sink_kv_cache
+            and len(cohort.sink_sources) == len(sink_sources)
+            and all(a is b for a, b in zip(cohort.sink_sources, sink_sources))
+            and len(cohort.sink_kv) == len(model.layers)
+        )
+        sink_hidden = None
+        if sink_width and not reuse_sinks:
+            prefixes = [
+                mx.pad(row.sinks, [(0, 0), (0, sink_width - length), (0, 0)])
+                for (_, row, *_), length in zip(rows, sink_lengths)
+            ]
+            sink_hidden = model.hidden_norm(model.fc(mx.concatenate(prefixes, axis=0)))
+
 
         anchors = mx.concatenate([anchor for _, _, _, anchor, _ in rows]).astype(
             mx.int32
@@ -512,7 +717,6 @@ class DFlashDrafter:
         inputs = mx.concatenate([anchors[:, None], masks], axis=1)
         h = model._embed_input_tokens(inputs)
 
-        cohort = self._assemble_cohort(uids, dtype)
         base_arr = mx.array(bases, dtype=mx.int32)
         if counts is None:
             totals = mx.array([b + n for b, n in zip(bases, lengths)], dtype=mx.int32)
@@ -533,11 +737,18 @@ class DFlashDrafter:
         ring_valid = (
             (pos >= 0) & (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
         )
+        if sink_width:
+            # Retained prefix keys are separate; do not attend them twice in the ring.
+            prefix_lengths = mx.array(sink_lengths)[:, None]
+            ring_valid &= pos >= prefix_lengths
+            sink_valid = mx.arange(sink_width)[None, :] < prefix_lengths
+            ring_valid = mx.concatenate([sink_valid, ring_valid], axis=1)
         mask = mx.concatenate(
             [ring_valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
         )[:, None, None, :]
 
         new_keys, new_values = [], []
+        sink_kv = []
         for layer_index, layer in enumerate(model.layers):
             attn = layer.self_attn
             # DFlash2 layers wrap attention and the MLP in dynamic convs;
@@ -581,6 +792,22 @@ class DFlashDrafter:
             prop_keys = model.rope(prop_keys, offset=query_offsets)
             keys = mx.concatenate([ring_keys, prop_keys], axis=2)
             values = mx.concatenate([ring_values, prop_values], axis=2)
+            if sink_hidden is not None:
+                sink_keys, sink_values = attn._project_kv(sink_hidden)
+                sink_keys = attn.k_norm(
+                    sink_keys.reshape(batch, sink_width, attn.n_kv_heads, -1)
+                ).transpose(0, 2, 1, 3)
+                sink_keys = model.rope(sink_keys, offset=0)
+                sink_values = sink_values.reshape(
+                    batch, sink_width, attn.n_kv_heads, -1
+                ).transpose(0, 2, 1, 3)
+                sink_kv.append((sink_keys, sink_values))
+            if sink_width:
+                sink_keys, sink_values = (
+                    cohort.sink_kv[layer_index] if reuse_sinks else sink_kv[-1]
+                )
+                keys = mx.concatenate([sink_keys, keys], axis=2)
+                values = mx.concatenate([sink_values, values], axis=2)
             attended = mx.fast.scaled_dot_product_attention(
                 queries,
                 keys,
@@ -605,6 +832,9 @@ class DFlashDrafter:
                 x = _conv_finish(mlp_conv, x, kernel)
             h = residual + x
 
+        if sink_width and not reuse_sinks:
+            cohort.sink_sources = sink_sources if self.sink_kv_cache else ()
+            cohort.sink_kv = sink_kv if self.sink_kv_cache else []
         if commit:
             cohort.keys = new_keys
             cohort.values = new_values
@@ -617,6 +847,17 @@ class DFlashDrafter:
         draft_hidden = model.norm(h)[:, 1:]
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
+        if self.tree_width > 1:
+            width = self.tree_width
+            scores32 = logits.astype(mx.float32)
+            best = mx.argpartition(-scores32, kth=width - 1, axis=-1)[..., :width]
+            values = mx.take_along_axis(scores32, best, axis=-1)
+            order = mx.argsort(-values, axis=-1)
+            self._last_topk = (
+                mx.take_along_axis(best, order, axis=-1),
+                mx.take_along_axis(values, order, axis=-1)
+                - mx.logsumexp(scores32, axis=-1, keepdims=True),
+            )
         selector = getattr(model, "candidate_selector", None)
         if selector is not None and _fused_select_eligible(selector, draft_hidden):
             proposals = _select_fused(selector, draft_hidden, logits, anchors, samplers)
@@ -969,6 +1210,10 @@ def load_dflash_drafter(
     target_model: Any,
     *,
     block_size: int | None = None,
+    draft_window_size: int | None = None,
+    draft_sink_size: int = 0,
+    sink_kv_cache: bool = True,
+    verify_mode: str | None = None,
     quant_enabled: bool = False,
     quant_bits: int = 4,
     quant_group_size: int = 64,
@@ -978,6 +1223,17 @@ def load_dflash_drafter(
     ``target_model`` is the mlx-vlm model whose ``language_model`` owns the
     embeddings and lm_head the drafter borrows.
     """
+    from omlx.utils.model_loading import validate_dflash_block_verify_mode
+
+    validate_dflash_block_verify_mode(verify_mode)
+    if draft_window_size is not None and (
+        isinstance(draft_window_size, bool)
+        or not isinstance(draft_window_size, int)
+        or draft_window_size < 2
+    ):
+        raise ValueError("DFlash draft window must be an integer of at least 2")
+    if isinstance(draft_sink_size, bool) or not isinstance(draft_sink_size, int) or draft_sink_size < 0:
+        raise ValueError("DFlash sink size must be a nonnegative integer")
     model, kind = load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
@@ -989,13 +1245,19 @@ def load_dflash_drafter(
             quant_bits,
             quant_group_size,
         )
+    if draft_window_size is not None:
+        model.config.draft_window_size = draft_window_size
     model.bind(target_model)
     block = resolve_block_size(model, block_size)
     mx.eval(model.parameters())
     if qwen35_packed_linear.enabled(target_model):
         packed = qwen35_packed_linear.pack_drafter(model)
         logger.info("DFlash drafter packed 4-bit projections: %d layers", packed)
-    drafter = DFlashDrafter(model, block_size=block, source_path=path)
+    drafter = DFlashDrafter(
+        model, block_size=block, source_path=path, sink_size=draft_sink_size,
+        sink_kv_cache=sink_kv_cache,
+    )
+    drafter.adaptive_verify = verify_mode == "adaptive"
     logger.info(
         "DFlash drafter loaded: path=%s kind=%s block=%d target_layers=%s",
         path,
@@ -1014,6 +1276,7 @@ def attach_drafter(language_model: Any, drafter: DFlashDrafter) -> None:
     language_model._omlx_mtp_batch_rollback = True
     language_model._omlx_mtp_chain = True
     language_model._omlx_mtp_depth = drafter.depth
+    language_model._omlx_mtp_depth_fixed = not getattr(drafter, "adaptive_verify", False)
     language_model._omlx_mtp_head_clone = False
 
 

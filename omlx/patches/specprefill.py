@@ -93,6 +93,22 @@ def _accepts_extractor_kwargs(extractor, kwargs) -> bool:
     return set(kwargs).issubset(accepted)
 
 
+def _rotate_queries(attn, queries, cache=None, **kwargs):
+    """Use the attention module's rotary interface for scoring queries."""
+    rope = getattr(attn, "rope", None)
+    if callable(rope):
+        return rope(queries, offset=cache.offset) if cache is not None else rope(queries)
+    rotary = getattr(attn, "rotary_emb", None)
+    if not callable(getattr(rotary, "apply_rotary", None)):
+        raise ValueError("Draft attention has no supported rotary interface")
+    positions = kwargs.get("position_ids")
+    if positions is None:
+        offset = cache.offset if cache is not None else 0
+        positions = mx.arange(queries.shape[2])[None, :] + offset
+    rotated, _ = rotary.apply_rotary(queries, queries, positions, unsqueeze_dim=1)
+    return rotated
+
+
 def _qwen35_extract_queries(attn, x, cache=None, **kwargs):
     """Qwen3.5: gate split + q_norm + RoPE."""
     B, L, D = x.shape
@@ -101,11 +117,7 @@ def _qwen35_extract_queries(attn, x, cache=None, **kwargs):
         q_out.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
     )
     queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
-    if cache is not None:
-        queries = attn.rope(queries, offset=cache.offset)
-    else:
-        queries = attn.rope(queries)
-    return queries
+    return _rotate_queries(attn, queries, cache, **kwargs)
 
 
 def _qwen36_extract_queries(attn, x, cache=None, **kwargs):
@@ -118,11 +130,7 @@ def _qwen36_extract_queries(attn, x, cache=None, **kwargs):
     )
     queries = attn.q_proj(x).reshape(B, L, n_heads, -1)
     queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
-    if cache is not None:
-        queries = attn.rope(queries, offset=cache.offset)
-    else:
-        queries = attn.rope(queries)
-    return queries
+    return _rotate_queries(attn, queries, cache, **kwargs)
 
 
 def _llama_extract_queries(attn, x, cache=None, **kwargs):
@@ -135,11 +143,7 @@ def _llama_extract_queries(attn, x, cache=None, **kwargs):
     )
     queries = attn.q_proj(x)
     queries = queries.reshape(B, L, n_heads, -1).transpose(0, 2, 1, 3)
-    if cache is not None:
-        queries = attn.rope(queries, offset=cache.offset)
-    else:
-        queries = attn.rope(queries)
-    return queries
+    return _rotate_queries(attn, queries, cache, **kwargs)
 
 
 def _gemma4_extract_queries(attn, x, cache=None, offset=None, **kwargs):
@@ -193,9 +197,17 @@ def _get_attn_module(layer):
 def _set_attn_module(layer, module):
     """Set attention module on a layer."""
     if hasattr(layer, "self_attn"):
-        layer.self_attn = module
+        name = "self_attn"
     elif getattr(layer, "block_type", None) == "*":
-        layer.mixer = module
+        name = "mixer"
+    else:
+        return
+    # MLX modules are dictionaries. Keep the child in that dictionary even
+    # while a plain capture proxy wraps it; some forwards use item lookup.
+    if isinstance(layer, dict):
+        layer[name] = module
+    else:
+        setattr(layer, name, module)
 
 
 def _build_layer_to_cache_map(model) -> Dict[int, int]:
@@ -459,9 +471,7 @@ def _hold_value(value: Any, seen: set[int]) -> Any:
 
 def _restore_value(held: Any) -> Any:
     if isinstance(held, _HeldObject):
-        vars(held.obj).update(
-            {k: _restore_value(v) for k, v in held.attrs.items()}
-        )
+        vars(held.obj).update({k: _restore_value(v) for k, v in held.attrs.items()})
         return held.obj
     if isinstance(held, (list, tuple)):
         return type(held)(_restore_value(v) for v in held)
@@ -666,7 +676,11 @@ def score_tokens(
             cache,
             step_size=prefill_step_size,
             progress_callback=(
-                (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
+                (
+                    lambda processed, total: progress_callback(
+                        cached_len + processed, n_prompt, "scoring"
+                    )
+                )
                 if progress_callback is not None
                 else None
             ),
@@ -679,7 +693,11 @@ def score_tokens(
             cache,
             step_size=prefill_step_size,
             progress_callback=(
-                (lambda processed, total: progress_callback(processed, total, "scoring"))
+                (
+                    lambda processed, total: progress_callback(
+                        processed, total, "scoring"
+                    )
+                )
                 if progress_callback is not None
                 else None
             ),
@@ -694,8 +712,7 @@ def score_tokens(
     # Recurrent state and wrapped rotating buffers cannot be trimmed like KV.
     leaves = _cache_leaves(cache)
     held_states = [
-        None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)
-        for leaf in leaves
+        None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf) for leaf in leaves
     ]
 
     # Phase 2: Lookahead decode with query capture
@@ -1028,20 +1045,38 @@ def sparse_prefill(
     selected_tokens = tokens[selected_indices]
     N = selected_tokens.shape[0]
 
-    # Detect initial cache offset (non-zero when system KV is restored)
+    # Explicit-position models own decode offsets, including recurrent-only stages.
+    set_position_offset = getattr(model, "set_specprefill_position_offset", None)
+    explicit_positions = callable(set_position_offset)
     attn_layers = _find_attention_layers(model)
-    layer_to_cache = _build_layer_to_cache_map(model)
-    first_attn_layer_idx = attn_layers[0][0]
-    first_attn_cache_idx = layer_to_cache[first_attn_layer_idx]
-    cache_start = (
-        cache[first_attn_cache_idx].offset
-        if hasattr(cache[first_attn_cache_idx], "offset")
-        else 0
+    cache_start = 0
+    has_rope = False
+    if not explicit_positions:
+        if not attn_layers:
+            raise ValueError(
+                "SpecPrefill model exposes no attention or position handler"
+            )
+        layer_to_cache = _build_layer_to_cache_map(model)
+        first_attn_cache_idx = layer_to_cache[attn_layers[0][0]]
+        cache_start = getattr(cache[first_attn_cache_idx], "offset", 0)
+        has_rope = hasattr(_get_attn_module(attn_layers[0][1]), "rope")
+
+    output_scope = getattr(getattr(model, "model", None), "coordinator_output", None)
+    cache_only_output = callable(output_scope) and bool(
+        getattr(model, "_omlx_supports_rank_zero_logits", False)
     )
 
-    # Check if model has RoPE (Nemotron-H doesn't)
-    first_attn = _get_attn_module(attn_layers[0][1])
-    has_rope = hasattr(first_attn, "rope")
+    def forward(start, end, cache_only=False):
+        kwargs = {}
+        if explicit_positions:
+            kwargs["position_ids"] = selected_positions[start:end][None]
+        if cache_only and cache_only_output:
+            with output_scope():
+                return model(
+                    selected_tokens[start:end][None], cache=cache,
+                    skip_logits=True, **kwargs,
+                )
+        return model(selected_tokens[start:end][None], cache=cache, **kwargs)
 
     # Patch RoPE for position-mapped prefill
     original_ropes = {}
@@ -1057,32 +1092,43 @@ def sparse_prefill(
                 genuine, selected_positions, cache_start=cache_start
             )
 
+    succeeded = False
     try:
-        prompt = selected_tokens
         n = int(N)
         processed = 0
 
-        while n - processed > 1:
-            chunk = min(step_size, n - processed - 1)
-            if progress_callback is not None:
-                # Surface that work is active before the potentially long
-                # target-model eval returns, but don't advance completed-token
-                # progress until the eval has actually finished.
-                progress_callback(processed, n)
-            model(prompt[processed : processed + chunk][None], cache=cache)
-            mx.eval([c.state for c in cache])
-            processed += chunk
-            if progress_callback is not None:
-                progress_callback(processed, n)
-            mx.clear_cache()
+        from contextlib import nullcontext
+
+        transport = getattr(model, "_omlx_prefill_transport", None)
+        context = (
+            transport() if cache_only_output and callable(transport)
+            else nullcontext(lambda callback, *args, **kwargs: callback(*args, **kwargs))
+        )
+        with context as run_forward:
+            while n - processed > 1:
+                chunk = min(step_size, n - processed - 1)
+                if progress_callback is not None:
+                    # Surface that work is active before the potentially long
+                    # target-model eval returns, but don't advance completed-token
+                    # progress until the eval has actually finished.
+                    progress_callback(processed, n)
+                run_forward(forward, processed, processed + chunk, cache_only=True)
+                mx.eval([c.state for c in cache])
+                processed += chunk
+                if progress_callback is not None:
+                    progress_callback(processed, n)
+                mx.clear_cache()
 
         # Last token -> logits
-        logits = model(prompt[processed:][None], cache=cache)
+        logits = forward(processed, n)
         mx.eval(logits)
         if progress_callback is not None:
             progress_callback(n, n)
+        succeeded = True
 
     finally:
+        if explicit_positions:
+            set_position_offset(cache, position_offset + M if succeeded else None)
         # Replace position-mapped RoPE with offset-adjusted RoPE for decode
         if has_rope:
             total_prompt_len = position_offset + M
@@ -1105,6 +1151,9 @@ def cleanup_rope(model):
     Call after generation to remove _OffsetAdjustedRoPE wrappers.
     No-op for architectures without RoPE (e.g. Nemotron-H).
     """
+    set_position_offset = getattr(model, "set_specprefill_position_offset", None)
+    if callable(set_position_offset):
+        set_position_offset(None, None)
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):

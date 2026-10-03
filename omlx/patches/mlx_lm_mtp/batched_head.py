@@ -127,11 +127,13 @@ def draft(batch, jobs):
             layer.prepare(lengths=sizes, right_padding=padding)
         else:
             layer.prepare(right_padding=padding)
+    greedy = all(bg._is_greedy(row) for row, *_ in jobs)
+    forward_kwargs = bg._draft_forward_kwargs(jobs[0][0])
     positions = mx.array(sizes)[:, None, None] - 1
     if head_prenorm or head_clone:
         # HC heads return raw recurrent hidden separately from projected logits.
         all_logits, raw_hidden = batch.model.mtp_forward(
-            hidden, tokens, cache, return_hidden=True
+            hidden, tokens, cache, return_hidden=True, **forward_kwargs
         )
         selected = mx.take_along_axis(raw_hidden, positions, axis=1)
         logits = mx.take_along_axis(all_logits, positions, axis=1)
@@ -145,16 +147,16 @@ def draft(batch, jobs):
         )
     for layer in cache:
         layer.finalize()
-    chain_cache = (
-        bg._clone_mtp_head_cache(cache) if head_clone and depth > 1 else cache
-    )
+    chain_cache = bg._clone_mtp_head_cache(cache) if head_clone and depth > 1 else cache
     samplers = [bg._resolve_draft_sampler(row, state) for row, state, *_ in jobs]
-    greedy = all(bg._is_greedy(row) for row, *_ in jobs)
     drafted, probabilities, acceptance = [], [], []
     for index in range(depth):
         lp = bg._logprobs(logits[:, -1, :])
         if greedy:
             token = mx.argmax(lp, axis=-1).astype(mx.uint32)
+            coordinator = getattr(batch.model, "_omlx_mtp_coordinator", None)
+            if coordinator is not None:
+                token = coordinator.tokens(token)
             accept_lp = lp
         else:
             token, accept_lp = _sample_rows(samplers, lp)
@@ -164,7 +166,7 @@ def draft(batch, jobs):
         acceptance.append(accept_lp)
         if index + 1 < depth:
             logits, selected = batch.model.mtp_forward(
-                selected, token[:, None], chain_cache, return_hidden=True
+                selected, token[:, None], chain_cache, return_hidden=True, **forward_kwargs
             )
     result = mx.stack(drafted, axis=1)
     mx.async_eval(result)

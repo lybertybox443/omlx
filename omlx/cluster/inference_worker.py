@@ -25,6 +25,7 @@ from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
+    decode_worker_runtime_options,
     decode_worker_stage_links,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
@@ -957,6 +958,60 @@ def _validate_loaded_stage(
         raise RuntimeError("loaded model retained weights before its pipeline stage")
     if any(layer is None for layer in layers[assignment.start_layer :]):
         raise RuntimeError("loaded model is missing weights inside its pipeline stage")
+    _validate_stage_owner(model, pipeline_model, assignment)
+
+
+def _validate_stage_owner(
+    model: Any,
+    pipeline_model: Any,
+    assignment: PipelineAssignment,
+) -> None:
+    """For models that build their own stage, check the stage they really own.
+
+    Such a model records a stage object and its adapter reads which decoder
+    layers its *parameters* belong to. The range the stage reports, its world
+    position and those layers must all equal the approved assignment; any one
+    of them differing means this rank would compute the wrong layers.
+    """
+
+    stage = getattr(pipeline_model, "pipeline_stage", None)
+    if stage is None:
+        return
+    if (stage.rank, stage.start, stage.end) != (
+        assignment.rank,
+        assignment.start_layer,
+        assignment.end_layer,
+    ):
+        raise RuntimeError(
+            "loaded model stage does not match the approved assignment: "
+            f"rank {stage.rank} holds [{stage.start}, {stage.end}), expected "
+            f"rank {assignment.rank} [{assignment.start_layer}, "
+            f"{assignment.end_layer})"
+        )
+    resident = model_adapter(model).resident_layers(model)
+    expected = set(range(assignment.start_layer, assignment.end_layer))
+    if resident != expected:
+        raise RuntimeError(
+            "loaded model weights do not belong to the approved stage: "
+            f"resident layers {sorted(resident)}, expected "
+            f"[{assignment.start_layer}, {assignment.end_layer})"
+        )
+
+
+def _model_config(model_path: str | Path) -> dict[str, Any]:
+    try:
+        config = json.loads((Path(model_path).expanduser() / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def model_adapter(model: Any) -> Any:
+    """The architecture adapter a loaded model names, or the neutral default."""
+
+    from .model_adapters import PipelineModelAdapter
+
+    return getattr(model, "_omlx_adapter", None) or PipelineModelAdapter()
 
 
 def _loaded_stage(model: Any) -> dict[str, Any]:
@@ -971,7 +1026,7 @@ def _loaded_stage(model: Any) -> dict[str, Any]:
 
     pipeline_model = getattr(model, "model", None)
     layers = getattr(pipeline_model, "layers", None)
-    return {
+    stage = {
         "loaded_start_layer": getattr(pipeline_model, "start_idx", None),
         "loaded_end_layer": getattr(pipeline_model, "end_idx", None),
         "loaded_layer_count": (
@@ -980,6 +1035,14 @@ def _loaded_stage(model: Any) -> dict[str, Any]:
             else None
         ),
     }
+    if getattr(pipeline_model, "pipeline_stage", None) is not None:
+        # The module list can look right while other stages' tensors stay
+        # resident; the parameter tree is what the Mac actually holds.
+        resident = model_adapter(model).resident_layers(model)
+        stage["loaded_resident_layers"] = (
+            [min(resident), max(resident) + 1] if resident else []
+        )
+    return stage
 
 
 def _measured_weight_bytes(model: Any) -> int | None:
@@ -1233,6 +1296,7 @@ def run_worker(args: argparse.Namespace) -> int:
     plan_hash, assignments, performance_profiles, tensor_parallel_size = (
         decode_worker_contract(args.plan)
     )
+    runtime_options = decode_worker_runtime_options(args.plan)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
     jaccl_lease = (
@@ -1308,6 +1372,11 @@ def run_worker(args: argparse.Namespace) -> int:
         # ceiling the single-node engine pool admits against. Checked *before*
         # any weights are read: without it a rank loads until the OS gives up,
         # taking the machine with it.
+        from .model_adapters import adapter_for_config
+
+        adapter = adapter_for_config(_model_config(args.model))
+        # Keep the approved conservative bound, including file-backed PLE pages.
+        # mmap changes storage, not the rank's signed admission budget.
         assignment = assignments[rank]
         # Role- and tier-aware: a Mac someone is working on admits at a lower
         # fraction than a headless one, and the guard — not the plan — is what
@@ -1354,6 +1423,10 @@ def run_worker(args: argparse.Namespace) -> int:
         )
 
         maybe_apply_pre_load_patches(args.model)
+        # An architecture mlx-lm cannot load registers itself, with the
+        # runtime options the deployment carries (never a local guess).
+        if adapter is not None:
+            adapter.prepare_worker(args.model, runtime_options)
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1437,6 +1510,14 @@ def run_worker(args: argparse.Namespace) -> int:
             )
             # Validate the loaded pipeline stage before any TP mutation
             _validate_loaded_stage(provider.model, assignment)
+            # A model that builds its own stage proves, with one collective
+            # issued after the load, that every rank agrees on the wire
+            # layout and that the ranges chain from layer 0 to the last.
+            if (
+                getattr(getattr(provider.model, "model", None), "pipeline_stage", None)
+                is not None
+            ):
+                model_adapter(provider.model).verify_contract(provider.model, group)
             # Pure TP was applied layer-by-layer by the progressive loader.
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
@@ -1455,6 +1536,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     execution,
                     batchable=provider.is_batchable,
                     pipeline_parallel=tensor_parallel_size == 1,
+                    runtime_options=runtime_options,
                 ) as optimizations,
             ):
                 marker.update(
@@ -1527,14 +1609,27 @@ def run_worker(args: argparse.Namespace) -> int:
                     if args.control_host and args.control_port and args.control_token
                     else nullcontext(None)
                 )
+                capture_root = _prompt_cache_ssd_dir(args, rank) if args.prompt_cache_ssd else None
+                provider._omlx_capture_cache_dir = str(Path(capture_root) / "dflash_captures") if capture_root else None
                 with (
                     control_context as control_plane,
+                    model_adapter(provider.model).serving(
+                        provider.model, provider, mlx_server, runtime_options
+                    ),
                     install_server_telemetry(
                         marker,
                         execution=execution,
                         assignment=assignment,
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
+                        capture_cache_dir=provider._omlx_capture_cache_dir,
+                        capture_cache=getattr(
+                            getattr(
+                                getattr(getattr(provider.model, "language_model", None), "_omlx_drafter", None),
+                                "draft_model", None,
+                            ),
+                            "capture_store", None,
+                        ),
                         ssd_cache_max_bytes=execution.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(

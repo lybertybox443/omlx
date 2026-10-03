@@ -1225,7 +1225,13 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
 
 
-_DFLASH_BATCHED_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe")
+_DFLASH_BATCHED_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen4_exp")
+# Branched (ddtree) verification needs the Qwen4 forward's exact memory model.
+_DDTREE_MODEL_TYPES = ("qwen4_exp",)
+
+
+def ddtree_supported(model_type: str | None) -> bool:
+    return model_type in _DDTREE_MODEL_TYPES
 
 
 def dflash_batched_supported(model_type: str | None, engine_type: str | None) -> bool:
@@ -1235,6 +1241,25 @@ def dflash_batched_supported(model_type: str | None, engine_type: str | None) ->
     single-stream DFlashEngine.
     """
     return engine_type == "vlm" and model_type in _DFLASH_BATCHED_MODEL_TYPES
+
+
+def validate_dflash_block_verify_mode(mode: str | None, *, allow_ddtree: bool = False) -> None:
+    """Reject unsupported algorithms loading shared-block drafter.
+
+    ``ddtree`` (branched verification) exists on distributed deployments and on local
+    batched Qwen4 targets; callers pass ``allow_ddtree`` once they have checked that.
+    """
+    if mode == "ddtree" and not allow_ddtree:
+        raise ValueError(
+            "DFlash verify mode 'ddtree' is available on distributed deployments and local "
+            "batched Qwen4 targets only (other block verifiers are linear); select "
+            "'dflash'/'adaptive' here or use the standalone DFlash engine"
+        )
+    if mode not in (None, "dflash", "adaptive", "ddtree"):
+        raise ValueError(
+            f"DFlash verify mode {mode!r} is unsupported by the batched/distributed "
+            "block verifier; select 'dflash'/'adaptive' or use the standalone DFlash engine"
+        )
 
 
 def dflash_batched_requested(model_settings: Any | None) -> bool:
@@ -1482,3 +1507,31 @@ def maybe_load_custom_quantization(
         return None
 
     return model, processor
+
+
+def load_specprefill_draft(model_path: str, *, trust_remote_code: bool = False):
+    """Load a complete scoring model without inheriting target MTP or sharding.
+
+    The caller owns memory admission and serializes model loading. Materialize
+    frozen buffers on this thread before another executor scores the draft.
+    """
+    from ..cluster.pipeline_compat import unsharded_model_loading
+    from ..patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+    from .tokenizer import get_tokenizer_config
+
+    was_mtp = is_mtp_active()
+    try:
+        set_mtp_active(False)
+        with unsharded_model_loading():
+            tokenizer_config = get_tokenizer_config(
+                model_path, trust_remote_code=trust_remote_code
+            )
+            model, _ = lm_load_compat(
+                model_path,
+                tokenizer_config=tokenizer_config,
+                trust_remote_code=trust_remote_code,
+            )
+            materialize_lazy_state(model)
+            return model
+    finally:
+        set_mtp_active(was_mtp)

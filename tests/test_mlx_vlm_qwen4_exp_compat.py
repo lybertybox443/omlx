@@ -2071,8 +2071,8 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
 
 def test_mtp_batched_positions_match_for_identical_rows():
     config = _tiny_config().text_config
-    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
     import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
 
     mx.random.seed(17)
     head = Qwen4ExpMTPModule(config)
@@ -2184,3 +2184,35 @@ def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_
     assert mx.array_equal(out, conv(x)).item()
     assert language._DEPTHWISE_CONV_STATE["enabled"] is False
     assert language._DEPTHWISE_CONV_STATE["validated"] is False
+
+
+def test_recurrent_row_mask_honours_right_padding_with_zero_left_padding():
+    """A right-padded prefill prepares ``lengths`` on caches merged with zero left padding."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import _recurrent_row_mask
+
+    hidden = mx.zeros((3, 6, 4))
+    cache = ArraysCache.merge([ArraysCache(2) for _ in range(3)])
+    assert cache.left_padding is not None  # zeros: the stock builder answers no mask
+    cache.prepare(lengths=[6, 2, 4])
+    mask = _recurrent_row_mask(hidden, cache)
+    assert mask.tolist() == [
+        [True] * 6,
+        [True, True, False, False, False, False],
+        [True, True, True, True, False, False],
+    ]
+    # Full-length rows (no padding anywhere) keep the stock answer.
+    full = ArraysCache.merge([ArraysCache(2) for _ in range(2)])
+    full.prepare(lengths=[6, 6])
+    assert _recurrent_row_mask(hidden[:2], full) is None
+    # Real left padding combines with the in-length condition.
+    both = ArraysCache.merge([ArraysCache(2) for _ in range(2)])
+    both.left_padding = mx.array([2, 0])
+    both.prepare(lengths=[6, 3])
+    assert _recurrent_row_mask(hidden[:2], both).tolist() == [
+        [False, False, True, True, True, True],
+        [True, True, True, False, False, False],
+    ]
+    assert _recurrent_row_mask(hidden, None) is None

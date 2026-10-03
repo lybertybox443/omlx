@@ -9,6 +9,7 @@ from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
 from ..qwen3_5 import Model as Qwen3_5Model
 from ..qwen3_5.qwen3_5 import sanitize_key
 from .config import ModelConfig
+from . import pipeline as _pipeline
 from .language import (
     LanguageModel,
     Qwen4ExpMTPModule,
@@ -23,6 +24,7 @@ from .vision import VisionModel
 
 logger = logging.getLogger(__name__)
 
+_VISION_KEY = re.compile(r"(?:model\.)?(?:vision_tower|visual)\.")
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
 _NGRAM_STORAGE_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\."
@@ -135,7 +137,14 @@ class Model(Qwen3_5Model):
     def __init__(self, config: ModelConfig):
         nn.Module.__init__(self)
         self.config = config
-        self.vision_tower = VisionModel(config.vision_config)
+        # In a pipeline only the stage that owns layer 0 consumes embeddings,
+        # so it alone runs (and holds) the vision tower; every other stage
+        # builds none and its checkpoint tensors are dropped by ``sanitize``.
+        self.vision_tower = (
+            VisionModel(config.vision_config)
+            if _pipeline.owns_vision(config.text_config.num_hidden_layers)
+            else None
+        )
         self.language_model = LanguageModel(config.text_config, config)
         if get_mtp_runtime().enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)
@@ -180,6 +189,14 @@ class Model(Qwen3_5Model):
                 key = "mtp." + key[len(mtp_key) :]
             normalized[key] = value
         weights = normalized
+
+        if getattr(self, "vision_tower", object()) is None:
+            # Another pipeline stage owns the vision tower.
+            weights = {
+                key: value
+                for key, value in weights.items()
+                if not _VISION_KEY.match(key)
+            }
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

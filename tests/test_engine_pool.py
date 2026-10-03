@@ -1462,6 +1462,29 @@ class TestEnginePoolAsync:
         return pool
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["ddtree", "off"])
+    async def test_batched_dflash_rejects_unsupported_verifier(
+        self, pool_with_mock_engines, mode
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._get_final_ceiling = lambda: 32 * 1024**3
+        settings = ModelSettings(
+            dflash_enabled=True, dflash_draft_model="/draft",
+            dflash_verify_mode=mode,
+            dflash_in_memory_cache=False,
+        )
+        with (
+            patch("omlx.engine_pool.dflash_batched_supported", return_value=True),
+            patch("omlx.engine_pool.BatchedEngine") as create_engine,
+        ):
+            with pytest.raises(ModelUnavailableError, match="block verifier"):
+                await pool.get_engine("model-a", runtime_settings=settings)
+        create_engine.assert_not_called()
+        assert pool.loaded_model_count == 0
+
+    @pytest.mark.asyncio
     async def test_get_engine_loads_model(self, pool_with_mock_engines):
         """Test that get_engine loads the model."""
         pool = pool_with_mock_engines

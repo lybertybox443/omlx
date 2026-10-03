@@ -370,8 +370,18 @@ class ModelSettingsRequest(BaseModel):
     dflash_ssd_cache_max_bytes: int | None = None
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
+    dflash_sink_kv_cache: bool | None = None
+    dflash_async_prefill: bool | None = None
+    dflash_predraft: bool | None = None
+    dflash_evict_on_fallback: bool | None = None
+    dflash_capture_cache: bool | None = None
+    mtp_peer_projection_skip: bool | None = None
+    mtp_peer_verify_projection_skip: bool | None = None
     dflash_block_size: int | None = None
     dflash_verify_mode: str | None = None
+    dflash_ddtree_max_branches: int | None = None
+    dflash_ddtree_max_nodes: int | None = None
+    dflash_ddtree_memory_bytes: int | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -911,6 +921,9 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_sink_size",
         "dflash_block_size",
         "dflash_verify_mode",
+        "dflash_ddtree_max_branches",
+        "dflash_ddtree_max_nodes",
+        "dflash_ddtree_memory_bytes",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
     )
@@ -1022,6 +1035,9 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_sink_size = None
     settings.dflash_block_size = None
     settings.dflash_verify_mode = None
+    settings.dflash_ddtree_max_branches = None
+    settings.dflash_ddtree_max_nodes = None
+    settings.dflash_ddtree_memory_bytes = None
     settings.mtp_enabled = False
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
@@ -3165,6 +3181,14 @@ async def update_model_settings(
         current_settings.dflash_draft_window_size = (
             int(value) if value and value > 0 else None
         )
+    for name in (
+        "dflash_capture_cache", "mtp_peer_projection_skip",
+        "mtp_peer_verify_projection_skip", "dflash_sink_kv_cache",
+        "dflash_async_prefill", "dflash_predraft",
+        "dflash_evict_on_fallback",
+    ):
+        if name in sent:
+            setattr(current_settings, name, bool(getattr(request, name)))
     if "dflash_draft_sink_size" in sent:
         # Negative / None → oMLX default 0 (no sink tokens).
         value = request.dflash_draft_sink_size
@@ -3178,6 +3202,12 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    for name in (
+        "dflash_ddtree_max_branches", "dflash_ddtree_max_nodes", "dflash_ddtree_memory_bytes",
+    ):
+        if name in sent:
+            value = getattr(request, name)
+            setattr(current_settings, name, int(value) if value and value > 0 else None)
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3424,6 +3454,17 @@ async def update_model_settings(
         or "dflash_in_memory_cache" in sent
         or "dflash_in_memory_cache_max_entries" in sent
         or "dflash_in_memory_cache_max_bytes" in sent
+        or "dflash_sink_kv_cache" in sent
+        or "dflash_async_prefill" in sent
+        or "dflash_verify_mode" in sent
+        or "dflash_ddtree_max_branches" in sent
+        or "dflash_ddtree_max_nodes" in sent
+        or "dflash_ddtree_memory_bytes" in sent
+        or "dflash_predraft" in sent
+        or "dflash_evict_on_fallback" in sent
+        or "dflash_capture_cache" in sent
+        or "mtp_peer_projection_skip" in sent
+        or "mtp_peer_verify_projection_skip" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
@@ -7052,6 +7093,7 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
             try:
                 report = await distributed_clear(ssd=True)
                 total_deleted += int(report.get("ssd_deleted", 0))
+                total_deleted += int(report.get("capture_ssd_deleted", 0))
                 distributed_ranks += len(report.get("ranks", ()))
             except Exception as exc:
                 logger.warning(
@@ -7169,6 +7211,7 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         try:
             report = await distributed_clear(hot=True)
             total_cleared += int(report.get("hot_cleared", 0))
+            total_cleared += int(report.get("capture_hot_cleared", 0))
             distributed_ranks += len(report.get("ranks", ()))
         except Exception as exc:
             logger.warning(

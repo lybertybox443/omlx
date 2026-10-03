@@ -747,39 +747,12 @@ class BatchedEngine(BaseEngine):
                 try:
 
                     def _load_draft():
-                        from ..patches.mlx_lm_mtp import set_mtp_active
+                        from ..utils.model_loading import load_specprefill_draft
 
-                        was_mtp = False
-                        try:
-                            from ..patches.mlx_lm_mtp import is_mtp_active
-
-                            was_mtp = is_mtp_active()
-                        except Exception:
-                            pass
-                        set_mtp_active(False)
-                        try:
-                            draft_tokenizer_config = get_tokenizer_config(
-                                specprefill_draft,
-                                trust_remote_code=self._trust_remote_code,
-                            )
-                            draft_model, _ = lm_load_compat(
-                                specprefill_draft,
-                                tokenizer_config=draft_tokenizer_config,
-                                trust_remote_code=self._trust_remote_code,
-                            )
-                            # Materialize frozen buffers (RoPE freqs, etc.)
-                            # on the loader thread. mlx_lm.load only does
-                            # mx.eval(model.parameters()) and leaves siblings
-                            # lazy bound to this thread's stream. Without
-                            # this, the first score_tokens() call from
-                            # Scheduler.step on the per-engine executor
-                            # thread raises "no Stream(gpu, X) in current
-                            # thread". Same root cause and fix as e93c408
-                            # for the VLM MTP drafter.
-                            materialize_lazy_state(draft_model)
-                            return draft_model
-                        finally:
-                            set_mtp_active(was_mtp)
+                        return load_specprefill_draft(
+                            specprefill_draft,
+                            trust_remote_code=self._trust_remote_code,
+                        )
 
                     draft_model = await loop.run_in_executor(
                         get_mlx_executor(), _load_draft

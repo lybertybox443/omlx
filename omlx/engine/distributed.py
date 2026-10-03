@@ -238,7 +238,10 @@ class DistributedBatchedEngine(BatchedEngine):
     def runtime_failed_reason(self) -> str | None:
         """Terminal worker failure observed by the coordinator, if any."""
 
-        if self._runtime_failed_reason is None and getattr(self, "_supervisor", None) is not None:
+        if (
+            self._runtime_failed_reason is None
+            and getattr(self, "_supervisor", None) is not None
+        ):
             status = self._supervisor.status()
             reason = status.failure_reason
             if reason is None and status.returncode is not None:
@@ -300,7 +303,8 @@ class DistributedBatchedEngine(BatchedEngine):
         """Quiescence-gated cache clear executed on every inference rank."""
 
         if not ssd and not hot:
-            return {"status": "ok", "ranks": [], "ssd_deleted": 0, "hot_cleared": 0}
+            return {"status": "ok", "ranks": [], "ssd_deleted": 0, "hot_cleared": 0,
+                    "capture_ssd_deleted": 0, "capture_hot_cleared": 0}
         if not self._loaded or self._client is None or self._supervisor.port is None:
             raise DistributedInferenceError("distributed engine is not loaded")
         async with self._active_lock:
@@ -415,12 +419,14 @@ raise SystemExit(2)
             "ranks": reports,
             "ssd_deleted": sum(int(item.get("ssd_deleted", 0)) for item in reports),
             "hot_cleared": sum(int(item.get("hot_cleared", 0)) for item in reports),
+            "capture_ssd_deleted": sum(int(item.get("capture_ssd_deleted", 0)) for item in reports),
+            "capture_hot_cleared": sum(int(item.get("capture_hot_cleared", 0)) for item in reports),
         }
 
     async def start(self) -> None:
         if self._loaded:
             return
-        self._validate_model_settings()
+        self._validate_model_settings(defer_model_capabilities=True)
         self._runtime_failed_reason = None
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
@@ -442,7 +448,9 @@ raise SystemExit(2)
             ],
         )
         config = await asyncio.to_thread(load_config, metadata_path)
+        self._validate_runtime_contract(config)
         self._model_type = config.get("model_type")
+        self._validate_model_settings()
         self._tokenizer = await asyncio.to_thread(
             load_tokenizer,
             metadata_path,
@@ -470,10 +478,47 @@ raise SystemExit(2)
             self.deployment.plan_hash[:16],
         )
 
-    def _validate_model_settings(self) -> None:
+    def _validate_runtime_contract(self, config: dict[str, Any]) -> None:
+        from ..cluster.model_adapters import adapter_for_config
+
+        adapter = adapter_for_config(config)
+        if adapter is None or self._model_settings is None:
+            return
+        expected = adapter.runtime_options(config, self._model_settings)
+        if expected.get("specprefill_draft_model"):
+            for key in ("specprefill_reserved_bytes", "specprefill_max_prompt_tokens"):
+                value = self.deployment.runtime_options.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError("SpecPrefill requires an approved memory reservation")
+                expected[key] = value
+        if expected.get("dflash_enabled"):
+            for key in ("dflash_reserved_bytes", "dflash_max_prompt_tokens"):
+                value = self.deployment.runtime_options.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError("DFlash requires an approved memory reservation")
+                expected[key] = value
+        if expected.get("vlm_mtp_enabled"):
+            for key in ("vlm_mtp_reserved_bytes", "vlm_mtp_max_prompt_tokens"):
+                value = self.deployment.runtime_options.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError("external MTP requires an approved memory reservation")
+                expected[key] = value
+        if expected != self.deployment.runtime_options:
+            raise ValueError(
+                "model runtime settings differ from the approved cluster plan; "
+                "replan the deployment before loading"
+            )
+
+    def _validate_model_settings(self, *, defer_model_capabilities: bool = False) -> None:
+        from ..cluster.model_adapters import adapter_for_type
+
         settings = self._model_settings
         if settings is None:
             return
+        adapter = adapter_for_type(self._model_type)
+        supported = adapter.optimizations if adapter is not None else ()
+        if defer_model_capabilities:
+            supported = (*supported, "mtp_enabled", "specprefill_enabled", "turboquant_kv_enabled", "dflash_enabled", "vlm_mtp_enabled")
         incompatible = [
             name
             for name in (
@@ -483,7 +528,7 @@ raise SystemExit(2)
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
             )
-            if bool(getattr(settings, name, False))
+            if bool(getattr(settings, name, False)) and name not in supported
         ]
         if incompatible:
             raise ValueError(
@@ -595,16 +640,56 @@ raise SystemExit(2)
         kind = "stream" if stream else "request"
         return DistributedInferenceError(f"rank-zero inference {kind} failed: {detail}")
 
-    @staticmethod
-    def _validate_request_features(kwargs: dict[str, Any]) -> None:
+    _MEDIA_KIND = {
+        "image": "image",
+        "image_url": "image",
+        "input_image": "image",
+        "input_audio": "audio",
+        "audio": "audio",
+        "video": "video",
+        "video_url": "video",
+        "input_video": "video",
+    }
+
+    def _reject_unserved_media(self, messages: list[dict[str, Any]]) -> None:
+        """Refuse media the ranks cannot carry instead of letting rank 0 drop it.
+
+        What a deployment's workers serve is the model adapter's published
+        capability (``PipelineModelAdapter.media``). A model without an adapter
+        keeps its text-only behavior: rank 0's server reports the part itself.
+        """
+
+        from ..cluster.model_adapters import adapter_for_type
+
+        adapter = adapter_for_type(self._model_type)
+        if adapter is None:
+            return
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                kind = self._MEDIA_KIND.get(
+                    part.get("type") if isinstance(part, dict) else None
+                )
+                if kind is not None and kind not in adapter.media:
+                    raise ValueError(
+                        f"distributed {adapter.model_type} does not serve "
+                        f"{kind!r} input; its ranks serve "
+                        f"{', '.join(adapter.media) or 'text'} only."
+                    )
+
+    def _validate_request_features(self, kwargs: dict[str, Any]) -> None:
+        # ddtree replays the repetition/presence/frequency penalties and the thinking
+        # budget per branch (ddtree_branches.processed_logprobs); nothing to refuse here.
         if kwargs.get("compiled_grammar") is not None:
             raise ValueError(
                 "guided grammar is not yet supported by distributed inference"
             )
         if kwargs.get("logit_bias"):
             raise ValueError("logit_bias is not yet supported by distributed inference")
-        if kwargs.get("specprefill") is True:
-            raise ValueError("SpecPrefill is not supported by distributed inference")
+        if kwargs.get("specprefill") is True and not self.deployment.runtime_options.get("specprefill_draft_model"):
+            raise ValueError("SpecPrefill requires a deployment with a reserved draft")
 
     def _completion_payload(
         self,
@@ -657,6 +742,8 @@ raise SystemExit(2)
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
         chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        if kwargs.get("specprefill") is not None:
+            chat_template_kwargs["_omlx_specprefill"] = kwargs["specprefill"]
         # MLX-LM's private server reads thinking budgets from chat_template_kwargs
         # on the request body, not from a top-level field. Fold it in so the rank
         # sees it and can build its budget processor per request.
@@ -695,6 +782,7 @@ raise SystemExit(2)
         """
 
         self._validate_request_features(kwargs)
+        self._reject_unserved_media(messages)
         if (
             kwargs.get("seed") is not None
             and self.deployment.execution.sampling_rank_only
@@ -729,6 +817,8 @@ raise SystemExit(2)
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
         chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        if kwargs.get("specprefill") is not None:
+            chat_template_kwargs["_omlx_specprefill"] = kwargs["specprefill"]
         # MLX-LM's private server reads thinking budgets from chat_template_kwargs
         # on the request body, not from a top-level field. Fold it in so the rank
         # sees it and can build its budget processor per request.

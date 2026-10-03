@@ -897,7 +897,11 @@ def test_pipeline_cache_plan_requires_rank_agreement(monkeypatch):
         size = staticmethod(lambda: 2)
 
     class FakePromptCache:
+        fail = False
+
         def fetch_nearest_cache(self, _model, tokens):
+            if self.fail:
+                raise TypeError("injected uncopyable cache")
             return "rank-zero-cache", tokens[2:]
 
         def __len__(self):
@@ -926,6 +930,11 @@ def test_pipeline_cache_plan_requires_rank_agreement(monkeypatch):
             [3, 4],
         )
         control.peer_plan = (0, 4, 0)
+        assert cache.fetch_nearest_cache("model", tokens) == (None, tokens)
+
+    FakePromptCache.fail = True
+    with install_server_telemetry(_Marker(), heartbeat_interval=0, control_plane=control):
+        cache = mlx_server.LRUPromptCache()
         assert cache.fetch_nearest_cache("model", tokens) == (None, tokens)
 
 
@@ -976,3 +985,68 @@ def test_rank_hot_clear_reaches_live_prompt_cache_instances(monkeypatch):
     assert cache.entries == 0
     assert handler.status == 200
     assert json.loads(handler.wfile.getvalue())["hot_cleared"] == 3
+
+
+@pytest.mark.parametrize("kind", ["hot", "ssd", "all"])
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("resident", [False, True])
+def test_rank_clear_includes_capture_cache(monkeypatch, tmp_path, kind, active, resident):
+    from io import BytesIO
+    from unittest.mock import Mock
+
+    import mlx_lm.server as mlx_server
+
+    class Marker(_Marker):
+        payload = {"deployment_id": "dep", "plan_hash": "p" * 64}
+        path = None
+
+    class Handler:
+        path = f"/omlx/internal/cache/{kind}/clear"
+        headers = {"X-oMLX-Plan-Hash": "p" * 64}
+
+        def __init__(self):
+            self.wfile = BytesIO()
+            self.status = None
+
+        def _set_completion_headers(self, status):
+            self.status = status
+
+        def end_headers(self):
+            pass
+
+    monkeypatch.setattr(
+        mlx_server.APIHandler, "do_POST", lambda self: None, raising=False
+    )
+    capture_cache = Mock(root=None)
+    capture_cache.clear.return_value = {
+        "capture_hot_cleared": 2 if kind in ("hot", "all") else 0,
+        "capture_ssd_deleted": 0,
+    }
+    namespace = tmp_path / "old-configuration"
+    namespace.mkdir()
+    capture_file = namespace / "capture.safetensors"
+    capture_file.write_bytes(b"old capture")
+    with install_server_telemetry(
+        Marker(), heartbeat_interval=0,
+        capture_cache=capture_cache if resident else None,
+        capture_cache_dir=str(tmp_path),
+    ) as telemetry:
+        if active:
+            telemetry.begin_request()
+        handler = Handler()
+        mlx_server.APIHandler.do_POST(handler)
+    if active:
+        assert handler.status == 409
+        capture_cache.clear.assert_not_called()
+    else:
+        assert handler.status == 200
+        response = json.loads(handler.wfile.getvalue())
+        assert response["capture_hot_cleared"] == (2 if resident and kind in ("hot", "all") else 0)
+        assert response["capture_ssd_deleted"] == (1 if kind in ("ssd", "all") else 0)
+        if resident:
+            capture_cache.clear.assert_called_once_with(
+                memory=kind in ("hot", "all"), disk=kind in ("ssd", "all")
+            )
+        else:
+            capture_cache.clear.assert_not_called()
+    assert capture_file.exists() == (active or kind == "hot")

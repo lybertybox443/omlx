@@ -192,3 +192,60 @@ FP16/BF16, varied RMS weights, three epsilon values, every gate encoding, and
 fallback when the installed MLX arithmetic is unsupported. The check supports
 both released and nightly MLX builds; it does not assume the exponential from
 the version number.
+
+# Qwen4-Exp pipeline tests
+
+Run `python -m pytest -q tests/test_qwen4_exp_pipeline.py tests/test_qwen4_exp_pipeline_ring.py tests/test_qwen4_exp_worker_e2e.py` on a Metal-capable Mac. No checkpoint is loaded: `tests/qwen4_pipeline_support.py` writes a reduced Qwen4-Exp (GatedDeltaNet and QSA layers, hyper-connections, MoE with a shared expert, PLE, a vision tower; optionally 4-bit with per-tensor overrides).
+
+`test_qwen4_exp_pipeline.py` is single-process: the stage contract, boundary packing, local cache indices, per-stage construction and weight filtering (including the RMSNorm centering vote on small stages), hook recognition, planning for 2 to 48 stages without weights, and the guards that must stay (accelerations and image input refused). It does not prove any collective.
+
+`test_qwen4_exp_pipeline_ring.py` starts 2, 3 and 4 real MLX ring ranks on loopback (`qwen4_pipeline_worker.py`). Each compares its stage with the whole model on fragmented prefill and several decodes, down to every cache tensor, with the production loader, a quantized checkpoint, the deferred and eager write layouts, and an image prompt through a vision tower held by the first stage only. Tolerances are declared at the top of the file.
+
+`test_qwen4_exp_worker_e2e.py` runs the production `inference_worker` with the argument vector `build_mlx_launch_argv` builds, on real ranks, and compares chat, streaming, prompt-cache reuse and concurrent batched requests with the whole model; `DistributedBatchedEngine` talks to those ranks. It also checks that the surviving ranks exit within a bound when one is killed and that terminating the deployment leaves no process. Equal-length prompts are used because a left-padded batch row of this tiny model already differs from its single-request run on one Mac. A loopback ring is not an inter-Mac measurement. See [Qwen4-Exp pipeline](experimental/qwen4_exp_pipeline.md) for what is and is not demonstrated.
+
+
+## Deferred multi-Mac MTP projection performance comparison
+
+Before claiming a throughput improvement from skipping peer draft projections,
+compare the same deployment with the public `mtp_peer_projection_skip` (draft) and, independently, `mtp_peer_verify_projection_skip` (target verification) options, each alone and both together,
+enabled and disabled. It defaults to false.
+Use the same checkpoint, quantization, layer placement, prompts, output lengths,
+cache state and sampling settings. Cover greedy and stochastic generation,
+singleton and concurrent batches, short and long prompts, and both 2 and N Macs.
+Run on the actual JACCL/RDMA transport; loopback correctness tests are insufficient.
+
+Warm up both configurations, alternate repeated runs, and record tokens/s, first
+token latency, inter-token latency (median and p95), per-rank GPU memory and
+collective/head synchronization time. Compare fixed-depth MTP first; evaluate the
+adaptive controller separately because timing changes can alter its draw sequence.
+Check fixed-depth seeded token identity and agreement among ranks. Report raw runs
+and variance, including regressions. Keep the optimization only where measured
+benefits justify its synchronization cost; do not infer speedup from fewer matrix
+multiplications. This comparison is pending hardware availability.
+
+
+For sink configurations, separately measure cold capture, RAM sidecar reuse,
+SSD reuse after restart and the missing-sidecar full-prompt fallback. Enable
+`dflash_capture_cache` explicitly; use the existing RAM/SSD limits. Compare partial
+and exact prefix hits, different images, changing concurrent cohorts and models or
+runtime settings that invalidate prior captures. Prove actual capture hits rather
+than merely matching final tokens. The distributed capture path currently uses
+synchronous prefill transport; measure its overhead independently from cache hits.
+Test `dflash_capture_cache=false` and zero sinks as controls. Sidecar availability
+must never change target token correctness. This hardware comparison remains pending.
+
+### DFlash sink projection reuse
+
+For nonzero DFlash sinks, compare stable batches against batches with growing short prefixes, admission, removal and row reordering. Check output equality against forced projection recomputation, then measure throughput and peak memory on physical Macs. Projection reuse retains one batch's per-layer sink KV; changing the cohort rebuilds it. Include capture RAM/SSD hits and restarted workers. This avoids repeated projection work but is not yet a measured end-to-end speedup.
+
+For the sink projection A/B comparison, toggle the public `dflash_sink_kv_cache` setting (true/false), keeping sink count, capture cache, draft checkpoint and batch shape fixed. Measure retained memory, peak memory and throughput; do not equate fewer projections with a measured speedup.
+
+### Adaptive DFlash verification
+
+Compare `dflash_verify_mode=dflash` and `adaptive` with the same checkpoint, block size, sinks and capture settings. Cover singleton and changing batches, greedy and stochastic generation, images, cache reuse, ordinary calibration and re-entry. Record selected verification depths, acceptance, target verification time, complete draft time and end-to-end throughput. Rank-local timing differences must not cause divergent decisions. The adaptive mode still computes the full draft block and may park speculation based on measured cost; it introduces no default context cutoff. Loopback correctness does not establish multi-Mac/RDMA speed.
+
+At adaptive depth zero, verify that the draft forward is absent, pending captures stay bounded and subsequent re-entry matches full prefill. Include a mixed batch where another request continues drafting. Distinguish skipped zero-depth work from positive-depth verification truncation, which still computes the complete draft block.
+
+### DDTree cohorts and recurrent padding on physical Macs
+
+Compare ordinary decoding, MTP, DFlash linear verification, and DDTree with 2/3 ranks and 2/4 concurrent requests. Mix prompt lengths around the QSA window boundary, cache hits, request arrival/completion, greedy and stochastic sampling, and enabled sinks. Check per-request tokens and cache offsets against independent generation. Measure throughput, time to first token, peak stage memory, and CPU/GPU synchronization cost of recurrent row-mask construction, including uniform-length batches and single-token decoding. Logical single-host ring tests do not establish physical RDMA performance or a physical memory upper bound.

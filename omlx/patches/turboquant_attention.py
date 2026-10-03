@@ -465,16 +465,17 @@ def _patch_vlm_target_verify_attention() -> None:
         return
 
     def patched(queries, keys, values, *, cache, scale, mask):
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache as _VLMBatchTQCache
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
 
         from ..turboquant_kv import BatchTurboQuantKVCache
 
         real_cache = cache
         if hasattr(cache, "_cache") and not isinstance(
-            cache, (_TQCache, BatchTurboQuantKVCache)
+            cache, (_TQCache, BatchTurboQuantKVCache, _VLMBatchTQCache)
         ):
             real_cache = cache._cache
-        if not isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+        if not isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache, _VLMBatchTQCache)):
             return original(queries, keys, values, cache=cache, scale=scale, mask=mask)
 
         sdpa = q35_lang.scaled_dot_product_attention
@@ -547,6 +548,7 @@ def apply_turboquant_attention_patch() -> bool:
         mask: Optional[mx.array],
         sinks: Optional[mx.array] = None,
     ) -> mx.array:
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache as _VLMBatchTQCache
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
 
         from ..turboquant_kv import BatchTurboQuantKVCache, _state_length
@@ -554,11 +556,11 @@ def apply_turboquant_attention_patch() -> bool:
         # Detect underlying TQ cache (may be wrapped by proxy objects)
         real_cache = cache
         if hasattr(cache, "_cache") and not isinstance(
-            cache, (_TQCache, BatchTurboQuantKVCache)
+            cache, (_TQCache, BatchTurboQuantKVCache, _VLMBatchTQCache)
         ):
             real_cache = cache._cache
 
-        if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+        if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache, _VLMBatchTQCache)):
             if sinks is not None:
                 # TurboQuant's quantized kernels do not implement attention
                 # sinks. Preserve correctness by falling back to MLX's

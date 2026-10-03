@@ -348,9 +348,9 @@ def test_sampling_rank_optimization_is_capability_gated_and_restored():
     ) as capabilities:
         assert capabilities["sampling_rank_only"]["active"] is True
         assert capabilities["rank_zero_logits"]["active"] is False
-        assert capabilities["pipeline_prefill_overlap"]["active"] is True, (
-            capabilities["pipeline_prefill_overlap"]["reason"]
-        )
+        assert capabilities["pipeline_prefill_overlap"]["active"] is True, capabilities[
+            "pipeline_prefill_overlap"
+        ]["reason"]
         assert mx.distributed.all_gather is not original_gather
         assert mx.distributed.send is not original_send
         assert _ValidatedPipeline.__call__ is not original_call
@@ -414,7 +414,15 @@ def test_rank_zero_sampling_stays_off_when_another_rank_cannot_use_it(monkeypatc
         settings,
         batchable=True,
     ) as capabilities:
-        assert votes == [{"prompt": True, "rank_zero_logits": False, "sampling": True}]
+        assert votes == [
+            {
+                "prompt": True,
+                "rank_zero_logits": False,
+                "sampling": True,
+                "prefill_output": False,
+                "capture_prefill": False,
+            }
+        ]
         sampling = capabilities["sampling_rank_only"]
         assert sampling["active"] is False
         assert "another rank" in sampling["reason"]
@@ -496,8 +504,7 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
 
 def test_pipeline_prefill_schedule_has_equal_fill_and_drain_timeline():
     schedules = [
-        pipeline_prefill_schedule(10, 4, rank=rank, world_size=3)
-        for rank in range(3)
+        pipeline_prefill_schedule(10, 4, rank=rank, world_size=3) for rank in range(3)
     ]
 
     assert {len(schedule) for schedule in schedules} == {5}
@@ -520,12 +527,33 @@ def test_pipeline_prefill_schedule_has_equal_fill_and_drain_timeline():
     assert all(sum(slot.is_real for slot in schedule) == 3 for schedule in schedules)
 
 
-def test_staggered_prompt_queues_and_flushes_every_real_chunk(monkeypatch):
+@pytest.mark.parametrize("length", [9, 25])
+def test_staggered_prompt_queues_and_flushes_every_real_chunk(monkeypatch, length):
     sends = []
     gathers = []
     async_values = []
     original_prompt = mlx_generate.PromptProcessingBatch.prompt
+    original_eval = mx.eval
+    inflight = []
+    peak = []
 
+    def submit(*values):
+        async_values.extend(values)
+        inflight.extend(values)
+        peak.append(len(inflight))
+
+    def finish(*values):
+        flattened = [
+            item
+            for value in values
+            for item in (value if isinstance(value, (list, tuple)) else [value])
+        ]
+        inflight[:] = [
+            item for item in inflight if not any(item is value for value in flattened)
+        ]
+        return original_eval(*values)
+
+    monkeypatch.setattr(mx, "eval", finish)
     monkeypatch.setattr(
         mx.distributed,
         "send",
@@ -536,7 +564,7 @@ def test_staggered_prompt_queues_and_flushes_every_real_chunk(monkeypatch):
         "all_gather",
         lambda value, **kwargs: gathers.append(value) or value,
     )
-    monkeypatch.setattr(mx, "async_eval", lambda *values: async_values.extend(values))
+    monkeypatch.setattr(mx, "async_eval", submit)
 
     class Cache:
         state = mx.array([0])
@@ -566,18 +594,20 @@ def test_staggered_prompt_queues_and_flushes_every_real_chunk(monkeypatch):
         settings,
         batchable=True,
     ) as capabilities:
-        assert capabilities["pipeline_prefill_overlap"]["active"] is True, (
-            capabilities["pipeline_prefill_overlap"]["reason"]
-        )
-        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(9))])
+        assert capabilities["pipeline_prefill_overlap"]["active"] is True, capabilities[
+            "pipeline_prefill_overlap"
+        ]["reason"]
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(length))])
 
-    # The scheduler honours the same eight-token step the memory guard approved,
-    # so 9 tokens make two real chunks. Each chunk reaches send; the final
-    # hidden-state gather is skipped.
-    assert sends == [0, 0]
-    assert len(async_values) == 2
+    # Preserve the admitted eight-token chunks, bound transport buffers and
+    # drain all sends without a final hidden-state gather.
+    chunks = (length + 7) // 8
+    assert sends == [0] * chunks
+    assert len(async_values) == chunks
+    assert max(peak) <= 2
+    assert inflight == []
     assert gathers == []
-    assert batch.tokens == [list(range(9))]
+    assert batch.tokens == [list(range(length))]
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
 
 
@@ -673,3 +703,39 @@ def test_non_batchable_model_never_reports_continuous_batching_active():
         assert batching["enabled"] is True
         assert batching["active"] is False
         assert "sequentially" in batching["reason"]
+
+
+@pytest.mark.parametrize("peer_accepts", [False, True])
+def test_native_prefill_vote_is_independent_of_speculative_decode(
+    monkeypatch, peer_accepts
+):
+    from contextlib import nullcontext
+
+    pipeline = _ValidatedPipeline()
+    pipeline.coordinator_output = nullcontext
+    model = SimpleNamespace(
+        model=pipeline,
+        language_model=SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_optimizations,
+        "_agree_across_ranks",
+        lambda group, local: {**local, "prefill_output": peer_accepts},
+    )
+    original_step = mlx_generate.GenerationBatch._step
+    original_prompt = mlx_generate.PromptProcessingBatch.prompt
+    settings = replace(
+        execution_profile("balanced"), sampling_rank_only=False, async_overlap=True
+    )
+    with install_runtime_optimizations(
+        model, _Group(), settings, batchable=True, runtime_options={"mtp_enabled": True}
+    ) as caps:
+        assert not caps["sampling_rank_only"]["active"]
+        assert caps["pipeline_prefill_overlap"]["active"] is peer_accepts
+        assert mlx_generate.GenerationBatch._step is original_step
+        assert (
+            mlx_generate.PromptProcessingBatch.prompt is not original_prompt
+        ) is peer_accepts
+    assert mlx_generate.PromptProcessingBatch.prompt is original_prompt

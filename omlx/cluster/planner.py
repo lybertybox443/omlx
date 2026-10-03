@@ -16,6 +16,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from .model_adapters import adapter_for_config, validate_runtime_options
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
@@ -113,8 +114,26 @@ class ModelLayout:
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
     supports_pipeline: bool = False
+    runtime_options: dict[str, Any] = field(default_factory=dict)
+    model_type: str = ""
+    layer_kv_bytes_per_token: tuple[int, ...] = ()
+    layer_kv_fixed_bytes: tuple[int, ...] = ()
+    kv_cache_step: int = 1
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "runtime_options", validate_runtime_options(self.runtime_options)
+        )
+        if not self.layer_kv_bytes_per_token and (self.layer_kv_fixed_bytes or self.kv_cache_step != 1):
+            raise ValueError("fixed KV budgets and allocation steps require per-layer rates")
+        for values in (self.layer_kv_bytes_per_token, self.layer_kv_fixed_bytes):
+            if values and (len(values) != len(self.layer_weight_bytes) or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in values
+            )):
+                raise ValueError("KV layer budgets must match the layer count")
+        if isinstance(self.kv_cache_step, bool) or not isinstance(self.kv_cache_step, int) or self.kv_cache_step < 1:
+            raise ValueError("kv_cache_step must be a positive integer")
         if self.fixed_weight_bytes < 0:
             raise ValueError("fixed_weight_bytes must be non-negative")
         if not self.layer_weight_bytes:
@@ -177,8 +196,17 @@ class ModelLayout:
             "tensor_parallel_divisors": list(self.tensor_parallel_divisors),
             "supports_tensor_parallel": self.supports_tensor_parallel,
             "supports_pipeline": self.supports_pipeline,
+            **({"model_type": self.model_type} if self.model_type else {}),
+            **(
+                {"runtime_options": dict(self.runtime_options)}
+                if self.runtime_options
+                else {}
+            ),
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
+            **({"layer_kv_bytes_per_token": list(self.layer_kv_bytes_per_token),
+                "layer_kv_fixed_bytes": list(self.layer_kv_fixed_bytes),
+                "kv_cache_step": self.kv_cache_step} if self.layer_kv_bytes_per_token else {}),
         }
 
     @classmethod
@@ -216,6 +244,9 @@ class ModelLayout:
                 kv_bytes_per_token_per_layer=int(
                     payload.get("kv_bytes_per_token_per_layer", 0)
                 ),
+                layer_kv_bytes_per_token=tuple(payload.get("layer_kv_bytes_per_token", ())),
+                layer_kv_fixed_bytes=tuple(payload.get("layer_kv_fixed_bytes", ())),
+                kv_cache_step=payload.get("kv_cache_step", 1),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
                 ),
@@ -223,6 +254,10 @@ class ModelLayout:
                     payload.get("supports_tensor_parallel", False)
                 ),
                 supports_pipeline=bool(payload.get("supports_pipeline", False)),
+                model_type=str(payload.get("model_type", "")),
+                runtime_options=validate_runtime_options(
+                    payload.get("runtime_options")
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -262,6 +297,9 @@ class NodeBudget:
     # common argv to every host.
     memory_guard_tier: str = "balanced"
 
+    # Resident auxiliary models/caches, separate from the OS safety reserve.
+    runtime_reserve_bytes: int = 0
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", normalize_node_role(self.role))
         object.__setattr__(
@@ -273,6 +311,10 @@ class NodeBudget:
             raise ValueError("node_id is required")
         if self.capacity_bytes <= 0:
             raise ValueError("capacity_bytes must be positive")
+        if (isinstance(self.runtime_reserve_bytes, bool)
+                or not isinstance(self.runtime_reserve_bytes, int)
+                or self.runtime_reserve_bytes < 0):
+            raise ValueError("runtime_reserve_bytes must be a non-negative integer")
         if self.reserve_bytes < 0:
             raise ValueError("reserve_bytes must be non-negative")
         if self.reserve_bytes >= self.capacity_bytes:
@@ -293,7 +335,7 @@ class NodeBudget:
 
     @property
     def usable_bytes(self) -> int:
-        return self.capacity_bytes - self.reserve_bytes
+        return self.capacity_bytes - self.reserve_bytes - self.runtime_reserve_bytes
 
     @property
     def weight_ceiling_bytes(self) -> int:
@@ -345,7 +387,14 @@ class PipelineAssignment:
     predicted_send_seconds: float | None = None
     predicted_stage_seconds: float | None = None
 
+    # Resident auxiliary models/caches, separate from the OS safety reserve.
+    runtime_reserve_bytes: int = 0
+
     def __post_init__(self) -> None:
+        if (isinstance(self.runtime_reserve_bytes, bool)
+                or not isinstance(self.runtime_reserve_bytes, int)
+                or self.runtime_reserve_bytes < 0):
+            raise ValueError("runtime_reserve_bytes must be a non-negative integer")
         # Normalised on the way in, not read leniently on the way out: this
         # object is decoded from a command line on a machine that will size its
         # own admission from it, and a role that arrives misspelled must fail
@@ -367,7 +416,8 @@ class PipelineAssignment:
         # parallelism the stage's layers are already divided by the TP degree,
         # because shard_linear splits the projections inside each layer. Adding
         # ``sharded_weight_bytes`` on top double-counted the same weights.
-        return self.fixed_weight_bytes + self.layer_weight_bytes + self.kv_cache_bytes
+        return (self.fixed_weight_bytes + self.layer_weight_bytes
+                + self.kv_cache_bytes + self.runtime_reserve_bytes)
 
     @property
     def headroom_bytes(self) -> int:
@@ -388,6 +438,7 @@ class PipelineAssignment:
             "fixed_weight_bytes": self.fixed_weight_bytes,
             "planned_weight_bytes": self.planned_weight_bytes,
             "reserve_bytes": self.reserve_bytes,
+            "runtime_reserve_bytes": self.runtime_reserve_bytes,
             "capacity_bytes": self.capacity_bytes,
             "manual_memory_limit": self.manual_memory_limit,
             "headroom_bytes": self.headroom_bytes,
@@ -511,7 +562,16 @@ def synthetic_model_layout(*, total_weight_bytes: int, layer_count: int) -> Mode
     )
 
 
-def _tensor_layer_index(name: str) -> int | None:
+def _tensor_layer_index(name: str, adapter: Any | None = None) -> int | None:
+    """Decoder layer a tensor belongs to, or None for replicated weights.
+
+    A model adapter that knows its checkpoint holds other ``layers.N`` /
+    ``blocks.N`` stacks (a vision tower, an MTP head) decides which tensors are
+    decoder layers; every other model keeps the generic name pattern.
+    """
+
+    if adapter is not None:
+        return adapter.trunk_layer_index(name)
     for pattern in _LAYER_PATTERNS:
         if match := pattern.search(name):
             return int(match.group(1))
@@ -540,6 +600,9 @@ def _activation_bytes_per_token(model_path: Path) -> int:
         ),
         0,
     )
+    adapter = adapter_for_config(config)
+    if adapter is not None and (boundary := adapter.boundary_bytes_per_token(config)):
+        return boundary
     # Pipeline activations in the pinned MLX-LM path are floating point even
     # when weights are quantized. Two bytes is the conservative common case.
     return hidden_size * 2
@@ -760,6 +823,11 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     )
     if declared is not None:
         return bool(declared)
+    # An architecture with an adapter answers for itself, vision sub-config
+    # included: the adapter's worker chain is what makes the claim true.
+    adapter = adapter_for_config(config)
+    if adapter is not None:
+        return adapter.supports_pipeline(config)
     # A checkpoint carrying a vision sub-config is served by mlx-vlm, whose
     # loaded wrapper never exposes ``model.model.pipeline`` — the exact
     # attribute progressive_loading gates on. Its text backbone's source-level
@@ -847,9 +915,7 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
         text_config = config.get("text_config")
         layer_config = text_config if isinstance(text_config, dict) else config
         layer_types = layer_config.get("layer_types")
-        if config.get("model_type") == "glm5_next" and isinstance(
-            layer_types, list
-        ):
+        if config.get("model_type") == "glm5_next" and isinstance(layer_types, list):
             num_layers = _config_int(config, "num_hidden_layers", 0)
             sparse_layers = sum(
                 layer_type != "linear_attention" for layer_type in layer_types
@@ -1002,6 +1068,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
+    adapter = adapter_for_config(_model_config(root))
     for weight_file in _model_weight_files(root):
         header, payload_bytes = _safetensors_header(weight_file)
         intervals: list[tuple[int, int, str]] = []
@@ -1029,7 +1096,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
-            layer_index = _tensor_layer_index(name)
+            layer_index = _tensor_layer_index(name, adapter)
             if layer_index is None:
                 fixed_bytes += tensor_bytes
             else:
@@ -1084,6 +1151,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
         supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
         supports_pipeline=_supports_pipeline(_model_config(root)),
+        model_type=str(_model_config(root).get("model_type", "")),
+        runtime_options=(
+            adapter.runtime_options(_model_config(root), None)
+            if (adapter := adapter_for_config(_model_config(root)))
+            else {}
+        ),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(_model_config(root)),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(_model_config(root)),
     )
@@ -1431,6 +1504,43 @@ def _predict_stage_seconds(
     return compute_seconds, send_seconds, compute_seconds + send_seconds
 
 
+def _reserve_specprefill_draft(model, nodes, context_tokens):
+    """Charge draft residency to rank zero without changing its process ceiling."""
+    amounts = []
+    for kind in ("specprefill", "dflash"):
+        amount = model.runtime_options.get(f"{kind}_reserved_bytes", 0)
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise PlanningError(f"invalid {kind} memory reservation")
+        if amount:
+            bound = model.runtime_options.get(f"{kind}_max_prompt_tokens")
+            if isinstance(bound, bool) or not isinstance(bound, int) or bound < context_tokens:
+                raise PlanningError(f"{kind} reservation does not cover requested context")
+            amounts.append(amount)
+    shared = model.runtime_options.get("vlm_mtp_reserved_bytes", 0)
+    if isinstance(shared, bool) or not isinstance(shared, int) or shared < 0:
+        raise PlanningError("invalid external MTP memory reservation")
+    if shared:
+        bound = model.runtime_options.get("vlm_mtp_max_prompt_tokens")
+        if isinstance(bound, bool) or not isinstance(bound, int) or bound < context_tokens:
+            raise PlanningError("external MTP reservation does not cover requested context")
+    # ddtree forks caches and widens the forward on every stage: its incremental
+    # budget is charged to each rank, on top of the draft reservation on rank zero.
+    tree = 0
+    if model.runtime_options.get("dflash_verify_mode") == "ddtree":
+        tree = model.runtime_options.get("dflash_ddtree_memory_bytes", 0)
+        if isinstance(tree, bool) or not isinstance(tree, int) or tree <= 0:
+            raise PlanningError("ddtree requires a positive dflash_ddtree_memory_bytes")
+    if not amounts and not shared and not tree:
+        return nodes
+    try:
+        return tuple(
+            replace(node, runtime_reserve_bytes=shared + tree + (sum(amounts) if node.rank == 0 else 0))
+            for node in nodes
+        )
+    except ValueError as exc:
+        raise PlanningError(f"draft does not fit rank zero: {exc}") from exc
+
+
 def _validate_pipeline_request(
     model: ModelLayout,
     nodes: Sequence[NodeBudget],
@@ -1472,6 +1582,7 @@ def plan_unequal_pipeline(
 ) -> ShardPlan:
     """Assign contiguous layers in MLX pipeline order across unequal nodes."""
 
+    nodes = _reserve_specprefill_draft(model, nodes, context_tokens)
     _validate_pipeline_request(model, nodes, workload_profile, microbatch_size)
 
     # MLX-LM sends activations from the highest rank (early layers) down to
@@ -1485,8 +1596,8 @@ def plan_unequal_pipeline(
             pipeline_nodes,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + _kv_bytes_for_stage(model, 1, context_tokens, start_layer=index)
+                for index, weight_bytes in enumerate(model.layer_weight_bytes)
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
@@ -1576,6 +1687,7 @@ def plan_proportional_pipeline(
     being silently rebalanced.
     """
 
+    nodes = _reserve_specprefill_draft(model, nodes, context_tokens)
     _validate_pipeline_request(model, nodes, workload_profile, microbatch_size)
 
     pipeline_nodes = tuple(sorted(nodes, key=lambda item: item.rank, reverse=True))
@@ -1628,7 +1740,7 @@ def _finish_pipeline_plan(
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
-        kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
+        kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens, start_layer=start)
         planned = model.fixed_weight_bytes + layer_weight_bytes + kv_bytes
         if planned > node.usable_bytes:
             raise PlanningError(
@@ -1653,16 +1765,18 @@ def _finish_pipeline_plan(
                 layer_weight_bytes=layer_weight_bytes,
                 fixed_weight_bytes=model.fixed_weight_bytes,
                 reserve_bytes=node.reserve_bytes,
+                runtime_reserve_bytes=node.runtime_reserve_bytes,
                 capacity_bytes=node.capacity_bytes,
                 manual_memory_limit=node.manual_memory_limit,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
                 kv_cache_bytes=kv_bytes,
-                kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
+                kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start, start_layer=start),
                 max_context_tokens=_max_context_for_stage(
                     model,
                     node,
                     layer_count=end - start,
+                    start_layer=start,
                     weight_bytes=model.fixed_weight_bytes + layer_weight_bytes,
                 ),
                 predicted_compute_seconds=(
@@ -1813,6 +1927,7 @@ def _kv_bytes_for_stage(
     layer_count: int,
     context_tokens: int,
     tensor_parallel_size: int = 1,
+    start_layer: int = 0,
 ) -> int:
     """KV bytes a node holds for its layers at the planned context length.
 
@@ -1822,8 +1937,15 @@ def _kv_bytes_for_stage(
     is not per-head and stays whole on every member.
     """
 
-    if model.kv_bytes_per_token_per_layer <= 0 or context_tokens <= 0:
+    if context_tokens <= 0:
         return 0
+    if model.layer_kv_bytes_per_token:
+        if tensor_parallel_size != 1:
+            raise PlanningError("per-layer KV budgets require a validated TP cache contract")
+        stop = start_layer + layer_count
+        tokens = ((context_tokens + model.kv_cache_step - 1) // model.kv_cache_step) * model.kv_cache_step
+        return (sum(model.layer_kv_bytes_per_token[start_layer:stop]) * tokens
+                + sum(model.layer_kv_fixed_bytes[start_layer:stop]))
     total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
     if model.kv_replicated_across_tp:
         return total
@@ -1834,9 +1956,14 @@ def _kv_bytes_per_token_for_stage(
     model: ModelLayout,
     layer_count: int,
     tensor_parallel_size: int = 1,
+    start_layer: int = 0,
 ) -> int:
     """What one more token of context costs this node."""
 
+    if model.layer_kv_bytes_per_token:
+        if tensor_parallel_size != 1:
+            raise PlanningError("per-layer KV budgets require a validated TP cache contract")
+        return sum(model.layer_kv_bytes_per_token[start_layer:start_layer + layer_count])
     if model.kv_bytes_per_token_per_layer <= 0:
         return 0
     per_token = model.kv_bytes_per_token_per_layer * layer_count
@@ -1852,6 +1979,7 @@ def _max_context_for_stage(
     layer_count: int,
     weight_bytes: int,
     tensor_parallel_size: int = 1,
+    start_layer: int = 0,
 ) -> int:
     """Longest context this node could hold once its weights are resident.
 
@@ -1863,11 +1991,13 @@ def _max_context_for_stage(
     "not known" rather than "unlimited".
     """
 
-    per_token = _kv_bytes_per_token_for_stage(model, layer_count, tensor_parallel_size)
+    per_token = _kv_bytes_per_token_for_stage(model, layer_count, tensor_parallel_size, start_layer)
     if per_token <= 0:
         return 0
     spare = node.usable_bytes - weight_bytes
-    return max(0, spare // per_token)
+    spare -= sum(model.layer_kv_fixed_bytes[start_layer:start_layer + layer_count])
+    tokens = max(0, spare // per_token)
+    return tokens // model.kv_cache_step * model.kv_cache_step
 
 
 def _tp_stage_budget(
@@ -1979,6 +2109,10 @@ def plan_hybrid(
             tensor_parallel_size=1,
             pipeline_stages=pipeline_stages,
         )
+
+    if any(model.runtime_options.get(f"{kind}_reserved_bytes", 0)
+           for kind in ("specprefill", "dflash", "vlm_mtp")):
+        raise PlanningError("reserved drafts require pure pipeline parallelism")
 
     # Refuse impossible tensor parallelism here rather than after every rank
     # has loaded its weights. shard() does n_heads //= N and n_kv_heads //= N,

@@ -751,7 +751,9 @@ def _run_rank(
         pipeline_index, "apply_mlx_lm_pipeline_index_patch", lambda: None
     )
     monkeypatch.setattr(
-        model_loading, "maybe_apply_pre_load_patches", lambda _model: None
+        model_loading,
+        "maybe_apply_pre_load_patches",
+        lambda _model, **_options: None,
     )
     monkeypatch.setattr(
         inference_worker,
@@ -816,6 +818,9 @@ def _run_rank(
     )
     # Likewise its stage links: none, so ranks keep MLX's own send and receive.
     monkeypatch.setattr(inference_worker, "decode_worker_stage_links", lambda _plan: ())
+    monkeypatch.setattr(
+        inference_worker, "decode_worker_runtime_options", lambda _plan: {}
+    )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):
         record["order"].append("guard")
@@ -1406,9 +1411,7 @@ def test_cancel_request_epoch_advances_past_an_existing_clock_jump(tmp_path):
     path = tmp_path / "dep-9-cancel.json"
     path.write_text(json.dumps({"epoch": 9_999_999_999_999}), encoding="utf-8")
 
-    _write_cancel_request(
-        str(tmp_path), "dep-9", "new event", plan_hash="f" * 64
-    )
+    _write_cancel_request(str(tmp_path), "dep-9", "new event", plan_hash="f" * 64)
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["epoch"] == 10_000_000_000_000

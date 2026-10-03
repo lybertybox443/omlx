@@ -2877,6 +2877,22 @@ class VLMBatchedEngine(BaseEngine):
             drafter.target_layer_ids,
         )
 
+    def _reject_ddtree_sampling(
+        self, repetition_penalty: Any, presence_penalty: Any, kwargs: dict[str, Any]
+    ) -> None:
+        """Branched verification keeps no per-branch processor state: refuse, before any
+        request work, what would become a logits processor."""
+        if getattr(self._dflash_drafter, "ddtree", None) is None:
+            return
+        # Penalties and the thinking budget are replayed per branch; the grammar automaton
+        # cannot be snapshotted, and no logit_bias processor exists in the API.
+        if kwargs.get("compiled_grammar") is not None or kwargs.get("logit_bias"):
+            raise ValueError(
+                "dflash_verify_mode=ddtree does not support guided grammar (its automaton "
+                "state cannot be cloned per branch); remove it or use 'adaptive'/'dflash'"
+            )
+
+
     @property
     def dflash_drafter(self) -> Any | None:
         return self._dflash_drafter
@@ -4605,6 +4621,7 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        self._reject_ddtree_sampling(repetition_penalty, presence_penalty, kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -4719,6 +4736,7 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        self._reject_ddtree_sampling(repetition_penalty, presence_penalty, kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,

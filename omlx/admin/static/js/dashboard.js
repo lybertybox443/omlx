@@ -68,8 +68,18 @@
         'dflash_ssd_cache_max_bytes',
         'dflash_draft_window_size',
         'dflash_draft_sink_size',
+        'dflash_sink_kv_cache',
+        'dflash_async_prefill',
+        'dflash_predraft',
+        'dflash_evict_on_fallback',
+        'dflash_capture_cache',
+        'mtp_peer_projection_skip',
+        'mtp_peer_verify_projection_skip',
         'dflash_block_size',
         'dflash_verify_mode',
+        'dflash_ddtree_max_branches',
+        'dflash_ddtree_max_nodes',
+        'dflash_ddtree_memory_bytes',
         'mtp_enabled',
         'mtp_adaptive_max_depth',
         'mtp_fixed_depth',
@@ -1944,8 +1954,18 @@
                         : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
+                    dflash_sink_kv_cache: s.dflash_sink_kv_cache ?? true,
+                    dflash_async_prefill: s.dflash_async_prefill ?? false,
+                    dflash_predraft: s.dflash_predraft ?? false,
+                    dflash_evict_on_fallback: s.dflash_evict_on_fallback ?? false,
+                    dflash_capture_cache: s.dflash_capture_cache ?? false,
+                    mtp_peer_projection_skip: s.mtp_peer_projection_skip ?? false,
+                    mtp_peer_verify_projection_skip: s.mtp_peer_verify_projection_skip ?? false,
                     dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
+                    dflash_ddtree_max_branches: s.dflash_ddtree_max_branches ?? null,
+                    dflash_ddtree_max_nodes: s.dflash_ddtree_max_nodes ?? null,
+                    dflash_ddtree_memory_bytes: s.dflash_ddtree_memory_bytes ?? null,
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
@@ -3009,11 +3029,33 @@
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
+                                dflash_sink_kv_cache: !!this.modelSettings.dflash_sink_kv_cache,
+                                dflash_async_prefill: !!this.modelSettings.dflash_async_prefill,
+                                dflash_predraft: !!this.modelSettings.dflash_predraft,
+                                dflash_evict_on_fallback: !!this.modelSettings.dflash_evict_on_fallback,
+                                dflash_capture_cache: !!this.modelSettings.dflash_capture_cache,
+                                mtp_peer_projection_skip: !!this.modelSettings.mtp_peer_projection_skip,
+                                mtp_peer_verify_projection_skip: !!this.modelSettings.mtp_peer_verify_projection_skip,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
                                     ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
                                     : null,
                                 mtp_fixed_depth: null,
+                                dflash_ddtree_max_branches: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_verify_mode === 'ddtree'
+                                    && this.modelSettings.dflash_ddtree_max_branches
+                                    ? parseInt(this.modelSettings.dflash_ddtree_max_branches)
+                                    : null,
+                                dflash_ddtree_max_nodes: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_verify_mode === 'ddtree'
+                                    && this.modelSettings.dflash_ddtree_max_nodes
+                                    ? parseInt(this.modelSettings.dflash_ddtree_max_nodes)
+                                    : null,
+                                dflash_ddtree_memory_bytes: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_verify_mode === 'ddtree'
+                                    && this.modelSettings.dflash_ddtree_memory_bytes
+                                    ? parseInt(this.modelSettings.dflash_ddtree_memory_bytes)
+                                    : null,
                                 qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -3078,6 +3120,9 @@
                                     dflash_draft_sink_size: null,
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
+                                    dflash_ddtree_max_branches: null,
+                                    dflash_ddtree_max_nodes: null,
+                                    dflash_ddtree_memory_bytes: null,
                                     mtp_enabled: false,
                                     mtp_adaptive_max_depth: null,
                                     mtp_fixed_depth: null,
@@ -3344,6 +3389,9 @@
                         this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
+                        this.modelSettings.dflash_ddtree_max_branches = null;
+                        this.modelSettings.dflash_ddtree_max_nodes = null;
+                        this.modelSettings.dflash_ddtree_memory_bytes = null;
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;

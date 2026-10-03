@@ -18,6 +18,46 @@ from .planner import (
 
 _MISSING = object()
 _ASSIGNMENT_CONTRACT = "_omlx_honors_pipeline_assignment"
+_ACTIVE_ASSIGNMENTS: tuple[PipelineAssignment, ...] | None = None
+
+
+def active_assignments() -> tuple[PipelineAssignment, ...] | None:
+    """The shard plan installed for this worker process, if any.
+
+    Model classes that build their own pipeline stage (Qwen4-Exp builds only
+    its planned layers) read it here rather than carrying cluster state.
+    """
+
+    return _ACTIVE_ASSIGNMENTS
+
+
+@contextmanager
+def _record_active_assignments(
+    assignments: Sequence[PipelineAssignment],
+) -> Iterator[None]:
+    global _ACTIVE_ASSIGNMENTS
+    previous = _ACTIVE_ASSIGNMENTS
+    _ACTIVE_ASSIGNMENTS = tuple(assignments)
+    try:
+        yield
+    finally:
+        _ACTIVE_ASSIGNMENTS = previous
+
+
+@contextmanager
+def unsharded_model_loading() -> Iterator[None]:
+    """Temporarily hide the target plan while loading a complete draft.
+
+    Use on the worker's serialized model-loading thread, never concurrently
+    with target construction: the assignment state is process-global.
+    """
+    global _ACTIVE_ASSIGNMENTS
+    previous = _ACTIVE_ASSIGNMENTS
+    _ACTIVE_ASSIGNMENTS = None
+    try:
+        yield
+    finally:
+        _ACTIVE_ASSIGNMENTS = previous
 
 
 def _mark_assignment_contract(method: Any) -> Any:
@@ -51,6 +91,27 @@ def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     return _module_honors_pipeline_assignment(module, seen=frozenset())
 
 
+_BRIDGED_CLASS_PREFIXES = ("mlx_vlm.models.", "omlx.")
+
+
+def _resolve_bridged_class(dotted: Any) -> Any:
+    """Import ``package.module.Class`` named by a bridge, or None.
+
+    Only vendored model packages are followed; an arbitrary dotted name from a
+    module attribute must not become an import primitive.
+    """
+
+    if not isinstance(dotted, str) or not dotted.startswith(
+        _BRIDGED_CLASS_PREFIXES
+    ):
+        return None
+    module_name, _, class_name = dotted.rpartition(".")
+    try:
+        return getattr(importlib.import_module(module_name), class_name, None)
+    except ImportError:
+        return None
+
+
 def _module_honors_pipeline_assignment(
     module: Any,
     *,
@@ -73,6 +134,17 @@ def _module_honors_pipeline_assignment(
     declared = getattr(module, "HONORS_PIPELINE_ASSIGNMENT", None)
     if declared is not None:
         return declared is True
+
+    # A bridge module (a vendored model exposed under an mlx-lm name) keeps the
+    # pipeline class in another package, so a scan of its own namespace cannot
+    # see the hook. It names the exact class instead, and that class's
+    # ``pipeline`` must carry the marker: the declaration is a pointer to
+    # evidence, never evidence itself.
+    for dotted in getattr(module, "PIPELINE_MODEL_CLASSES", ()):
+        pipeline_class = _resolve_bridged_class(dotted)
+        method = getattr(pipeline_class, "pipeline", None)
+        if getattr(method, _ASSIGNMENT_CONTRACT, False):
+            return True
 
     # Only a method carrying the explicit contract is evidence. Inherited
     # methods count: install_unequal_pipeline_plan replaces PipelineMixin's
@@ -110,6 +182,10 @@ def _module_honors_pipeline_assignment(
 def _cache_dependency(cache_entry: Any, value: Any, mx: Any) -> None:
     """Keep a pipeline send in the lazy graph for either MLX cache family."""
 
+    anchor = getattr(cache_entry, "pipeline_dependency", None)
+    if callable(anchor):
+        anchor(value)
+        return
     if hasattr(cache_entry, "keys"):
         keys = cache_entry.keys
         if keys is not None:
@@ -282,6 +358,7 @@ def install_pipeline_compatibility(
     """
 
     with ExitStack() as stack:
+        stack.enter_context(_record_active_assignments(assignments))
         stack.enter_context(install_unequal_pipeline_plan(assignments))
         stack.enter_context(_install_nemotron_h_pipeline(assignments))
         yield

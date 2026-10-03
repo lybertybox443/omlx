@@ -89,6 +89,31 @@ def _python_token_id(value: Any) -> int:
     return token
 
 
+def covered_cache_key(tokens: Any, cache: Any) -> Any:
+    """Truncate ``tokens`` to the length every offset-bearing cache entry holds.
+
+    Entries without an integer offset (recurrent state), pooled DS4 entries and
+    disagreeing offsets leave the key untouched; the prompt-cache plan vote
+    still rejects an incoherent hit.
+    """
+
+    offsets: set[int] = set()
+    for item in cache or ():
+        nested = getattr(item, "caches", None)
+        for entry in nested if isinstance(nested, (list, tuple)) else (item,):
+            if getattr(entry, "ratio", None) is not None:
+                return tokens
+            offset = getattr(entry, "offset", None)
+            if isinstance(offset, int) and not isinstance(offset, bool):
+                offsets.add(offset)
+    if len(offsets) == 1:
+        covered = next(iter(offsets))
+        if 0 < covered < len(tokens):
+            return tokens[:covered]
+    return tokens
+
+
+
 class MarkerWriter(Protocol):
     """Small RuntimeMarker surface used by the telemetry observer."""
 
@@ -1107,6 +1132,8 @@ def install_server_telemetry(
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
     on_generation_failed: Callable[[str], None] | None = None,
+    capture_cache: Any | None = None,
+    capture_cache_dir: str | None = None,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
 
@@ -1489,25 +1516,31 @@ def install_server_telemetry(
             return super().fetch_nearest_cache(model, tokens)
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
-            cache, rest = self._fetch_observed(model, tokens)
-            if cache is not None and not rest and tokens:
-                # MLX-LM's exact-hit branch returns an empty rest, unlike its
-                # shorter/longer branches which cap the prefix at len - 1. The
-                # pinned batched server dies inserting a fully consumed
-                # request (insert_segments indexes seq[-1]) and the sequential
-                # generate_step rejects an empty prompt, so hand back the last
-                # token: trimmed off the hit when the cache supports it,
-                # recomputed from scratch when it does not.
-                from mlx_lm.models.cache import (
-                    can_trim_prompt_cache,
-                    trim_prompt_cache,
-                )
+            try:
+                cache, rest = self._fetch_observed(model, tokens)
+                if cache is not None and not rest and tokens:
+                    # MLX-LM's exact-hit branch returns an empty rest, unlike its
+                    # shorter/longer branches which cap the prefix at len - 1. The
+                    # pinned batched server dies inserting a fully consumed
+                    # request (insert_segments indexes seq[-1]) and the sequential
+                    # generate_step rejects an empty prompt, so hand back the last
+                    # token: trimmed off the hit when the cache supports it,
+                    # recomputed from scratch when it does not.
+                    from mlx_lm.models.cache import (
+                        can_trim_prompt_cache,
+                        trim_prompt_cache,
+                    )
 
-                if can_trim_prompt_cache(cache):
-                    trim_prompt_cache(cache, 1)
-                    rest = list(tokens[-1:])
-                else:
-                    cache, rest = None, list(tokens)
+                    if can_trim_prompt_cache(cache):
+                        trim_prompt_cache(cache, 1)
+                        rest = list(tokens[-1:])
+                    else:
+                        cache, rest = None, list(tokens)
+            except Exception:
+                # A failed optional cache lookup must still join the rank vote;
+                # otherwise healthy peers wait forever for the missing stage.
+                logger.debug("Discarding failed prompt cache lookup", exc_info=True)
+                cache, rest = None, list(tokens)
             # Record the full prompt so the boundary-snapshot callback can key
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
@@ -1559,6 +1592,11 @@ def install_server_telemetry(
             return self._lookup(model, tokens)
 
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
+            if len(args) >= 3:
+                # Speculative decoding finishes one token short of the emitted
+                # tokens; key the entry by what the cache actually holds, or a
+                # trimmed hit would sit one position behind its claimed prefix.
+                args = (args[0], covered_cache_key(args[1], args[2]), *args[2:])
             result = super().insert_cache(*args, **kwargs)
             entries, nbytes = self._omlx_cache_inventory()
             telemetry.observe_cache_state(entries=entries, nbytes=nbytes)
@@ -1688,7 +1726,7 @@ def install_server_telemetry(
                 raise
             return tokenized
 
-        def _serve_single(self, request: Any) -> Any:
+        def _serve_single(self, request: Any, *args: Any, **kwargs: Any) -> Any:
             # The coordinated context above makes every rank observe the same
             # cancellation. Suppress only MLX-LM's obsolete distributed guard,
             # whose entire behavior is to raise NotImplementedError after that
@@ -1698,7 +1736,7 @@ def install_server_telemetry(
             cancellation_state.sequential = was_distributed
             self._is_distributed = False
             try:
-                return super()._serve_single(request)
+                return super()._serve_single(request, *args, **kwargs)
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous
@@ -1734,6 +1772,17 @@ def install_server_telemetry(
             raise RuntimeError(f"requests are active ({active})")
         deleted = 0
         cleared = 0
+        captures = {"capture_hot_cleared": 0, "capture_ssd_deleted": 0}
+        if capture_cache is not None:
+            captures = capture_cache.clear(memory=clear_hot, disk=clear_ssd)
+        if (
+            clear_ssd
+            and capture_cache_dir is not None
+            and getattr(capture_cache, "root", None) is None
+        ):
+            from omlx.speculative.dflash_capture_cache import DFlashCaptureStore
+
+            captures["capture_ssd_deleted"] += DFlashCaptureStore.clear_disk(capture_cache_dir)
         if clear_ssd and ssd_store is not None:
             deleted = ssd_store.clear(timeout=30.0)
         if clear_hot:
@@ -1754,6 +1803,7 @@ def install_server_telemetry(
             "rank": rank,
             "ssd_deleted": deleted,
             "hot_cleared": cleared,
+            **captures,
         }
 
     def write_maintenance_ack(path: Path, payload: dict[str, Any]) -> None:
@@ -1851,7 +1901,7 @@ def install_server_telemetry(
                 clear_ssd=clear_ssd,
                 clear_hot=clear_hot,
             )
-        except (RuntimeError, TimeoutError) as exc:
+        except (RuntimeError, TimeoutError, OSError) as exc:
             status = 409 if "requests are active" in str(exc) else 503
             handler._set_completion_headers(status)
             handler.end_headers()

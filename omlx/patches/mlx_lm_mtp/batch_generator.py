@@ -198,6 +198,14 @@ def apply() -> bool:
                                     pass
                         _drop_mtp_state(self, "step-fallback")
             else:
+                active = getattr(self, "_omlx_mtp_state", None)
+                if (
+                    _mtp_state_valid_for_batch(self, active)
+                    and not _reconcile_mtp_to_standard(self, active)
+                ):
+                    raise RuntimeError(
+                        "Lightning MTP could not restore the committed cache"
+                    )
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
@@ -366,6 +374,9 @@ def _model_has_mtp_module(model: Any) -> bool:
     the actual module's presence.
     """
     inner = getattr(model, "language_model", model)
+    get_head = getattr(inner, "get_mtp_module", None)
+    if callable(get_head):
+        return get_head() is not None
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
 
 
@@ -531,11 +542,27 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
             and getattr(active, "reentry_probe", False)
         )
         # Batch parking uses its own cost policy; this cooldown belongs to one UID.
-        if not active_probe and not park_state.probe_ready():
-            return False
+        if not active_probe:
+            ready = park_state.probe_ready()
+            coordinator = getattr(
+                getattr(gen_batch, "model", None), "_omlx_mtp_coordinator", None
+            )
+            if coordinator is not None:
+                ready = coordinator.ready(ready)
+            if not ready:
+                return False
     if not hasattr(gen_batch, "model"):
         return False
     drafter = _drafter_for(gen_batch.model)
+    cutoff = getattr(drafter, "max_context_tokens", None)
+    if cutoff and any(len(tokens) > cutoff for tokens in gen_batch.tokens):
+        # All rows leave speculation together; the normal ineligible-state
+        # path restores committed cache state before ordinary generation.
+        # No row uses the draft now, so an opted-in drafter may drop its weights.
+        fallback = getattr(drafter, "fallback", None)
+        if callable(fallback):
+            fallback()
+        return False
     if drafter is None:
         if not hasattr(gen_batch.model, "mtp_forward"):
             return False
@@ -550,7 +577,11 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
         return False
     # XTC changes the target distribution but is absent from acceptance math.
     # Resolve each active row's sampler because the generator is reused.
-    return not _has_xtc_sampler(gen_batch)
+    if _has_xtc_sampler(gen_batch):
+        return False
+    # Eligible again: restore evicted weights (a failed reload stays ordinary).
+    ensure = getattr(drafter, "ensure_loaded", None)
+    return not callable(ensure) or bool(ensure())
 
 
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
@@ -972,8 +1003,13 @@ def _has_xtc_sampler(gen_batch: Any) -> bool:
 def _resolve_sampler(gen_batch: Any):
     """Match ``GenerationBatch._step``'s per-sequence sampler resolution (batch=1)."""
     if gen_batch.samplers and gen_batch.samplers[0] is not None:
-        return gen_batch.samplers[0]
-    return gen_batch.fallback_sampler
+        sampler = gen_batch.samplers[0]
+    else:
+        sampler = gen_batch.fallback_sampler
+    coordinator = getattr(
+        getattr(gen_batch, "model", None), "_omlx_mtp_coordinator", None
+    )
+    return coordinator.sampler(sampler) if coordinator is not None else sampler
 
 
 def _is_greedy(gen_batch):
@@ -1350,9 +1386,14 @@ def _batch_policy_for_next(gen_batch: Any):
         policy = BatchPolicy(
             gen_batch.uids,
             depth if chain else 1,
-            fixed=_drafter_for(gen_batch.model) is not None
-            or _mtp_depth_fixed(gen_batch.model),
+            fixed=(
+                _drafter_for(gen_batch.model) is not None
+                and not getattr(_drafter_for(gen_batch.model), "adaptive_verify", False)
+            ) or _mtp_depth_fixed(gen_batch.model),
         )
+        coordinator = getattr(gen_batch.model, "_omlx_mtp_coordinator", None)
+        if coordinator is not None:
+            policy = coordinator.batch_policy(policy)
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
 
@@ -1516,13 +1557,18 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         step = int(getattr(gen_batch, "prefill_step_size", 0) or 0) or 512
         total = int(tok_arr.shape[0])
         logits = None
-        # Inherits the per-engine stream from the enclosing BatchGenerator context.
-        for start in range(0, total, step):
-            # Committed history needs no per-token speculative rollback states.
-            logits = gen_batch.model(
-                tok_arr[None, start : start + step], cache=new_cache
-            )
-            if start + step < total:
+        from contextlib import nullcontext
+
+        replay = getattr(gen_batch.model, "cache_replay_segments", None)
+        segments = (
+            replay(total, step) if callable(replay)
+            else nullcontext((start, min(start + step, total))
+                             for start in range(0, total, step))
+        )
+        # Inherit the generator stream and let the model restore image positions.
+        with segments as chunks:
+            for start, end in chunks:
+                logits = gen_batch.model(tok_arr[None, start:end], cache=new_cache)
                 mx.eval(logits)
         last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
 
@@ -1612,6 +1658,25 @@ def _greedy_targets(logprobs):
     import mlx.core as mx
 
     return mx.argmax(logprobs, axis=-1).astype(mx.int32)
+
+
+def _greedy_verify_tokens(sampler, logprobs, drafts):
+    """Pack acceptance counts and tokens for singleton or batched verification."""
+    import mlx.core as mx
+
+    coordinator = getattr(sampler, "coordinator", None)
+    coordinated = getattr(sampler, "_omlx_distributed", False) and coordinator is not None
+    if coordinated and coordinator.rank != 0:
+        # Complete the lazy pipeline forward before entering the collective.
+        mx.eval(logprobs, drafts)
+        result = mx.zeros((*drafts.shape[:-1], 2 * drafts.shape[-1] + 2), dtype=mx.int32)
+    else:
+        targets = _greedy_targets(logprobs)
+        drafts = drafts.astype(mx.int32)
+        matches = (targets[..., :-1] == drafts).astype(mx.int32)
+        accepted = mx.cumprod(matches, axis=-1).sum(axis=-1, keepdims=True)
+        result = mx.concatenate([accepted, targets, drafts], axis=-1)
+    return coordinator.tokens(result) if coordinated else result
 
 
 def _accept_lp_for(sampler, lp):
@@ -2059,12 +2124,18 @@ def _call_backbone_captured(
     cache: List[Any],
     n_confirmed: int = 0,
     capture_layer_ids: Optional[List[int]] = None,
+    skip_logits: bool = False,
 ) -> Tuple[Any, Any, Optional[list], Optional[List[Any]]]:
     """``_call_backbone`` plus the drafter's layer captures as a 4th entry.
 
     Without a capture request this defers to ``_call_backbone`` so the
-    plain forward keeps one entry point.
+    plain forward keeps one entry point. ``skip_logits`` always takes the
+    full implementation, which owns the placeholder contract.
     """
+    if skip_logits:
+        return _call_backbone_impl(
+            model, inputs, cache, n_confirmed, capture_layer_ids, skip_logits=True
+        )
     if not capture_layer_ids:
         if n_confirmed:
             plain = _call_backbone(model, inputs, cache, n_confirmed=n_confirmed)
@@ -2080,8 +2151,14 @@ def _call_backbone_impl(
     cache: List[Any],
     n_confirmed: int,
     capture_layer_ids: Optional[List[int]],
+    skip_logits: bool = False,
 ) -> Tuple[Any, Any, Optional[list], Optional[List[Any]]]:
     """Run the backbone with ``return_hidden=True`` and normalise the result.
+
+    ``skip_logits`` (non-coordinator ranks only, see ``_verify_skip_logits``)
+    omits the vocabulary projection. The hidden state and captures are then
+    evaluated here, since the placeholder logits no longer depend on the
+    forward, and zero logits of the full shape stand in for the real ones.
 
     Returns ``(logits, hidden_pre_norm, gdn_states_or_None, captured)``.
     ``captured`` is the list of per-layer hidden states requested through
@@ -2110,6 +2187,8 @@ def _call_backbone_impl(
         kwargs["n_confirmed"] = n_confirmed
     if capture_layer_ids:
         kwargs["capture_layer_ids"] = list(capture_layer_ids)
+    if skip_logits:
+        kwargs["skip_logits"] = True
     dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
@@ -2158,8 +2237,21 @@ def _call_backbone_impl(
                 inputs.shape[1],
             )
             rollback_state = None
-        return result.logits, hidden, rollback_state, captured
+        logits = result.logits
+        if skip_logits:
+            import mlx.core as mx
+
+            if logits is not None:
+                raise TypeError("backbone projected logits despite skip_logits")
+            # Finish the forward and its captures before the collective.
+            mx.eval(hidden, *(captured or ()))
+            logits = mx.zeros(
+                (*inputs.shape, model._omlx_output_vocab_size), dtype=hidden.dtype
+            )
+        return logits, hidden, rollback_state, captured
     if isinstance(result, tuple):
+        if skip_logits:
+            raise TypeError("backbone tuple output cannot honor skip_logits")
         if capture_layer_ids:
             raise TypeError("backbone tuple output cannot carry layer captures")
         if len(result) == 3:
@@ -2851,6 +2943,11 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
         min_p=getattr(target, "min_p", 0.0),
         min_tokens_to_keep=getattr(target, "min_tokens_to_keep", 1),
     )
+    coordinator = getattr(
+        getattr(gen_batch, "model", None), "_omlx_mtp_coordinator", None
+    )
+    if coordinator is not None:
+        state.draft_sampler = coordinator.sampler(state.draft_sampler)
     return state.draft_sampler
 
 
@@ -2943,6 +3040,38 @@ def _dspark_next_drafts(
     mx.async_eval(state.drafts)
 
 
+def _peer_skip_allowed(gen_batch, option: str) -> bool:
+    """Non-coordinator rank, supported adapter, opted in, no logits processors."""
+    model = gen_batch.model
+    coordinator = getattr(model, "_omlx_mtp_coordinator", None)
+    return bool(
+        coordinator is not None
+        and coordinator.rank != 0
+        and getattr(model, "_omlx_mtp_skip_logits", False)
+        and getattr(model, option, False)
+        and _proc_list(gen_batch) is None
+    )
+
+
+def _draft_forward_kwargs(gen_batch):
+    """Skip peer draft projections when the coordinator owns sampling/verification."""
+    if _peer_skip_allowed(gen_batch, "_omlx_mtp_peer_projection_skip"):
+        return {"skip_logits": True}
+    return {}
+
+
+def _verify_skip_logits(gen_batch) -> bool:
+    """Peers skip the target verify projection when rank zero owns acceptance.
+
+    Own opt-in (``mtp_peer_verify_projection_skip``), independent of the draft
+    skip; the sampler must be coordinated so peers take tokens and counts from
+    the coordinator. Rank zero never skips, so API logprobs stay real.
+    """
+    return _peer_skip_allowed(
+        gen_batch, "_omlx_mtp_peer_verify_projection_skip"
+    ) and bool(getattr(_resolve_sampler(gen_batch), "_omlx_distributed", False))
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -2981,6 +3110,7 @@ def _chain_next_drafts(
             prev_buf,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
+    forward_kwargs = _draft_forward_kwargs(gen_batch)
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
@@ -3017,6 +3147,7 @@ def _chain_next_drafts(
             state.mtp_cache,
             return_hidden=True,
             logits_keep=1,
+            **forward_kwargs,
         )
     else:
         logits = None
@@ -3076,6 +3207,7 @@ def _chain_next_drafts(
                 tok.reshape(1, 1),
                 chain_cache,
                 return_hidden=True,
+                **forward_kwargs,
             )
         else:
             source, head_hidden = coarse.hidden(h, tok.reshape(1, 1), chain_cache)
@@ -3141,6 +3273,11 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     procs = _proc_list(gen_batch)
 
     main_tok = _ensure_uint32(gen_batch._next_tokens)  # (1,)
+    coordinator = getattr(
+        getattr(gen_batch, "model", None), "_omlx_mtp_coordinator", None
+    )
+    if coordinator is not None:
+        main_tok = coordinator.tokens(main_tok)
     main_lp = gen_batch._next_logprobs[0]  # (vocab,)
 
     if procs is not None:
@@ -3183,20 +3320,6 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if drafter is not None:
-            # Block drafters keep their own per-request context and draft a
-            # fixed block, so neither the head cache nor the depth
-            # controller applies. The captured hidden of main_tok is the
-            # newest context entry; next_main is the anchor.
-            state.mtp_cache = []
-            state.next_main = _ensure_uint32(next_main_tok)
-            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
-            state.queue.append(
-                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
-            )
-            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
-            gen_batch._omlx_mtp_state = state
-            return
         if depth > 1 and not _mtp_depth_fixed(gen_batch.model):
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
@@ -3210,11 +3333,28 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
                     exit_margin=_effective_loop_tax(gen_batch.model),
                     seed=getattr(gen_batch.model, "_omlx_mtp_depth_seed", None),
                 )
+                coordinator = getattr(gen_batch.model, "_omlx_mtp_coordinator", None)
+                if coordinator is not None:
+                    state.controller = coordinator.controller(state.controller)
                 try:
                     # The next sequence starts from this one's latest estimates.
                     gen_batch.model._omlx_mtp_depth_seed = state.controller
                 except Exception:
                     pass
+        if drafter is not None:
+            # Block drafters keep their own context without a head cache.
+            # Adaptive verification selects a prefix of their fixed block.
+            # The captured hidden of main_tok is the
+            # newest context entry; next_main is the anchor.
+            state.mtp_cache = []
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
+            gen_batch._omlx_mtp_state = state
+            return
         primed = _prompt_priming.take_primed(
             gen_batch.model,
             gen_batch.prompt_cache,
@@ -3782,6 +3922,8 @@ def _dense_q_rows(draft_accept_lps) -> list:
 
 def _sparse_top_k(sampler) -> int:
     """Top-k of a sampler whose target filter is exactly top-p + top-k, else 0."""
+    if getattr(sampler, "_omlx_distributed", False):
+        return 0
     top_k = int(getattr(sampler, "top_k", 0) or 0)
     if (
         float(getattr(sampler, "temp", 0.0) or 0.0) <= 0.0
@@ -3870,10 +4012,32 @@ def _stochastic_verify_tokens_sparse(
 
 
 def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
-    """Build acceptance and correction tokens without a host synchronization."""
+    """Build acceptance/correction tokens, sharing coordinated decisions."""
     import mlx.core as mx
 
     k = int(drafts.shape[0])
+    if draft_accept_lps is None:
+        # ddtree: drafts carry no q; walk the target distribution (see ddtree_branches).
+        from omlx.speculative.ddtree_branches import chain_walk_tokens
+
+        return chain_walk_tokens(sampler, combined_lp, drafts)
+    coordinator = getattr(sampler, "coordinator", None)
+    if getattr(sampler, "_omlx_distributed", False) and coordinator is not None:
+        if coordinator.rank == 0:
+            result = _stochastic_verify_tokens(
+                sampler.sampler, combined_lp, drafts, draft_accept_lps
+            )
+        else:
+            # Finish the target's lazy forward before joining the collective.
+            # Peers need neither acceptance draws nor residual distributions.
+            density = (
+                [draft_accept_lps.ids, draft_accept_lps.logq]
+                if isinstance(draft_accept_lps, SparseDraftQ)
+                else draft_accept_lps
+            )
+            mx.eval(combined_lp, drafts, density)
+            result = mx.zeros((2 * k + 2,), dtype=mx.int32)
+        return coordinator.tokens(result)
     top_k = _sparse_top_k(sampler)
     if top_k and k > 0:
         return _stochastic_verify_tokens_sparse(
@@ -3962,6 +4126,23 @@ def _run_verify_cycle_chain(
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
+    # DDTree: verify branched candidates for this single request and hand the
+    # chosen branch to the shared acceptance/commit code below.
+    tree_spec = getattr(_drafter_for(gen_batch.model), "ddtree", None)
+    if (
+        tree_spec is not None
+        and verify_result is None
+        and commit_cache is None
+        and draft_jobs is None
+        and not defer_commit
+    ):
+        from omlx.speculative.ddtree_branches import plan_tree_cycle
+
+        planned = plan_tree_cycle(gen_batch, state, tree_spec)
+        if planned is not None:
+            verify_result, commit_cache, *walked = planned
+            if walked:
+                stochastic_result = walked[0]
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
@@ -3988,6 +4169,7 @@ def _run_verify_cycle_chain(
             gen_batch.prompt_cache,
             n_confirmed=1,
             capture_layer_ids=_drafter_capture_ids(gen_batch.model),
+            skip_logits=_verify_skip_logits(gen_batch),
         )
     logits, hidden, gdn_states = verify_result[:3]
     captured = verify_result[3] if len(verify_result) > 3 else None
@@ -4035,10 +4217,9 @@ def _run_verify_cycle_chain(
         state.stats.zero_cycles += 1
     elif is_greedy:
         if greedy_result is None:
-            targets = _greedy_targets(combined_lp)  # (k+1,)
-            matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
-            m_arr = mx.cumprod(matches).sum().reshape(1)
-            host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])
+            host_arr = _greedy_verify_tokens(sampler, combined_lp, state.drafts)
+            m_arr = host_arr[:1]
+            targets = host_arr[1 : k + 2]
             if can_predraft:
                 predrafted = _predraft(
                     gen_batch,
@@ -4138,6 +4319,13 @@ def _run_verify_cycle_chain(
         emit_last_id = draft_ids[m]
         emit_last_lp = combined_lp[m]
 
+    coordinator = getattr(
+        getattr(gen_batch, "model", None), "_omlx_mtp_coordinator", None
+    )
+    if coordinator is not None:
+        m, emit_last_id = coordinator.decision(m, emit_last_id)
+        emit_last_lp = combined_lp[m]
+
     # Rewind budget-capable processors to the last emitted position.
     # Rows 0..m produced the m+1 emitted tokens (m accepted drafts + the
     # bonus/verify correction); rows m+1..k predicted rejected drafts that
@@ -4186,13 +4374,14 @@ def _run_verify_cycle_chain(
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
+        if drafter is not None:
+            rows_hidden = [c[:, : m + 1] for c in captured]
+            job = (gen_batch, state, rows_hidden, committed, prev_buf)
         if drafter is not None and predrafted and m == m_gpu:
-            drafter.adopt_predraft(state, m + 1)
+            drafter.adopt_predraft(state, m + 1, job=job)
         elif drafter is not None:
             if predrafted:
                 drafter.discard_predraft()
-            rows_hidden = [c[:, : m + 1] for c in captured]
-            job = (gen_batch, state, rows_hidden, committed, prev_buf)
             if draft_jobs is None:
                 drafter.draft([job])
             else:

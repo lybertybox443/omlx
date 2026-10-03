@@ -1000,6 +1000,9 @@ def _patched_ppb_split(self, indices):
             new_batch._omlx_glm_dsa_adaptive_prefill = (
                 self._omlx_glm_dsa_adaptive_prefill
             )
+        # DFlash capture prefill: rows already prepared must not be replayed.
+        if hasattr(self, "_omlx_dflash_prepared"):
+            new_batch._omlx_dflash_prepared = set(self._omlx_dflash_prepared)
 
         self.uids = []
         self.prompt_cache = []
@@ -4076,7 +4079,10 @@ class Scheduler:
                     **model_kwargs,
                 )
                 if capture_from is not None:
-                    self._dflash_seed_prefill(request, prefill_out, capture_from)
+                    self._dflash_seed_prefill(
+                        request, prefill_out, capture_from,
+                        position=base_size + processed_tokens + capture_from,
+                    )
                 mx.eval([c.state for c in prompt_cache])
                 input_arr = input_arr[:, n_to_process:]
                 if embeds_array is not None:
@@ -5196,7 +5202,7 @@ class Scheduler:
         n_tokens: int,
         model_kwargs: dict,
     ) -> Optional[int]:
-        """Request drafter layer captures for the chunk's tail inside the window.
+        """Request captures for the tail window, or the full prompt with sinks.
 
         Returns the chunk-local offset of the first position to keep, or None
         when the chunk ends before the drafter's context window starts. The
@@ -5209,7 +5215,12 @@ class Scheduler:
         prefill_owner = getattr(prefill_model, "__self__", prefill_model)
         if drafter is None or prefill_owner is not self.model:
             return None
-        keep_from = len(request.prompt_token_ids) - drafter.window
+        # Sink-aware rows need the initial captures, and contiguous positions
+        # through the prompt. The drafter bounds retained captures itself.
+        keep_from = (
+            0 if getattr(drafter, "sink_size", 0)
+            else len(request.prompt_token_ids) - drafter.window
+        )
         end = start + n_tokens
         if end <= keep_from:
             return None
@@ -5217,15 +5228,58 @@ class Scheduler:
         return max(0, keep_from - start)
 
     def _dflash_seed_prefill(
-        self, request: "Request", output: Any, keep_from: int
+        self, request: "Request", output: Any, keep_from: int, *, position: Optional[int] = None
     ) -> None:
         drafter = _block_drafter_for(self.model)
         hidden = getattr(output, "hidden_states", None)
         if drafter is None or not hidden:
             return
-        drafter.seed_request(
-            request.request_id, [layer[:, keep_from:] for layer in hidden]
-        )
+        # Qwen4 prefill appends its final residual stream after the requested layers.
+        captures = [layer[:, keep_from:] for layer in hidden][: len(drafter.target_layer_ids)]
+        # Publish exact block boundaries, including one inside this prefill chunk.
+        width = captures[0].shape[1]
+        block = getattr(getattr(self, "config", None), "paged_cache_block_size", 0)
+        boundaries = [width]
+        if position is not None and block and getattr(drafter, "capture_store", None) is not None:
+            boundaries = sorted(set([width, *range(block - position % block, width, block)]))
+        begin = 0
+        for end in boundaries:
+            offset = None if position is None else position + begin
+            drafter.seed_request(
+                request.request_id, [layer[:, begin:end] for layer in captures],
+                **({"position": offset} if offset is not None else {}),
+            )
+            if position is not None and getattr(drafter, "capture_store", None) is not None:
+                drafter.store_request_captures(
+                    request.request_id, request.prompt_token_ids, position + end,
+                    Scheduler._dflash_capture_media(request),
+                )
+            begin = end
+
+    @staticmethod
+    def _dflash_capture_media(request):
+        return [getattr(request, name, None) for name in (
+            "vlm_extra_keys_for_cache", "vlm_extra_key_token_start_for_cache",
+            "vlm_extra_key_ranges_for_cache",
+        )]
+
+    def _dflash_restore_prefix(self, request):
+        drafter = _block_drafter_for(self.model)
+        if getattr(drafter, "sink_size", 0) or getattr(drafter, "capture_store", None) is not None:
+            restored = request.cached_tokens > 0 and drafter.restore_request_captures(
+                request.request_id, request.prompt_token_ids, request.cached_tokens,
+                Scheduler._dflash_capture_media(request),
+            )
+            if not restored:
+                drafter.release_request(request.request_id)
+                if request.cached_tokens and self.paged_cache_manager is not None:
+                    self.paged_cache_manager.delete_block_table(request.request_id)
+                request.prompt_cache = None
+                request.block_table = None
+                request.cached_tokens = 0
+                request.shared_prefix_blocks = 0
+                request.remaining_tokens = request.prompt_token_ids
+
 
     def _dflash_bind_uid(self, request_id: str, uid: int) -> None:
         drafter = _block_drafter_for(self.model)
@@ -6120,7 +6174,10 @@ class Scheduler:
             )
             prefill_out = prefill_model(chunk, cache=state.cache, **chunk_kwargs)
             if capture_from is not None:
-                self._dflash_seed_prefill(state.request, prefill_out, capture_from)
+                self._dflash_seed_prefill(
+                    state.request, prefill_out, capture_from,
+                    position=state.base_size + state.tokens_processed + capture_from,
+                )
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()
@@ -9320,7 +9377,6 @@ class Scheduler:
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
-
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
             prefix_hook(request.prompt_token_ids) if callable(prefix_hook) else 0
@@ -9520,6 +9576,8 @@ class Scheduler:
         else:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
+
+        Scheduler._dflash_restore_prefix(self, request)
 
         # Lightning-MTP has a small prompt-history cache separate from the
         # backbone KV restored above.  Bind an exact cache-boundary sidecar (when

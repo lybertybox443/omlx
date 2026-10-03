@@ -814,6 +814,16 @@
                                     </div>
                                 </div>
 
+                                <label class="flex items-center gap-3 text-sm mb-3">
+                                    <input type="checkbox" x-model="modelSettings.mtp_peer_projection_skip">
+                                    <span>{{ t('modal.model_settings.mtp_peer_projection_skip') }}</span>
+                                </label>
+                                <p class="text-xs text-neutral-500 mb-3">{{ t('modal.model_settings.mtp_peer_projection_skip_hint') }}</p>
+                                <label class="flex items-center gap-3 text-sm mb-3">
+                                    <input type="checkbox" x-model="modelSettings.mtp_peer_verify_projection_skip">
+                                    <span>{{ t('modal.model_settings.mtp_peer_verify_projection_skip') }}</span>
+                                </label>
+                                <p class="text-xs text-neutral-500 mb-3">{{ t('modal.model_settings.mtp_peer_verify_projection_skip_hint') }}</p>
                                 <!-- DFlash -->
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-start justify-between gap-3">
@@ -918,6 +928,32 @@
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                     <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_draft_sink_hint') }}</p>
                                                 </div>
+                                                <label class="flex items-center gap-3 text-sm col-span-2">
+                                                    <input type="checkbox" x-model="modelSettings.dflash_capture_cache">
+                                                    <span>{{ t('modal.model_settings.dflash_capture_cache') }}</span>
+                                                </label>
+                                                <p class="text-xs text-neutral-500 col-span-2">{{ t('modal.model_settings.dflash_capture_cache_hint') }}</p>
+                                                <label class="flex items-center gap-2 col-span-2">
+                                                    <input type="checkbox" x-model="modelSettings.dflash_sink_kv_cache">
+                                                    <span>{{ t('modal.model_settings.dflash_sink_kv_cache') }}</span>
+                                                </label>
+                                                <p class="text-xs text-neutral-500 col-span-2">{{ t('modal.model_settings.dflash_sink_kv_cache_hint') }}</p>
+                                                <label class="flex items-center gap-2 col-span-2">
+                                                    <input type="checkbox" x-model="modelSettings.dflash_async_prefill">
+                                                    <span>{{ t('modal.model_settings.dflash_async_prefill') }}</span>
+                                                </label>
+                                                <p class="text-xs text-neutral-500 col-span-2">{{ t('modal.model_settings.dflash_async_prefill_hint') }}</p>
+                                                <label class="flex items-center gap-2 col-span-2">
+                                                    <input type="checkbox" x-model="modelSettings.dflash_predraft">
+                                                    <span>{{ t('modal.model_settings.dflash_predraft') }}</span>
+                                                </label>
+                                                <p class="text-xs text-neutral-500 col-span-2">{{ t('modal.model_settings.dflash_predraft_hint') }}</p>
+                                                <label class="flex items-center gap-2 col-span-2">
+                                                    <input type="checkbox" x-model="modelSettings.dflash_evict_on_fallback">
+                                                    <span>{{ t('modal.model_settings.dflash_evict_on_fallback') }}</span>
+                                                </label>
+                                                <p class="text-xs text-neutral-500 col-span-2">{{ t('modal.model_settings.dflash_evict_on_fallback_hint') }}</p>
+
                                             </div>
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_block_size_label') }}</label>
@@ -935,6 +971,21 @@
                                                     <option value="off">{{ t('modal.model_settings.dflash_verify_off') }}</option>
                                                 </select>
                                                 <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_verify_hint') }}</p>
+                                            </div>
+                                            <div x-show="modelSettings.dflash_verify_mode === 'ddtree'" class="col-span-2">
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_ddtree_max_branches') }}</label>
+                                                <input type="number" x-model.number="modelSettings.dflash_ddtree_max_branches" min="1" class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm bg-white">
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_ddtree_max_branches_hint') }}</p>
+                                            </div>
+                                            <div x-show="modelSettings.dflash_verify_mode === 'ddtree'" class="col-span-2">
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_ddtree_max_nodes') }}</label>
+                                                <input type="number" x-model.number="modelSettings.dflash_ddtree_max_nodes" min="1" class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm bg-white">
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_ddtree_max_nodes_hint') }}</p>
+                                            </div>
+                                            <div x-show="modelSettings.dflash_verify_mode === 'ddtree'" class="col-span-2">
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_ddtree_memory_bytes') }}</label>
+                                                <input type="number" x-model.number="modelSettings.dflash_ddtree_memory_bytes" min="1" class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm bg-white">
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_ddtree_memory_bytes_hint') }}</p>
                                             </div>
                                         </div>
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">

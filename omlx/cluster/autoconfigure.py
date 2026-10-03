@@ -1128,6 +1128,15 @@ def required_imports(
         for module in _third_party_imports(patch_module):
             sources.setdefault(module, set()).add(patch_module)
 
+    # A model whose ranks run through an architecture adapter says what that
+    # adapter imports; the dispatcher only covers the single-node patches.
+    from .model_adapters import adapter_for_config
+
+    adapter = None if for_vlm else adapter_for_config(_model_config(root))
+    if adapter is not None:
+        for module in adapter.required_imports:
+            sources.setdefault(module, set()).add(f"{adapter.model_type} adapter")
+
     return tuple(
         ImportRequirement(
             module=module,

@@ -71,7 +71,7 @@ def _tiny_target():
     return SimpleNamespace(language_model=language)
 
 
-def _tiny_drafter(seed=0):
+def _tiny_drafter(seed=0, sink_size=0):
     mx.random.seed(seed)
     model = DFlash2DraftModel(_tiny_config())
     # Random weights in float32 so both forwards share tight numerics.
@@ -82,7 +82,7 @@ def _tiny_drafter(seed=0):
     model.load_weights(list(params.items()), strict=False)
     model.bind(_tiny_target())
     mx.eval(model.parameters())
-    return dd.DFlashDrafter(model, block_size=BLOCK, source_path="tiny")
+    return dd.DFlashDrafter(model, block_size=BLOCK, source_path="tiny", sink_size=sink_size)
 
 
 def _captured(n, seed):
@@ -116,7 +116,8 @@ def _run_cycles(drafter, plan, cycle_offset=0):
     return outputs
 
 
-def test_batched_forward_matches_rows_drafted_alone():
+@pytest.mark.parametrize("sink_size", [0, 3])
+def test_batched_forward_matches_rows_drafted_alone(sink_size):
     """Padding, masks, vector RoPE offsets and ring writes must not leak across rows."""
     plan = [
         {0: (5, 3), 1: (1, 9)},
@@ -127,7 +128,7 @@ def test_batched_forward_matches_rows_drafted_alone():
     ]
     expected = [{} for _ in plan]
     for uid in (0, 1, 2):
-        alone = _tiny_drafter()
+        alone = _tiny_drafter(sink_size=sink_size)
         solo_plan = [{uid: rows[uid]} if uid in rows else {} for rows in plan]
         for cycle, rows in enumerate(solo_plan):
             if rows:
@@ -135,7 +136,7 @@ def test_batched_forward_matches_rows_drafted_alone():
                     _run_cycles(alone, [rows], cycle_offset=cycle)[0]
                 )
 
-    batched = _tiny_drafter()
+    batched = _tiny_drafter(sink_size=sink_size)
     got = _run_cycles(batched, plan)
     assert got == expected
     # The ring saw every context token, including the ones that fell out of
@@ -260,8 +261,9 @@ def test_prefill_seed_binds_to_uid_and_window_slicing():
     )
 
     output = SimpleNamespace(hidden_states=_captured(15, seed=2))
-    Scheduler._dflash_seed_prefill(scheduler, request, output, keep)
-    assert drafter._request_seeds["r"][0].shape == (
+    Scheduler._dflash_seed_prefill(scheduler, request, output, keep, position=18)
+    assert drafter._request_seeds["r"].fed == 18
+    assert drafter._request_seeds["r"].pending[0].shape == (
         1,
         7,
         HIDDEN * len(TARGET_LAYER_IDS),
@@ -319,6 +321,54 @@ def test_short_context_matches_reference_draft_block():
             [(SimpleNamespace(uid=0), row, context, anchor, None)]
         )[0][0]
         assert got.tolist() == expected.tolist()
+
+
+def test_block_attention_is_bidirectional_so_prefix_depth_is_not_a_shorter_block():
+    """A shorter block is not the prefix of the trained block: positions attend forward.
+
+    The drafter mask keeps every block key visible to every block query, so
+    computing only a verified prefix would change the proposals. The batched
+    drafter therefore computes the full block and truncates afterwards.
+    """
+    mask_tail = []
+    original = mx.fast.scaled_dot_product_attention
+
+    def spy(queries, keys, values, **kwargs):
+        mask_tail.append(kwargs["mask"][..., -BLOCK:])
+        return original(queries, keys, values, **kwargs)
+
+    anchor = mx.array([7], dtype=mx.int32)
+    drafter = _tiny_drafter()
+    context = mx.concatenate(_captured(4, seed=70), axis=-1)
+    mx.fast.scaled_dot_product_attention = spy
+    try:
+        drafter._draft_batched(
+            [(SimpleNamespace(uid=0), drafter._row(0), context, anchor, None)]
+        )
+    finally:
+        mx.fast.scaled_dot_product_attention = original
+    assert mask_tail and all(bool(tail.all().item()) for tail in mask_tail)
+
+    # Same weights and context; only the block length changes. The first
+    # proposal position must see the extra block keys, so its logits move.
+    drafter = _tiny_drafter()
+    context = mx.concatenate(_captured(5, seed=71), axis=-1)
+    first_logits = {}
+    real_logits = drafter.model._logits
+    for size in (BLOCK, 2):
+        drafter.block_size = size
+        def record(hidden, size=size):
+            logits = real_logits(hidden)
+            first_logits[size] = logits[:, :1]
+            return logits
+
+        drafter.model._logits = record
+        drafter._rows.clear()
+        drafter._cohort = None
+        drafter._draft_batched(
+            [(SimpleNamespace(uid=0), drafter._row(0), context, anchor, None)]
+        )
+    assert not mx.allclose(first_logits[BLOCK], first_logits[2], atol=1e-4).item()
 
 
 def test_prefill_capture_accepts_bound_prefill_of_the_model():
@@ -428,3 +478,437 @@ def test_resolve_block_size_clamps_to_trained_block_and_mtp_limit():
     assert dd.resolve_block_size(model, None) == dd.MAX_LIGHTNING_MTP_DRAFT_TOKENS + 1
     with pytest.raises(ValueError):
         dd.resolve_block_size(model, 1)
+
+
+@pytest.mark.parametrize("window", [None, 2, 4, 32])
+@pytest.mark.parametrize("sink_size", [0, 3])
+@pytest.mark.parametrize("sink_kv_cache", [False, True])
+def test_loader_applies_draft_window(monkeypatch, window, sink_size, sink_kv_cache):
+    draft_model = DFlash2DraftModel(_tiny_config())
+    monkeypatch.setattr(dd, "load_drafter", lambda *a, **k: (draft_model, "dflash"))
+    drafter = dd.load_dflash_drafter(
+        "synthetic", _tiny_target(), draft_window_size=window, draft_sink_size=sink_size,
+        sink_kv_cache=sink_kv_cache,
+    )
+    assert drafter.sink_size == sink_size
+    assert drafter.sink_kv_cache is sink_kv_cache
+    assert drafter.window == (WINDOW if window is None else window)
+    assert drafter.ring_slots == drafter.window - 1
+    assert drafter.capacity == drafter.ring_slots + drafter.block_size
+
+
+def test_request_seeds_bound_before_binding_and_preserve_positions():
+    drafter = _tiny_drafter()
+    reference = _tiny_drafter()
+    for index, length in enumerate([3, 20, 4, 9]):
+        captures = _captured(length, seed=100 + index)
+        drafter.seed_request("request", captures)
+        reference.seed(7, captures)
+        pending = drafter._request_seeds["request"]
+        assert sum(int(part.shape[1]) for part in pending.pending) <= drafter.ring_slots
+        assert pending.fed == reference._rows[7].fed
+    drafter.bind_uid("request", 7)
+    assert not drafter._request_seeds
+    assert drafter._rows[7].fed == reference._rows[7].fed
+    assert mx.array_equal(
+        mx.concatenate(drafter._rows[7].pending, axis=1),
+        mx.concatenate(reference._rows[7].pending, axis=1),
+    ).item()
+    plan = [{7: (1, 4)}, {7: (2, 5)}]
+    assert _run_cycles(drafter, plan) == _run_cycles(reference, plan)
+    drafter.seed_request("released", _captured(20, seed=1))
+    drafter.release_request("released")
+    assert not drafter._request_seeds
+
+
+def test_request_capture_positions_survive_window_trimming():
+    drafter = _tiny_drafter()
+    drafter.seed_request("r", _captured(20, seed=1), position=100)
+    drafter.seed_request("r", _captured(4, seed=2), position=120)
+    row = drafter._request_seeds["r"]
+    assert row.fed == 124 - drafter.ring_slots
+    for position in [119, 125, -1, True, 1.5]:
+        with pytest.raises(ValueError):
+            drafter.seed_request("r", _captured(1, seed=3), position=position)
+    assert row.fed + sum(part.shape[1] for part in row.pending) == 124
+    drafter.bind_uid("r", 7)
+    _run_cycles(drafter, [{7: (1, 4)}])
+    assert drafter.context_length(7) == 125
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+def test_sinks_retain_prefix_and_mask_ring_duplicates(monkeypatch, seeded):
+    drafter = _tiny_drafter(sink_size=3)
+    captures = _captured(20, seed=8)
+    if seeded:
+        drafter.seed_request("r", captures, position=0)
+        drafter.bind_uid("r", 7)
+    else:
+        drafter.seed(7, captures)
+    expected = dd._concat_captured(captures)[:, :3]
+    assert mx.array_equal(drafter._rows[7].sinks, expected).item()
+    masks = []
+    original = mx.fast.scaled_dot_product_attention
+
+    def attention(*args, **kwargs):
+        masks.append(kwargs["mask"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", attention)
+    _run_cycles(drafter, [{7: (1, 4)}, {7: (2, 5)}])
+    assert mx.array_equal(drafter._rows[7].sinks, expected).item()
+    assert masks
+    for mask in masks:
+        assert mask.shape[-1] == 3 + drafter.capacity + BLOCK
+        assert mask[0, 0, 0, :3].tolist() == [True] * 3
+        assert int(mx.sum(mask).item()) == 3 + drafter.ring_slots + BLOCK
+    assert not drafter.predraft(None, SimpleNamespace(uid=7), captures, mx.array([1]), mx.array([1]))
+    drafter.release([7])
+    assert 7 not in drafter._rows
+
+
+def test_short_sink_rows_exclude_duplicate_prefix_and_padding(monkeypatch):
+    drafter = _tiny_drafter(sink_size=3)
+    masks = []
+    original = mx.fast.scaled_dot_product_attention
+
+    def attention(*args, **kwargs):
+        masks.append(kwargs["mask"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", attention)
+    _run_cycles(drafter, [{0: (1, 4), 1: (5, 5)}])
+    for mask in masks:
+        assert mask[0, 0, 0, :3].tolist() == [True, False, False]
+        assert int(mx.sum(mask[0]).item()) == 1 + BLOCK
+        assert int(mx.sum(mask[1]).item()) == 5 + BLOCK
+    with pytest.raises(ValueError, match="prompt beginning"):
+        drafter.seed_request("missing", _captured(5, seed=8), position=20)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 29])
+def test_scheduler_sink_prefill_preserves_prefix_and_tail(chunk_size):
+    drafter = _tiny_drafter(sink_size=3)
+    reference = _tiny_drafter(sink_size=3)
+    scheduler = SimpleNamespace(model=SimpleNamespace(_omlx_drafter=drafter))
+    request = SimpleNamespace(prompt_token_ids=list(range(30)), request_id="r")
+    captures = _captured(29, seed=77)
+    reference.seed(7, captures)
+    for start in range(0, 29, chunk_size):
+        end = min(start + chunk_size, 29)
+        kwargs = {}
+        keep = Scheduler._dflash_prefill_capture(
+            scheduler, request, scheduler.model, start, end - start, kwargs
+        )
+        assert keep == 0
+        assert kwargs["capture_layer_ids"] == TARGET_LAYER_IDS
+        output = SimpleNamespace(hidden_states=[part[:, start:end] for part in captures])
+        Scheduler._dflash_seed_prefill(scheduler, request, output, keep, position=start)
+        row = drafter._request_seeds["r"]
+        assert row.sinks.shape[1] == min(3, end)
+        assert sum(part.shape[1] for part in row.pending) <= drafter.ring_slots
+    Scheduler._dflash_bind_uid(scheduler, "r", 7)
+    assert mx.array_equal(drafter._rows[7].sinks, reference._rows[7].sinks).item()
+    assert _run_cycles(drafter, [{7: (1, 4)}]) == _run_cycles(reference, [{7: (1, 4)}])
+
+
+@pytest.mark.parametrize("sink_size", [-1, True, 1.5, "3"])
+def test_loader_rejects_invalid_sinks_before_loading(monkeypatch, sink_size):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("loaded checkpoint before validation")
+    monkeypatch.setattr(dd, "load_drafter", forbidden)
+    with pytest.raises(ValueError, match="sink size"):
+        dd.load_dflash_drafter("synthetic", None, draft_sink_size=sink_size)
+
+
+def test_sink_requests_recompute_prompt_instead_of_reusing_kv_only_cache():
+    drafter = _tiny_drafter(sink_size=3)
+    scheduler = SimpleNamespace(
+        model=SimpleNamespace(_omlx_drafter=drafter),
+        _prefix_cache_prepared=set(), paged_cache_manager=None,
+    )
+    # The sink branch runs before cache lookup and needs no cache manager.
+    request = SimpleNamespace(
+        request_id="r", prompt_token_ids=list(range(30)),
+        prompt_cache=[object()], cached_tokens=20, remaining_tokens=list(range(20, 30)),
+    )
+    drafter.seed_request("r", _captured(2, seed=1), position=0)
+    Scheduler._dflash_restore_prefix(scheduler, request)
+    assert request.prompt_cache is None
+    assert request.cached_tokens == 0
+    assert request.remaining_tokens == request.prompt_token_ids
+    assert "r" not in drafter._request_seeds
+    captures = _captured(29, seed=2)
+    output = SimpleNamespace(hidden_states=captures)
+    Scheduler._dflash_seed_prefill(scheduler, request, output, 0, position=0)
+    Scheduler._dflash_bind_uid(scheduler, "r", 7)
+    reference = _tiny_drafter(sink_size=3)
+    reference.seed(7, captures)
+    assert _run_cycles(drafter, [{7: (1, 4)}]) == _run_cycles(reference, [{7: (1, 4)}])
+
+
+@pytest.mark.parametrize("disk", [False, True])
+@pytest.mark.parametrize("sink_size", [0, 3])
+def test_sink_capture_restore_keeps_kv_and_only_processes_suffix(tmp_path, disk, sink_size):
+    from omlx.speculative.dflash_capture_cache import DFlashCaptureStore
+
+    captures = _captured(24, seed=25)
+    draft = _tiny_drafter(sink_size=sink_size)
+    identity = ["target-revision", "draft-revision", sink_size, WINDOW]
+    draft.capture_store = DFlashCaptureStore(identity, directory=tmp_path if disk else None)
+    scheduler = SimpleNamespace(model=SimpleNamespace(_omlx_drafter=draft),
+                                config=SimpleNamespace(paged_cache_block_size=8))
+    request = SimpleNamespace(request_id="r", prompt_token_ids=list(range(30)))
+    Scheduler._dflash_seed_prefill(scheduler, request, SimpleNamespace(hidden_states=captures), 0, position=0)
+    if disk:
+        draft.capture_store = DFlashCaptureStore(identity, directory=tmp_path)
+    kv = [object()]
+    resumed = SimpleNamespace(request_id="new", prompt_token_ids=list(range(30)),
+                              cached_tokens=16, prompt_cache=kv, remaining_tokens=list(range(16,30)))
+    Scheduler._dflash_restore_prefix(scheduler, resumed)
+    assert resumed.prompt_cache is kv
+    assert resumed.cached_tokens == 16
+    assert resumed.remaining_tokens == list(range(16,30))
+    Scheduler._dflash_seed_prefill(scheduler, resumed, SimpleNamespace(
+        hidden_states=[part[:, 16:] for part in captures]), 0, position=16)
+    draft.bind_uid("new", 7)
+    reference = _tiny_drafter(sink_size=sink_size)
+    reference.seed(7, captures)
+    assert _run_cycles(draft, [{7: (1, 4)}]) == _run_cycles(reference, [{7: (1, 4)}])
+
+
+def test_sink_projection_reuse_and_invalidation(monkeypatch):
+    drafter = _tiny_drafter(sink_size=3)
+    reference = _tiny_drafter(sink_size=3)
+    reference.sink_kv_cache = False
+    attention = drafter.model.layers[0].self_attn
+    original = attention._project_kv
+    calls = []
+
+    def project(hidden):
+        calls.append(hidden.shape)
+        return original(hidden)
+
+    monkeypatch.setattr(attention, "_project_kv", project)
+    plan = [
+        {0: (1, 3), 1: (5, 4)},
+        {0: (2, 5), 1: (2, 6)},
+        {0: (2, 7), 1: (2, 8)},
+        {1: (2, 9), 0: (2, 10)},
+        {1: (2, 11)},
+        {1: (2, 12)},
+    ]
+    for cycle, rows in enumerate(plan):
+        expected = _run_cycles(reference, [rows], cycle_offset=cycle)
+        assert reference._cohort.sink_sources == ()
+        assert reference._cohort.sink_kv == []
+        calls.clear()
+        assert _run_cycles(drafter, [rows], cycle_offset=cycle) == expected
+        assert len(calls) == (2 if cycle in (2, 5) else 3)
+    drafter.release([1])
+    assert drafter._cohort is None
+    drafter.clear()
+    assert not drafter._rows
+
+
+@pytest.mark.parametrize("mode", ["ddtree", "off", "unknown"])
+def test_batched_verify_mode_rejected_before_checkpoint_load(monkeypatch, mode):
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("unsupported mode must fail before loading checkpoint")
+
+    monkeypatch.setattr(dd, "load_drafter", unexpected_load)
+    with pytest.raises(ValueError, match="block verifier"):
+        dd.load_dflash_drafter("missing", None, verify_mode=mode)
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_adaptive_draft_verification_prefix(depth):
+    drafter = _tiny_drafter()
+    reference = _tiny_drafter()
+    drafter.adaptive_verify = True
+    captured = _captured(5, seed=123)
+    outputs = []
+    for model in (reference, drafter):
+        state = SimpleNamespace(uid=7, depth=depth, controller=None)
+        model.draft([(None, state, captured, mx.array([4]), None)])
+        outputs.append(state.drafts.tolist())
+    assert outputs[1] == outputs[0][:depth]
+    row = drafter._rows[7]
+    assert row.fed + sum(part.shape[1] for part in row.pending) == reference.context_length(7)
+
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_adaptive_prefix_preserves_matching_draft_probabilities(monkeypatch, adaptive, depth):
+    drafter = _tiny_drafter()
+    drafter.adaptive_verify = adaptive
+    probabilities = [mx.array([0.25, 0.75]), mx.array([0.6, 0.4])]
+    monkeypatch.setattr(
+        drafter, "_draft_batched",
+        lambda rows: [(mx.array([[4, 5]]), probabilities)],
+    )
+    state = SimpleNamespace(uid=7, depth=2, controller=SimpleNamespace(cur=depth))
+    drafter.draft([(None, state, _captured(5, seed=123), mx.array([4]), None)])
+    count = depth if adaptive else 2
+    assert state.drafts.tolist() == [4, 5][:count]
+    assert len(state.draft_accept_lps) == count
+    assert all(
+        actual is expected
+        for actual, expected in zip(state.draft_accept_lps, probabilities[:count])
+    )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_adaptive_zero_depth_skips_draft_and_preserves_reentry(monkeypatch, mixed):
+    drafter = _tiny_drafter(sink_size=3)
+    drafter.adaptive_verify = True
+    reference = _tiny_drafter(sink_size=3)
+    original = drafter._draft_batched
+    calls = []
+
+    def record(rows, *args, **kwargs):
+        calls.append([state.uid for state, *_ in rows])
+        return original(rows, *args, **kwargs)
+
+    monkeypatch.setattr(drafter, "_draft_batched", record)
+    state = SimpleNamespace(uid=7, depth=0, controller=None)
+    for cycle in range(12):
+        captured = _captured(3, seed=cycle)
+        jobs = [(None, state, captured, mx.array([4]), None)]
+        if mixed:
+            active = SimpleNamespace(uid=8, depth=2, controller=None)
+            jobs.append((None, active, captured, mx.array([6]), None))
+        drafter.draft(jobs)
+        reference.seed(7, captured)
+        row = drafter._rows[7]
+        assert sum(part.shape[1] for part in row.pending) <= drafter.ring_slots
+        assert state.drafts.size == 0
+    assert calls == ([[8]] * 12 if mixed else [])
+    calls.clear()
+    state.depth = drafter.depth
+    captured = _captured(2, seed=100)
+    expected = SimpleNamespace(uid=7)
+    drafter.draft([(None, state, captured, mx.array([5]), None)])
+    reference.draft([(None, expected, captured, mx.array([5]), None)])
+    assert calls == [[7]]
+    assert state.drafts.tolist() == expected.drafts.tolist()
+    assert drafter.context_length(7) == reference.context_length(7)
+    assert mx.array_equal(drafter._rows[7].sinks, reference._rows[7].sinks).item()
+
+
+def test_prepared_rows_survive_batch_split_extend_and_scheduler_full_split():
+    """Rows already prepared must never replay their prompt (and reseed captures)."""
+    from mlx_lm.generate import PromptProcessingBatch
+
+    from omlx.cluster.dflash_prefill import install_dflash_prefill
+
+    def batch(uids, prepared=None):
+        b = PromptProcessingBatch.__new__(PromptProcessingBatch)
+        b.model, b.uids, b.prompt_cache = object(), list(uids), []
+        b.tokens = [[] for _ in uids]
+        b.samplers = [None for _ in uids]
+        b.logits_processors = [[] for _ in uids]
+        b.stop_sequences = [None for _ in uids]
+        b.max_tokens = [4 for _ in uids]
+        b.prefill_step_size, b.fallback_sampler = 2, None
+        if prepared is not None:
+            b._omlx_dflash_prepared = set(prepared)
+        return b
+
+    with install_dflash_prefill(object(), SimpleNamespace()):
+        full = batch([0, 1], {0, 1})
+        part = full.split([1])
+        assert part._omlx_dflash_prepared == {0, 1}
+        assert full._omlx_dflash_prepared == {0, 1}
+        whole = batch([5], {5})
+        assert whole.split([0])._omlx_dflash_prepared == {5}  # scheduler full-split path
+        left, right = batch([0], {0}), batch([1], {1})
+        left.extend(right)
+        assert left._omlx_dflash_prepared == {0, 1}
+        fresh = batch([2])
+        fresh.extend(batch([3], {3}))
+        assert fresh._omlx_dflash_prepared == {3}
+        assert not hasattr(batch([4]).split([0]), "_omlx_dflash_prepared")
+
+
+def test_evicted_drafter_frees_weights_keeps_context_and_resumes_identically():
+    import gc
+    import weakref
+
+    from omlx.utils.sampling import make_sampler
+
+    plan = [{0: (5, 3), 1: (2, 9)}, {0: (3, 11), 1: (4, 4)}]
+    after = [{0: (2, 8), 1: (3, 6)}]
+    reference = _tiny_drafter(sink_size=2)
+    evicting = _tiny_drafter(sink_size=2)
+    expected = _run_cycles(reference, plan)
+    assert _run_cycles(evicting, plan) == expected
+
+    released = weakref.ref(evicting.model)
+    window = evicting.window
+    assert evicting.evict() is True and evicting.evicted
+    gc.collect()
+    assert released() is None  # the only strong reference was the drafter's
+    assert (evicting.window, evicting.kind) == (window, reference.kind)
+    assert evicting.evict() is False
+    with pytest.raises(RuntimeError, match="evicted"):
+        _run_cycles(evicting, after)
+
+    # Ordinary decoding keeps feeding confirmed captures while evicted.
+    mx.random.seed(77)
+    ordinary = [mx.random.normal((2, 3, HIDDEN)) for _ in TARGET_LAYER_IDS]
+    for drafter in (reference, evicting):
+        drafter.observe([0, 1], ordinary)
+    with pytest.raises(RuntimeError, match="differs"):
+        evicting.reload(lambda: _tiny_drafter(sink_size=3))
+    assert evicting.evicted
+    calls = []
+    evicting.reload(lambda: calls.append(1) or _tiny_drafter(sink_size=2))
+    evicting.reload(lambda: calls.append(1) or _tiny_drafter(sink_size=2))
+    assert calls == [1] and not evicting.evicted
+
+    assert _run_cycles(evicting, after, cycle_offset=2) == _run_cycles(reference, after, cycle_offset=2)
+    # Same proposal distributions q for a sampled row after re-entry.
+    outputs = []
+    for drafter in (reference, evicting):
+        row = drafter._row(0)
+        context = mx.concatenate(_captured(2, seed=91), axis=-1)
+        mx.random.seed(5)
+        tokens, accept = drafter._draft_batched(
+            [(SimpleNamespace(uid=0), row, context, mx.array([7], dtype=mx.int32), make_sampler(temp=0.8))]
+        )[0]
+        q = [x.tolist() for x in accept] if isinstance(accept, list) else accept
+        outputs.append((tokens.tolist(), q))
+    assert outputs[0] == outputs[1]
+
+
+def test_shared_drafter_evicts_once_reloads_once_and_shares_failure():
+    from omlx.cluster.dflash import SharedDFlash
+
+    draft = _tiny_drafter()
+    loads = []
+    shared = SharedDFlash(
+        draft, share=lambda value: value, rank=0, evict=True,
+        loader=lambda: loads.append(1) or _tiny_drafter(),
+    )
+    assert shared.ensure_loaded() and not loads  # nothing evicted: no reload
+    shared.fallback()
+    shared.fallback()
+    assert shared.evicted and draft.evicted
+    assert shared.ensure_loaded() and shared.ensure_loaded()
+    assert loads == [1] and not draft.evicted
+
+    broken = SharedDFlash(
+        _tiny_drafter(), share=lambda value: value, rank=0, evict=True,
+        loader=lambda: (_ for _ in ()).throw(RuntimeError("disk gone")),
+    )
+    broken.fallback()
+    assert broken.ensure_loaded() is False and broken.reload_failed
+    broken.fallback()  # a failed deployment never evicts or retries again
+    assert broken.ensure_loaded() is False
+
+    off = SharedDFlash(_tiny_drafter(), share=lambda value: value, rank=0)
+    off.fallback()
+    assert not off.evicted and not off.draft_model.evicted
+
+    peer = SharedDFlash(None, share=lambda value: {"error": "x"}, rank=1, evict=True)
+    peer.fallback()
+    assert peer.evicted and peer.ensure_loaded() is False and peer.reload_failed

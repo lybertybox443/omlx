@@ -28,6 +28,7 @@ async def test_ssd_clear_aggregates_distributed_rank_results():
         return_value={
             "status": "ok",
             "ssd_deleted": 9,
+            "capture_ssd_deleted": 3,
             "hot_cleared": 0,
             "ranks": [{"rank": 0}, {"rank": 1}],
         }
@@ -41,7 +42,7 @@ async def test_ssd_clear_aggregates_distributed_rank_results():
     clear.assert_awaited_once_with(ssd=True)
     assert result == {
         "status": "ok",
-        "total_deleted": 9,
+        "total_deleted": 12,
         "distributed_ranks": 2,
     }
 

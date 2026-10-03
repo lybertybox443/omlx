@@ -442,8 +442,20 @@ class ModelSettings:
     # sliding_window when present; sink size defaults to no attention-sink tokens.
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = 0
+    dflash_sink_kv_cache: bool = True
+    dflash_async_prefill: bool = False
+    dflash_predraft: bool = False
+    dflash_evict_on_fallback: bool = False
+    dflash_capture_cache: bool = False
+    mtp_peer_projection_skip: bool = False
+    mtp_peer_verify_projection_skip: bool = False
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    # ddtree (distributed, greedy): branch/node bounds and the byte bound for branched
+    # caches plus activations. The memory bound has no default: ddtree needs it explicit.
+    dflash_ddtree_max_branches: Optional[int] = None
+    dflash_ddtree_max_nodes: Optional[int] = None
+    dflash_ddtree_memory_bytes: Optional[int] = None
 
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;
@@ -492,6 +504,22 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        for name in (
+            "dflash_ddtree_max_branches", "dflash_ddtree_max_nodes", "dflash_ddtree_memory_bytes",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        for name in (
+            "dflash_capture_cache", "mtp_peer_projection_skip",
+            "mtp_peer_verify_projection_skip", "dflash_sink_kv_cache",
+            "dflash_async_prefill", "dflash_predraft",
+            "dflash_evict_on_fallback",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
         # Profiles retain raw JSON types; engine signatures use repr().
         self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:

@@ -992,7 +992,6 @@ class TestLogicalCacheOffset:
 
 
 class TestUndoLookahead:
-
     @staticmethod
     def _kv(n, seed):
         return mx.random.normal((1, 2, n, 4), key=mx.random.key(seed))
@@ -1070,3 +1069,53 @@ class TestUndoLookahead:
         assert cache[0].caches[1] is window
         assert restored[0].tolist() == [[3.0, 3.0, 3.0]]
         assert window._idx == before[1][1]["_idx"]
+
+
+@pytest.mark.parametrize("fail_on", [None, 1, 3])
+def test_explicit_position_handler_cleans_up_after_prefill(fail_on):
+    from types import SimpleNamespace
+
+    from omlx.patches.specprefill import cleanup_rope, sparse_prefill
+
+    class Model:
+        layers = []
+
+        def __init__(self):
+            self.positions = []
+            self.end = 123
+
+        def __call__(self, tokens, cache, position_ids):
+            self.positions.extend(position_ids[0].tolist())
+            if len(self.positions) == fail_on:
+                raise RuntimeError("injected prefill failure")
+            cache[0].offset += tokens.shape[1]
+            return mx.zeros((1, tokens.shape[1], 8))
+
+        def set_specprefill_position_offset(self, cache, original_end):
+            self.end = original_end
+
+    model = Model()
+    cache = [SimpleNamespace(offset=2, state=mx.zeros((1,)))]
+    if fail_on is None:
+        sparse_prefill(
+            model,
+            mx.array([4, 5, 6, 7, 8]),
+            mx.array([0, 2, 4]),
+            cache,
+            step_size=1,
+            position_offset=2,
+        )
+        assert model.positions == [2, 4, 6]
+        assert model.end == 7
+        cleanup_rope(model)
+    else:
+        with pytest.raises(RuntimeError, match="injected prefill failure"):
+            sparse_prefill(
+                model,
+                mx.array([4, 5, 6, 7, 8]),
+                mx.array([0, 2, 4]),
+                cache,
+                step_size=1,
+                position_offset=2,
+            )
+    assert model.end is None

@@ -62,11 +62,13 @@ _MAX_ENTRIES_DEFAULT = 512
 
 # Bump when stored states stop matching a fresh prefill; older manifests then
 # reset on load. 2: mlx-lm 94cdcae changed the Qwen3.5 GDN q/k norm eps.
-_MANIFEST_VERSION = 2
+# 3: preserve the MLX-VLM recurrent class and its padding/length metadata.
+_MANIFEST_VERSION = 3
 
 
 def _wire_state(entry: Any) -> tuple[Any, Any]:
     from mlx_lm.models.cache import CacheList, QuantizedKVCache
+
     from omlx.cache.type_registry import CacheTypeRegistry
 
     if isinstance(entry, CacheList):
@@ -77,6 +79,12 @@ def _wire_state(entry: Any) -> tuple[Any, Any]:
     if isinstance(entry, QuantizedKVCache):
         state = entry.keys_and_values() if entry.keys is not None else (None, None)
         return list(state), (entry.offset, entry.group_size, entry.bits)
+    if type(entry).__name__ == "ArraysCache" and type(entry).__module__ == "mlx_vlm.models.cache":
+        if entry.is_speculating:
+            raise ValueError("cannot snapshot an uncommitted recurrent cache")
+        return [*entry.state, entry.left_padding, entry.lengths], ("mlx_vlm", len(entry.state))
+    if type(entry).__name__ == "QSATurboQuantKVCache":
+        return entry.snapshot_state()
     handler = CacheTypeRegistry.get_handler_for_object(entry)
     state = handler.serialize_state(entry)
     return list(state), handler.serialize_meta_state(entry) or ""
@@ -100,6 +108,15 @@ def _from_wire_state(name: str, state: Any, metadata: Any) -> Any:
         )
     import mlx_lm.models.cache as cache_module
 
+    if name == "QSATurboQuantKVCache":
+        from omlx.patches.qwen4_exp_mlx_lm.turboquant import QSATurboQuantKVCache
+        return QSATurboQuantKVCache.from_snapshot(state, metadata)
+    if name in ("QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache"):
+        from omlx.cache.type_registry import CacheTypeRegistry
+        result = CacheTypeRegistry.get_handler_by_class_name(name).deserialize_state(state, metadata)
+        if result is None:
+            raise ValueError(f"could not restore {name} snapshot")
+        return result
     cache_class = getattr(cache_module, name)
     if name in ("KVCache", "ConcatenateKVCache"):
         cache = cache_class()
@@ -107,6 +124,13 @@ def _from_wire_state(name: str, state: Any, metadata: Any) -> Any:
         cache.offset = 0 if cache.keys is None else cache.keys.shape[2]
         return cache
     if name == "ArraysCache":
+        if metadata and metadata[0] == "mlx_vlm":
+            from mlx_vlm.models.cache import ArraysCache
+            slots = int(metadata[1])
+            cache = ArraysCache(slots)
+            cache.cache = list(state[:slots])
+            cache.left_padding, cache.lengths = state[slots:]
+            return cache
         cache = cache_class(len(state))
         cache.cache = list(state)
         return cache
@@ -767,6 +791,7 @@ class SSDPromptSnapshotStore:
             files = [_load_prompt_snapshot(str(self._path(key))) for key in chain]
             assembled = _assemble_chain(files, boundary)
         except Exception:
+            logger.debug("Could not restore prompt snapshot", exc_info=True)
             return None
         if assembled is None:
             return None

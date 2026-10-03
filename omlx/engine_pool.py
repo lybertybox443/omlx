@@ -453,6 +453,25 @@ class EnginePool:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    @staticmethod
+    def _cluster_servable(entry: EngineEntry) -> bool:
+        """Whether a cluster deployment may serve this entry.
+
+        Text LLMs, plus a VLM whose architecture adapter declares request media
+        its worker chain serves. The capability is the adapter's published,
+        effective one: a vision model whose ranks cannot take an image stays a
+        local model.
+        """
+
+        if entry.engine_type == "batched":
+            return True
+        if entry.engine_type != "vlm":
+            return False
+        from .cluster.model_adapters import adapter_for_type
+
+        adapter = adapter_for_type(entry.config_model_type)
+        return adapter is not None and bool(adapter.media)
+
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
     ) -> ClusterDeployment | None:
@@ -465,7 +484,7 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None or not self._cluster_servable(entry):
             return None
         return registry.get_for_model(entry.model_path)
 
@@ -1216,8 +1235,16 @@ class EnginePool:
                 )
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
+            add("dflash_sink_kv_cache", data.get("dflash_sink_kv_cache", True))
+            add("dflash_async_prefill", data.get("dflash_async_prefill", False))
+            add("dflash_predraft", data.get("dflash_predraft", False))
+            add("dflash_evict_on_fallback", data.get("dflash_evict_on_fallback", False))
+            add("dflash_capture_cache", data.get("dflash_capture_cache", False))
             add("dflash_block_size", data.get("dflash_block_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
+            add("dflash_ddtree_max_branches", data.get("dflash_ddtree_max_branches"))
+            add("dflash_ddtree_max_nodes", data.get("dflash_ddtree_max_nodes"))
+            add("dflash_ddtree_memory_bytes", data.get("dflash_ddtree_memory_bytes"))
 
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"
@@ -1227,6 +1254,11 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
+        add("mtp_peer_projection_skip", data.get("mtp_peer_projection_skip", False))
+        add(
+            "mtp_peer_verify_projection_skip",
+            data.get("mtp_peer_verify_projection_skip", False),
+        )
         return tuple(signature)
 
     @property
@@ -1471,11 +1503,11 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        if not self._cluster_servable(entry):
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
                 "Distributed cluster inference currently supports text LLM "
-                "models only."
+                "models only (and vision models whose cluster adapter serves media)."
             )
         return model_id
 
@@ -1509,7 +1541,7 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            if not self._cluster_servable(entry):
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
@@ -3273,14 +3305,15 @@ class EnginePool:
             # load. Log it again next to the load.
             for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):
                 self._offload_warn_state.pop((model_id, kind), None)
-            model_settings = self._effective_qwen4_model_settings(entry, model_settings)
-            model_settings = self._effective_deepseek_v41_model_settings(
-                entry, model_settings
-            )
+            deployment = self._distributed_deployment_for_entry(entry)
+            if deployment is None:
+                model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+                model_settings = self._effective_deepseek_v41_model_settings(
+                    entry, model_settings
+                )
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
-            deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)
             if (
                 deployment is None
@@ -3321,7 +3354,11 @@ class EnginePool:
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
-            deployment = deployment if effective_type == "batched" else None
+            deployment = (
+                deployment
+                if effective_type == "batched" or self._cluster_servable(entry)
+                else None
+            )
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
@@ -3351,6 +3388,26 @@ class EnginePool:
                         entry.config_model_type, effective_type
                     )
                 ):
+                    from .utils.model_loading import validate_dflash_block_verify_mode
+
+                    from .utils.model_loading import ddtree_supported
+
+                    validate_dflash_block_verify_mode(
+                        model_settings.dflash_verify_mode,
+                        allow_ddtree=ddtree_supported(entry.config_model_type),
+                    )
+                    if model_settings.dflash_verify_mode == "ddtree":
+                        # Refused before the engine is built, not after it holds memory.
+                        if getattr(model_settings, "turboquant_kv_enabled", False):
+                            raise ValueError(
+                                "dflash_verify_mode=ddtree cannot bound the branch memory of "
+                                "TurboQuant KV caches; use 'adaptive' or 'dflash'"
+                            )
+                        if not (model_settings.dflash_ddtree_memory_bytes or 0) > 0:
+                            raise ValueError(
+                                "dflash_verify_mode=ddtree requires dflash_ddtree_memory_bytes, "
+                                "a positive bound for branched caches and activations"
+                            )
                     # Qwen3.5-family VLM targets draft inside the batched
                     # engine; the drafter is attached after start below.
                     logger.info(
@@ -3653,10 +3710,18 @@ class EnginePool:
                 def _load_dflash_sync(path: str = drafter_path):
                     from .speculative.dflash_drafter import load_dflash_drafter
 
-                    return load_dflash_drafter(
+                    draft = load_dflash_drafter(
                         path,
                         engine.vlm_model,
                         block_size=getattr(model_settings, "dflash_block_size", None),
+                        draft_window_size=model_settings.dflash_draft_window_size,
+                        draft_sink_size=model_settings.dflash_draft_sink_size or 0,
+                        sink_kv_cache=model_settings.dflash_sink_kv_cache,
+                        verify_mode=(
+                            None
+                            if model_settings.dflash_verify_mode == "ddtree"
+                            else model_settings.dflash_verify_mode
+                        ),
                         quant_enabled=bool(
                             getattr(model_settings, "dflash_draft_quant_enabled", False)
                         ),
@@ -3670,12 +3735,47 @@ class EnginePool:
                         ),
                     )
 
+                    if model_settings.dflash_verify_mode == "ddtree":
+                        from .speculative.ddtree_branches import enable_local_tree
+
+                        enable_local_tree(
+                            draft,
+                            engine.vlm_model,
+                            max_branches=model_settings.dflash_ddtree_max_branches or 4,
+                            max_nodes=model_settings.dflash_ddtree_max_nodes or 8,
+                            memory_bytes=model_settings.dflash_ddtree_memory_bytes,
+                            turboquant=bool(getattr(model_settings, "turboquant_kv_enabled", False)),
+                        )
+                    if model_settings.dflash_capture_cache:
+                        from .speculative.dflash_capture_cache import (
+                            DFlashCaptureStore,
+                            checkpoint_identity,
+                        )
+
+                        root = getattr(self._scheduler_config, "paged_ssd_cache_dir", None)
+                        directory = Path(root) / "dflash_captures" if root and model_settings.dflash_ssd_cache else None
+                        draft.capture_store = DFlashCaptureStore(
+                            [checkpoint_identity(entry.model_path), checkpoint_identity(path), model_settings.to_dict(),
+                             draft.window, draft.sink_size, draft.target_layer_ids,
+                             model_settings.dflash_draft_quant_enabled,
+                             model_settings.dflash_draft_quant_weight_bits,
+                             model_settings.dflash_draft_quant_group_size],
+                            max_entries=model_settings.dflash_in_memory_cache_max_entries,
+                            max_bytes=model_settings.dflash_in_memory_cache_max_bytes if model_settings.dflash_in_memory_cache else 0,
+                            directory=directory,
+                            disk_bytes=model_settings.dflash_ssd_cache_max_bytes,
+                        )
+                    return draft
+
                 loop = asyncio.get_running_loop()
                 try:
                     drafter = await loop.run_in_executor(
                         get_mlx_executor(), _load_dflash_sync
                     )
                 except Exception as e:
+                    if model_settings.dflash_verify_mode == "ddtree":
+                        # An explicit ddtree deployment never degrades to a linear one.
+                        raise
                     logger.warning(
                         f"DFlash drafter load raised for {model_id} "
                         f"(drafter={drafter_id}): {e} -- toggle ignored"
@@ -3686,11 +3786,8 @@ class EnginePool:
                     ignored = [
                         name
                         for name, default in (
-                            ("dflash_verify_mode", None),
                             ("dflash_max_ctx", None),
-                            ("dflash_draft_window_size", None),
-                            ("dflash_draft_sink_size", 0),
-                            ("dflash_ssd_cache", False),
+
                         )
                         if getattr(model_settings, name, default) != default
                     ]

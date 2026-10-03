@@ -297,6 +297,7 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             layer_weight_bytes=int(payload["layer_weight_bytes"]),
             fixed_weight_bytes=int(payload["fixed_weight_bytes"]),
             reserve_bytes=int(payload["reserve_bytes"]),
+            runtime_reserve_bytes=payload.get("runtime_reserve_bytes", 0),
             capacity_bytes=int(payload["capacity_bytes"]),
             manual_memory_limit=bool(payload.get("manual_memory_limit", False)),
             role=role,
@@ -362,10 +363,18 @@ class ClusterDeployment:
     # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
     path_map: dict[str, str] = field(default_factory=dict)
+    # Explicit per-model choices every rank must make the same way (for
+    # Qwen4-Exp, where the PLE table lives). Carried to the workers in the
+    # encoded plan so no rank derives one from its own environment; supplied by
+    # the model's adapter (``PipelineModelAdapter.runtime_options``).
+    runtime_options: dict[str, Any] = field(default_factory=dict)
     # RDMA stage edges for one launch only; never stored or compared.
     stage_links: tuple[StageLink, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "runtime_options", _validated_runtime_options(self.runtime_options)
+        )
         if _NODE_ID.fullmatch(self.deployment_id) is None:
             raise ValueError(f"invalid deployment ID: {self.deployment_id!r}")
         if (
@@ -506,6 +515,7 @@ class ClusterDeployment:
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
             "path_map": dict(sorted(self.path_map.items())),
+            "runtime_options": dict(sorted(self.runtime_options.items())),
         }
 
     @classmethod
@@ -553,6 +563,7 @@ class ClusterDeployment:
             # Schema 1 payloads predate per-node paths; they decode to the
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
+            runtime_options=_validated_runtime_options(payload.get("runtime_options")),
         )
 
     def encode_worker_plan(self) -> str:
@@ -570,6 +581,7 @@ class ClusterDeployment:
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "path_map": dict(sorted(self.path_map.items())),
+                "runtime_options": dict(sorted(self.runtime_options.items())),
                 "stage_links": [link.to_dict() for link in self.stage_links],
             },
             sort_keys=True,
@@ -657,6 +669,24 @@ def decode_worker_contract(
             "tensor_parallel_size must be between 1 and the assignment count"
         )
     return payload["plan_hash"], parsed, profiles, tensor_parallel_size
+
+
+def _validated_runtime_options(value: Any) -> dict[str, Any]:
+    from .model_adapters import validate_runtime_options
+
+    return validate_runtime_options(value)
+
+
+def decode_worker_runtime_options(encoded: str) -> dict[str, Any]:
+    """Model runtime options carried inside the worker contract.
+
+    Contracts that predate them decode to no options; an adapter that needs one
+    then refuses to start rather than guessing.
+    """
+
+    return _validated_runtime_options(
+        _decode_worker_payload(encoded).get("runtime_options")
+    )
 
 
 def decode_worker_path_map(encoded: str) -> dict[str, str]:

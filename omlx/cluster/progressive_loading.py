@@ -31,13 +31,19 @@ def materialize_parameters_progressively(
     mx_module: Any,
     tree_flatten: Callable[[Any], list[tuple[str, Any]]],
     progress: ProgressCallback | None = None,
+    layer_index: Callable[[str], int | None] = _layer_index,
 ) -> tuple[int, ...]:
-    """Materialize fixed weights once and transformer weights one layer at a time."""
+    """Materialize fixed weights once and transformer weights one layer at a time.
+
+    ``layer_index`` says which decoder layer a parameter belongs to; a model
+    adapter replaces the name pattern when the model keeps other layer-like
+    stacks (a vision tower, an MTP head) that are fixed weights.
+    """
 
     fixed: list[Any] = []
     layers: dict[int, list[Any]] = {}
     for path, value in tree_flatten(parameters):
-        index = _layer_index(path)
+        index = layer_index(path)
         if index is None:
             fixed.append(value)
         else:
@@ -186,6 +192,8 @@ def progressive_sharded_load(
         strict=False,
         trust_remote_code=trust_remote_code,
     )
+    adapter = getattr(model, "_omlx_adapter", None)
+    layer_index = adapter.trunk_layer_index if adapter is not None else _layer_index
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
         materialize_parameters_progressively(
@@ -193,6 +201,7 @@ def progressive_sharded_load(
             mx_module=mx_module,
             tree_flatten=utils_module.tree_flatten,
             progress=progress,
+            layer_index=layer_index,
         )
     elif tensor_group is not None:
         # Fixed embeddings/head weights are replicated. Materialize them first;

@@ -11,6 +11,7 @@ import time
 import weakref
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import partial
@@ -23,10 +24,13 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import (
+    register_ple_resource,
+)
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
 from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from mlx_vlm.models.base import LanguageModelOutput
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
@@ -49,6 +53,7 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 from . import hc_fused
+from . import pipeline as _pipeline
 from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
@@ -129,9 +134,7 @@ def _split_text_mrope_positions(
 ) -> tuple[mx.array, mx.array]:
     """Indexer text ids vs rotary ids for the gathered QSA arms."""
     if position_ids is None:
-        text_position_ids = mx.arange(
-            past_len, past_len + length, dtype=mx.int32
-        )[None]
+        text_position_ids = mx.arange(past_len, past_len + length, dtype=mx.int32)[None]
         rotary_position_ids = mx.broadcast_to(
             text_position_ids,
             (3, batch, length),
@@ -151,6 +154,33 @@ class Qwen4ExpMTPRuntime:
 
 
 _MTP_RUNTIME = Qwen4ExpMTPRuntime()
+
+
+def _recurrent_row_mask(hidden_states, cache):
+    """Row mask of the recurrent layers, honouring right padding.
+
+    mlx-vlm's ``ArraysCache.make_mask`` (and the builder around it) answers from left
+    padding alone: merged empty caches carry zero left padding, so a right-padded
+    prefill, which prepares per-row ``lengths``, got no mask (or an all-true one) and
+    the padded positions updated each short row's recurrent state. The in-length
+    condition is added here, from the cache, and only while some row is shorter than
+    the step; full-length rows and decode steps keep the original answer.
+    """
+    mask = _create_qwen3_5_ssm_mask(hidden_states, cache)
+    lengths = getattr(cache, "lengths", None)
+    if (
+        cache is not None
+        and isinstance(lengths, mx.array)
+        and lengths.ndim > 0
+        and lengths.size > 0
+        and int(lengths.min().item()) < hidden_states.shape[1]
+    ):
+        in_length = mx.arange(hidden_states.shape[1])[None, :] < lengths[:, None]
+        left = getattr(cache, "left_padding", None)
+        if mask is None and isinstance(left, mx.array) and left.ndim > 0:
+            mask = mx.arange(hidden_states.shape[1])[None, :] >= left[:, None]
+        return in_length if mask is None else (mask & in_length)
+    return mask
 
 
 @dataclass(frozen=True)
@@ -210,8 +240,7 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
     if requested is None:
         requested = "auto"
     checkpoint_bytes = sum(
-        path.stat().st_size
-        for path in compute_path.glob("*.safetensors")
+        path.stat().st_size for path in compute_path.glob("*.safetensors")
     )
     physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     _PLE_RUNTIME_MODE = resolve_ple_runtime_mode(
@@ -390,9 +419,7 @@ class _QSAIndexerCache:
                 # MRoPE promotion is rare. Collapse the old position backing to
                 # its logical prefix so the capacity grow below creates a
                 # writable three-coordinate allocation.
-                old_positions = self._index_position_ids[
-                    ..., : self._index_offset
-                ]
+                old_positions = self._index_position_ids[..., : self._index_offset]
                 self._index_position_ids = mx.broadcast_to(
                     old_positions[None],
                     (position_ids.shape[0], *old_positions.shape),
@@ -548,9 +575,7 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     def extract(self, idx):
         cache = QSAKVCache()
         if self.keys is not None:
-            cache.keys = mx.contiguous(
-                self.keys[idx : idx + 1, :, : self.offset, :]
-            )
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
             cache.values = mx.contiguous(
                 self.values[idx : idx + 1, :, : self.offset, :]
             )
@@ -756,9 +781,7 @@ class BatchQSAKVCache:
                     dtype=sample_positions.dtype,
                 )
             else:
-                positions = mx.zeros(
-                    (batch_size, 0), dtype=sample_positions.dtype
-                )
+                positions = mx.zeros((batch_size, 0), dtype=sample_positions.dtype)
         else:
             keys = cache.index_keys[:, :length]
             positions = cache.index_position_ids[..., :length]
@@ -829,9 +852,7 @@ class BatchQSAKVCache:
         right = self._pad_index(other, target, sample_keys, sample_positions)
         index_keys = mx.concatenate([left[0], right[0]], axis=0)
         position_axis = 1 if sample_positions.ndim == 3 else 0
-        index_position_ids = mx.concatenate(
-            [left[1], right[1]], axis=position_axis
-        )
+        index_position_ids = mx.concatenate([left[1], right[1]], axis=position_axis)
 
         self.kv_cache.extend(other.kv_cache)
         self.index_keys = index_keys
@@ -959,9 +980,7 @@ class BatchQSAKVCache:
         # and desync the indexer from the KV by the trimmed amount.
         if trimmed and self.index_keys is not None:
             self.index_keys = self.index_keys[:, : self.index_offset]
-            self.index_position_ids = self.index_position_ids[
-                ..., : self.index_offset
-            ]
+            self.index_position_ids = self.index_position_ids[..., : self.index_offset]
         return trimmed
 
     @property
@@ -1030,8 +1049,7 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         cache = QSAQuantizedKVCache(self.group_size, self.bits)
         if self.keys is not None:
             cache.keys = tuple(
-                mx.contiguous(x[idx : idx + 1, :, : self.offset, :])
-                for x in self.keys
+                mx.contiguous(x[idx : idx + 1, :, : self.offset, :]) for x in self.keys
             )
             cache.values = tuple(
                 mx.contiguous(x[idx : idx + 1, :, : self.offset, :])
@@ -1232,9 +1250,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
         if isinstance(start, mx.array) and start.ndim == 1:
-            return mx.maximum(start[:batch], 0)[:, None] + mx.arange(
-                length, dtype=mx.int32
-            )[None, :]
+            return (
+                mx.maximum(start[:batch], 0)[:, None]
+                + mx.arange(length, dtype=mx.int32)[None, :]
+            )
         positions = mx.arange(start, start + length, dtype=mx.int32)
         return mx.broadcast_to(positions[None], (batch, length))
 
@@ -1529,10 +1548,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and not target_verify
             and (
                 position_ids is None
-                or (
-                    position_ids.ndim == 2
-                    and tuple(position_ids.shape) == (1, 1)
-                )
+                or (position_ids.ndim == 2 and tuple(position_ids.shape) == (1, 1))
             )
         ):
             return False
@@ -1994,15 +2010,17 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         projected = _target_verify_linear(indexer.index_qk_proj, x).reshape(
             batch, length, indexer.n_heads + indexer.kv_heads, indexer.head_dim
         )
-        index_queries = indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(
-            0, 2, 1, 3
-        )
+        index_queries = indexer.q_layernorm(
+            projected[:, :, : indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
         index_positions = (
             position_ids
             if position_ids is not None
             else indexer._default_position_ids(batch, past_len, length)
         )
-        cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
+        cache.update_indexer(
+            projected[:, :, indexer.n_heads :].squeeze(2), index_positions
+        )
         index_queries = indexer._apply_rope(index_queries, index_positions)
         pooled_keys = mx.expand_dims(
             cache.pooled_indexer_keys(
@@ -2027,9 +2045,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             blocks = key_tokens // indexer.compress_ratio
             # A contiguous one-row FP32 query, as the serial step builds it: a
             # strided row view takes another matmul kernel (other FP32 sums).
-            scores = index_queries[:, :, row : row + 1].astype(mx.float32) @ pooled_keys[
-                :, :, :blocks
-            ].transpose(0, 1, 3, 2)
+            scores = index_queries[:, :, row : row + 1].astype(
+                mx.float32
+            ) @ pooled_keys[:, :, :blocks].transpose(0, 1, 3, 2)
             row_mask = indexer.aligned_row_mask(scores, key_tokens)
             row_queries = queries[:, :, row : row + 1]
             row_keys = keys[..., :key_tokens, :]
@@ -2204,9 +2222,7 @@ class Qwen4ExpGatedResidual(nn.Module):
                 hc_hidden_size, self.hc_count, bias=False
             )
 
-    def __call__(
-        self, hyper_input: mx.array, target_verify: bool = False, write=None
-    ):
+    def __call__(self, hyper_input: mx.array, target_verify: bool = False, write=None):
         # ``write`` is a pending (branch, gate) residual write onto hyper_input.
         # The written residual comes back as the passthrough; the mixer (no
         # block_inject_weight) then returns (mixed, written).
@@ -2312,9 +2328,7 @@ class Qwen4ExpGatedResidual(nn.Module):
         mixed_input = mx.mean(mix * streams, axis=-2)
         if block_injection is None:
             return mixed_input
-        injection_weights = 2 * mx.sigmoid(
-            block_injection / self.hc_count
-        )
+        injection_weights = 2 * mx.sigmoid(block_injection / self.hc_count)
         return mixed_input, hyper_input, injection_weights
 
 
@@ -2375,9 +2389,7 @@ def _can_fuse_hyper_connection(module: Qwen4ExpGatedResidual) -> bool:
 
 def _can_prepare_exact_hybrid(module: Qwen4ExpGatedResidual) -> bool:
     if not (
-        module.hc_count == 4
-        and module.hidden_size == 2560
-        and module.hc_lowrank == 320
+        module.hc_count == 4 and module.hidden_size == 2560 and module.hc_lowrank == 320
     ):
         return False
     from .hc_projection import compatible_projections
@@ -2411,8 +2423,7 @@ def fuse_hyper_connection_projections(model: nn.Module) -> int:
     targets = [
         module
         for module in _unique_hyper_connections(model)
-        if _can_fuse_hyper_connection(module)
-        and _can_prepare_exact_hybrid(module)
+        if _can_fuse_hyper_connection(module) and _can_prepare_exact_hybrid(module)
     ]
     for module in targets:
         module._omlx_exact_hybrid_projection = True
@@ -2544,7 +2555,9 @@ class _SafeTensorMMap:
                 header_size = struct.unpack("<Q", self._file.read(8))[0]
                 self._header = json.loads(self._file.read(header_size))
                 self._data_start = 8 + header_size
-                self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+                self._mapping = mmap.mmap(
+                    self._file.fileno(), 0, access=mmap.ACCESS_READ
+                )
                 self._seen_pages = bytearray(
                     1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
                 )
@@ -2885,11 +2898,14 @@ class DiskBackedShardedEmbedding(nn.Module):
         bits, group_size = specs[0][3], specs[0][4]
         families = [0] if bits is None else [0, 1, 2]
         dtypes = {
-            family: self._tensor_readers[specs[0][family]].tensor_dtype(specs[0][family])
+            family: self._tensor_readers[specs[0][family]].tensor_dtype(
+                specs[0][family]
+            )
             for family in families
         }
         if any(spec[3:] != (bits, group_size) for spec in specs) or any(
-            self._tensor_readers[spec[family]].tensor_dtype(spec[family]) != dtypes[family]
+            self._tensor_readers[spec[family]].tensor_dtype(spec[family])
+            != dtypes[family]
             for spec in specs
             for family in families
         ):
@@ -2921,7 +2937,9 @@ class DiskBackedShardedEmbedding(nn.Module):
         flat = indices.reshape(-1)
         mx.eval(flat)
         host = np.asarray(flat.astype(mx.int64)).reshape(-1)
-        if host.size and (int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]):
+        if host.size and (
+            int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]
+        ):
             raise IndexError("embedding index is outside the sharded vocabulary")
         return host
 
@@ -2973,7 +2991,10 @@ class DiskBackedShardedEmbedding(nn.Module):
         _, _, touched, _, families, dtypes, bits, group_size = plan
         self.last_touched_shards = tuple(touched)
         self.rows_read = int(host.size)
-        arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
+        arrays = [
+            _SafeTensorMMap.to_mx(buffers[family], dtypes[family])
+            for family in families
+        ]
         self.last_uploads = len(arrays)
         values = arrays[0]
         if bits is not None:
@@ -3348,10 +3369,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> mx.array:
         batch = input_ids.shape[0]
         if cache is not None and cache[3] is not None:
+            if cache[2] is None:
+                # A fresh cache can also receive a raw batch without a merge.
+                return mx.broadcast_to(cache[3], (batch, self.context_len))
             return cache[3]
-        return mx.full(
-            (batch, self.context_len), self.eos_token_id, dtype=mx.int64
-        )
+        return mx.full((batch, self.context_len), self.eos_token_id, dtype=mx.int64)
 
     def _ngram_indices(self, token_history: mx.array, length: int) -> mx.array:
         """Hashed table rows for the last ``length`` tokens of ``token_history``."""
@@ -3391,7 +3413,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         token_history = mx.concatenate([previous_context, input_ids], axis=-1)
         if cache is not None:
-            cache.update_window(3, token_history, self.context_len)
+            cache.update_window(
+                3, token_history, self.context_len, lengths=cache.lengths
+            )
 
         ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
         embeddings = self.ngram_embedding(ngram_ids)
@@ -3536,7 +3560,9 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache.update_window(2, conv_input, self.short_conv_state_len)
+            cache.update_window(
+                2, conv_input, self.short_conv_state_len, lengths=cache.lengths
+            )
         return nn.silu(_depthwise_conv1d(self.conv1d, conv_input)), state
 
     def __call__(
@@ -3679,21 +3705,105 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
 
 class Qwen4ExpModel(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, layer_range=None):
         super().__init__()
         self.args = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if layer_range is None:
+            layer_range = _pipeline.planned_layer_range(config.num_hidden_layers)
+        # Layers owned by other pipeline stages stay None: they are never
+        # built, so no weight, PLE table or storage handle exists for them.
+        start, end = layer_range or (0, config.num_hidden_layers)
         self.layers = [
             Qwen4ExpDecoderLayer(config, layer_idx)
+            if start <= layer_idx < end
+            else None
             for layer_idx in range(config.num_hidden_layers)
         ]
         self.hyper_connection_mixer = Qwen4ExpGatedResidual(config, use_combine=False)
-        self.ssm_idx = next(
-            (i for i, layer in enumerate(self.layers) if layer.is_linear), 0
-        )
+        held = [layer for layer in self.layers if layer is not None]
+        self.ssm_idx = next((i for i, layer in enumerate(held) if layer.is_linear), 0)
         self.fa_idx = next(
-            (i for i, layer in enumerate(self.layers) if not layer.is_linear), 0
+            (i for i, layer in enumerate(held) if not layer.is_linear), 0
         )
+        # Single-node defaults; ``pipeline()`` replaces them for one stage.
+        self.pipeline_rank = 0
+        self.pipeline_size = 1
+        self.start_idx = 0
+        self.end_idx = None
+        self.pipeline_stage = None
+
+    @property
+    def pipeline_layers(self):
+        """The layers this process executes (all of them off a pipeline)."""
+        return self.layers[self.start_idx : self.end_idx]
+
+    def pipeline(self, group, split=None):
+        """Keep only this rank's planned layer range.
+
+        Unlike MLX-LM's mixin this never derives an even split: the range must
+        come from the approved shard plan the worker installs, because an even
+        split silently overrides a plan sized around unequal memory.
+        """
+        del split
+        plan = _pipeline.installed_plan()
+        if plan is None:
+            raise _pipeline.PipelineContractError(
+                "Qwen4-Exp pipeline stages require an approved shard plan"
+            )
+        from omlx.cluster.planner import apply_pipeline_assignment
+
+        total = len(self.layers)
+        apply_pipeline_assignment(self, group, plan)
+        embedding_dtype = self.embed_tokens(mx.zeros((1, 1), dtype=mx.int32)).dtype
+        self.pipeline_stage = _pipeline.PipelineStage(
+            rank=self.pipeline_rank,
+            size=self.pipeline_size,
+            start=self.start_idx,
+            end=self.end_idx,
+            total_layers=total,
+            hc_count=self.args.hc_count,
+            hidden_size=self.args.hidden_size,
+            defer_write=hc_fused.write_enabled(),
+            wire_dtype=embedding_dtype,
+        )
+        self.fa_idx, self.ssm_idx = _pipeline.local_cache_indices(self.pipeline_layers)
+
+    # The planner plan, not model code, decides the range. The worker's
+    # pre-load guard accepts a model only through this explicit marker.
+    pipeline._omlx_honors_pipeline_assignment = True
+
+    @contextmanager
+    def coordinator_output(self):
+        """Scope rank-local outputs to coordinated decode or prefill steps."""
+        previous = getattr(self, "_omlx_rank_local_output", False)
+        self._omlx_rank_local_output = True
+        try:
+            yield
+        finally:
+            self._omlx_rank_local_output = previous
+
+    @contextmanager
+    def boundary_capture_output(self):
+        """Carry layer captures on the stage boundary instead of collectives.
+
+        Only for capture-only prefill, whose sole consumer is rank zero: the
+        stages forward their captured layers with the activation message and
+        rank zero returns all of them, so the forward holds no collective and
+        can overlap like an ordinary staggered chunk.
+        """
+        previous = getattr(self, "_omlx_boundary_captures", False)
+        self._omlx_boundary_captures = True
+        try:
+            yield
+        finally:
+            self._omlx_boundary_captures = previous
+
+    def verify_pipeline_contract(self, group):
+        """One post-load collective: same wire layout everywhere, ranges chain."""
+        if self.pipeline_stage is None:
+            raise _pipeline.PipelineContractError("model has no pipeline stage")
+        _pipeline.verify_contract(group, self.pipeline_stage)
 
     def __call__(
         self,
@@ -3708,36 +3818,88 @@ class Qwen4ExpModel(nn.Module):
         **kwargs,
     ):
         del kwargs
+        stage = self.pipeline_stage
+        if stage is not None:
+            _pipeline.reject_unsupported(
+                capture_layer_ids, hidden_sink, gdn_sink, cache
+            )
         if cache is not None and any(
             getattr(c, "_speculation", None) is not None for c in cache
         ):
             gdn_sink = []
-        hidden_states = (
-            self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        write = None
+        # Captures ride the stage boundary (no collective) in the scoped
+        # capture-only prefill; ``upstream`` holds earlier stages' captures.
+        boundary_caps = bool(
+            stage is not None
+            and hidden_sink is not None
+            and getattr(self, "_omlx_boundary_captures", False)
         )
-        hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
+        upstream = []
+        if stage is None or stage.is_first:
+            hidden_states = (
+                self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+            )
+            hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
+        elif boundary_caps:
+            hidden_states, write, upstream = _pipeline.receive_boundary_captures(
+                stage,
+                inputs.shape[0],
+                inputs.shape[1],
+                sum(1 for i in set(capture_layer_ids or ()) if i < stage.start),
+            )
+        else:
+            # Embeddings and the opening mix belong to the first stage; this
+            # stage resumes from the residual (and pending write) it is sent.
+            hidden_states, write = _pipeline.receive_boundary(
+                stage, inputs.shape[0], inputs.shape[1]
+            )
+        layers = self.layers if stage is None else self.pipeline_layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        if stage is not None and len(cache) != len(layers):
+            raise _pipeline.PipelineContractError(
+                f"stage holds {len(layers)} layers but received {len(cache)} "
+                "cache entries; stage caches are local"
+            )
 
-        fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
-        if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
+        fa_mask = (
+            None
+            if self.fa_idx is None
+            else _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
+        )
+        ssm_mask = (
+            None
+            if self.ssm_idx is None
+            else _recurrent_row_mask(hidden_states, cache[self.ssm_idx])
+        )
+        if (
+            mask is not None
+            and isinstance(mask, mx.array)
+            and mask.ndim == 2
+            and self.ssm_idx is not None
+        ):
             ssm_mask = mask
 
         capture = set(capture_layer_ids or [])
+        if stage is not None and any(i >= stage.total_layers for i in capture):
+            raise _pipeline.PipelineContractError("capture layer ID exceeds the model layer count")
+        local_captures = {}
         target_verify = gdn_sink is not None
         # Each layer's tail residual write stays pending and is applied inside
         # the next hyper-connection norm; ``hidden_states`` is the residual
-        # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly).
-        defer_write = hc_fused.write_enabled()
+        # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly). A stage
+        # fixes the choice at ``pipeline()`` time because it decides the
+        # layout of the tensor crossing the stage boundary.
+        defer_write = hc_fused.write_enabled() if stage is None else stage.defer_write
         # Every layer keeps the residual's leading (batch, rows) dims.
         eager = (
-            _EAGER_DISPATCH
+            stage is None
+            and _EAGER_DISPATCH
             and hidden_states.shape[0] * hidden_states.shape[1]
             <= _EAGER_DISPATCH_MAX_ROWS
         )
-        write = None
-        for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
+        for index, (layer, layer_cache) in enumerate(zip(layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states,
@@ -3756,17 +3918,46 @@ class Qwen4ExpModel(nn.Module):
                 index < _EAGER_DISPATCH_WARMUP or index % _EAGER_DISPATCH_EVERY == 0
             ):
                 mx.async_eval(hidden_states, *(write or ()))
-            if hidden_sink is not None and index in capture:
+            global_index = index if stage is None else stage.start + index
+            if hidden_sink is not None and global_index in capture:
                 if write is None:
                     mixed = self.hyper_connection_mixer(
                         hidden_states, target_verify=target_verify
                     )
                 else:
-                    mixed, hidden_states = self.hyper_connection_mixer(
+                    mixed, _ = self.hyper_connection_mixer(
                         hidden_states, target_verify=target_verify, write=write
                     )
-                    write = None
-                hidden_sink.append(mixed)
+                if stage is None:
+                    hidden_sink.append(mixed)
+                else:
+                    local_captures[global_index] = mixed
+
+        if stage is not None and not stage.is_last:
+            # No mixer here: it closes the trunk once, after the last layer.
+            # The placeholder joins the same gather as the real output so the
+            # collective is uniform across ranks.
+            if boundary_caps:
+                # Rank zero alone consumes the captures: forward them with the
+                # activations. This stage keeps only its trailing residual.
+                carried = [*upstream, *(local_captures[i] for i in sorted(local_captures))]
+                placeholder = _pipeline.hand_off(
+                    stage, hidden_states, write, cache, captures=carried
+                )
+                hidden_sink.append(hidden_states)
+                return placeholder
+            placeholder = _pipeline.hand_off(stage, hidden_states, write, cache)
+            if hidden_sink is not None:
+                output, residual = _pipeline.gather_mtp_output(
+                    stage, placeholder, mx.zeros_like(hidden_states)
+                )
+                hidden_sink.extend(_pipeline.gather_layer_captures(
+                    stage, capture_layer_ids, local_captures, output))
+                hidden_sink.append(residual)
+                return output
+            if getattr(self, "_omlx_rank_local_output", False):
+                return placeholder
+            return _pipeline.gather_output(stage, placeholder)
 
         mixed = None
         if write is not None:
@@ -3775,7 +3966,12 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states, target_verify=target_verify, write=write
             )
 
-        if inputs_embeds is None and gdn_sink is None and not _MTP_ONE_ROW_STEP.get():
+        if (
+            stage is None
+            and inputs_embeds is None
+            and gdn_sink is None
+            and not _MTP_ONE_ROW_STEP.get()
+        ):
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
             host = host_ref() if host_ref is not None else None
             if host is not None:
@@ -3789,7 +3985,7 @@ class Qwen4ExpModel(nn.Module):
                         cache,
                     )
 
-        if hidden_sink is not None and capture_layer_ids == []:
+        if hidden_sink is not None:
             # Lightning MTP consumes all residual streams before the final
             # mixer. Ordinary layer captures retain their mixed representation.
             hidden_sink.append(hidden_states)
@@ -3798,6 +3994,27 @@ class Qwen4ExpModel(nn.Module):
             mixed = self.hyper_connection_mixer(
                 hidden_states, target_verify=target_verify
             )
+        if stage is not None:
+            # The last stage shares the final state so every rank can produce
+            # logits for the synchronized MLX-LM sampler.
+            if boundary_caps:
+                carried = [*upstream, *(local_captures[i] for i in sorted(local_captures))]
+                if len(carried) != len(set(capture_layer_ids or ())):
+                    raise _pipeline.PipelineContractError(
+                        "boundary captures do not cover every requested layer"
+                    )
+                hidden_sink[-1:] = [*carried, hidden_states]
+                return mixed
+            if hidden_sink is not None:
+                output, residual = _pipeline.gather_mtp_output(
+                    stage, mixed, hidden_states
+                )
+                hidden_sink[-1:] = [*_pipeline.gather_layer_captures(
+                    stage, capture_layer_ids, local_captures, output), residual]
+                return output
+            if getattr(self, "_omlx_rank_local_output", False):
+                return mixed
+            return _pipeline.gather_output(stage, mixed)
         return mixed
 
 
@@ -3969,13 +4186,53 @@ class LanguageModel(Qwen3_5LanguageModel):
         owner = owner_ref() if owner_ref is not None else None
         return getattr(owner, "mtp", None) if owner is not None else None
 
+    def _forward_without_attention(self, inputs, inputs_embeds, mask, cache, kwargs):
+        """Pipeline stage that holds no full-attention layer.
+
+        The inherited forward reads its rotary positions from the first
+        full-attention cache; there is none here, and only attention layers
+        consume positions, so the trunk runs without them.
+        """
+        for name in ("speculative_verify",):
+            if kwargs.get(name):
+                raise _pipeline.PipelineContractError(
+                    f"{name} is not supported on a pipeline stage"
+                )
+        hidden_sink = [] if kwargs.get("return_hidden") else None
+        out = self.model(
+            inputs,
+            inputs_embeds=inputs_embeds,
+            mask=mask,
+            cache=cache,
+            capture_layer_ids=kwargs.get("capture_layer_ids", []) if hidden_sink is not None else None,
+            hidden_sink=hidden_sink,
+        )
+        if kwargs.get("skip_logits"):
+            logits = None
+        elif self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            gdn_states=None,
+            shared_kv_states=None,
+        )
+
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+        stage = self.model.pipeline_stage
+        if stage is not None and kwargs.get("speculative_verify"):
+            raise _pipeline.PipelineContractError(
+                "speculative_verify is not supported on a pipeline stage"
+            )
         return_hidden = bool(kwargs.get("return_hidden", False))
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
         one_row_step = (
             mtp_capture
+            and stage is None
             and not _ONE_ROW_MTP_DECODE_DISABLED
             and inputs_embeds is None
             and tuple(inputs.shape) == (1, 1)
@@ -3984,14 +4241,23 @@ class LanguageModel(Qwen3_5LanguageModel):
         )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if mtp_capture and not one_row_step
+            if return_hidden and not one_row_step and not kwargs.pop("_omlx_capture_only", False)
             else None
         )
         step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None
         try:
-            output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+            if stage is not None and self.model.fa_idx is None:
+                output = self._forward_without_attention(
+                    inputs, inputs_embeds, mask, cache, kwargs
+                )
+            else:
+                output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if mtp_capture and output.hidden_states:
                 output.hidden_states = [output.hidden_states[0]]
+            if return_hidden and not mtp_capture and (stage is None or self.model.fa_idx is not None):
+                # The inherited wrapper appends the mixed output; this model
+                # already appended its pre-mixer residual after layer captures.
+                output.hidden_states = output.hidden_states[:-1]
             output.gdn_states = transaction
             return output
         except BaseException:
@@ -4006,7 +4272,11 @@ class LanguageModel(Qwen3_5LanguageModel):
         """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
         for layer in self.model.layers:
             ple = getattr(layer, "ple", None)
-            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+            if (
+                ple is not None
+                and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None)
+                is not None
+            ):
                 return True
         return False
 
@@ -4028,7 +4298,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             embedding.prefetch(next_ids, history[:, -embedding.context_len :])
             if not getattr(self, "_ple_lookahead_logged", False):
                 self._ple_lookahead_logged = True
-                logger.info("PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk")
+                logger.info(
+                    "PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk"
+                )
 
     def mtp_forward(
         self,
@@ -4037,6 +4309,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        skip_logits: bool = False,
     ):
         mtp = self.get_mtp_module()
         if mtp is None:
@@ -4052,7 +4325,14 @@ class LanguageModel(Qwen3_5LanguageModel):
         logits_source = mtp_output
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
+        if skip_logits:
+            # The head and its cache must finish even without a vocabulary projection.
+            mx.eval(mtp_output, hc_hidden)
+            logits = mx.zeros(
+                (*logits_source.shape[:-1], self.args.vocab_size),
+                dtype=logits_source.dtype,
+            )
+        elif self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
         else:
             logits = self.lm_head(logits_source)
@@ -4071,9 +4351,21 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def make_cache(self):
         caches = []
-        for layer in self.layers:
+        # Local layers only: on a pipeline stage ``layers`` is padded with None
+        # up to the stage start, and the cache list is indexed by local layer.
+        for layer in self.model.pipeline_layers:
             if layer.is_linear:
-                caches.append(ArraysCache(size=4 if "ple" in layer else 2))
+                cache = ArraysCache(size=4 if "ple" in layer else 2)
+                if "ple" in layer:
+                    embedding = layer.ple.ple_embedding
+                    # Merging an empty row with a populated cache zero-fills
+                    # absent slots. PLE history starts with EOS, never padding 0.
+                    cache[3] = mx.full(
+                        (1, embedding.context_len),
+                        embedding.eos_token_id,
+                        dtype=mx.int64,
+                    )
+                caches.append(cache)
             else:
                 caches.append(QSAKVCache())
         return caches
@@ -4107,27 +4399,27 @@ class LanguageModel(Qwen3_5LanguageModel):
     @staticmethod
     def _restore_ple_state(cache, snapshot, accepted_values):
         batch = snapshot.input_ids.shape[0]
-        values = accepted_values * batch if len(accepted_values) == 1 else accepted_values
+        values = (
+            accepted_values * batch if len(accepted_values) == 1 else accepted_values
+        )
         accepted_array = mx.array(values, dtype=mx.int32)
         retained = accepted_array + 1
 
         history_len = snapshot.history.shape[1]
         history = mx.concatenate([snapshot.history, snapshot.input_ids], axis=1)
-        history_positions = retained[:, None] + mx.arange(
-            history_len, dtype=mx.int32
-        )[None, :]
-        cache[3] = mx.contiguous(
-            mx.take_along_axis(history, history_positions, axis=1)
+        history_positions = (
+            retained[:, None] + mx.arange(history_len, dtype=mx.int32)[None, :]
         )
+        cache[3] = mx.contiguous(mx.take_along_axis(history, history_positions, axis=1))
 
         state_len = snapshot.conv_state.shape[1]
         if state_len:
             conv_input = mx.concatenate(
                 [snapshot.conv_state, snapshot.conv_inputs], axis=1
             )
-            conv_positions = retained[:, None] + mx.arange(
-                state_len, dtype=mx.int32
-            )[None, :]
+            conv_positions = (
+                retained[:, None] + mx.arange(state_len, dtype=mx.int32)[None, :]
+            )
             conv_positions = mx.broadcast_to(
                 conv_positions[..., None],
                 (batch, state_len, snapshot.conv_state.shape[-1]),
@@ -4139,6 +4431,14 @@ class LanguageModel(Qwen3_5LanguageModel):
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
         """Restore PLE state to the accepted prefix after inherited rollback."""
         accepted_values = self._normalize_accepted_counts(accepted)
+        if self.model.pipeline_stage is not None:
+            try:
+                accepted_values = _pipeline.agree_accepted(accepted_values, block_size)
+            except _pipeline.PipelineContractError:
+                if gdn_states is not None:
+                    gdn_states.abort()
+                self._discard_ple_snapshots(caches)
+                raise
 
         pending = []
         try:
@@ -4149,7 +4449,7 @@ class LanguageModel(Qwen3_5LanguageModel):
                 self._validate_ple_snapshot(snapshot, accepted_values)
                 pending.append((cache, snapshot))
             result = super().rollback_speculative_cache(
-                caches, gdn_states, accepted, block_size
+                caches, gdn_states, accepted_values, block_size
             )
             for cache, snapshot in pending:
                 self._restore_ple_state(cache, snapshot, accepted_values)

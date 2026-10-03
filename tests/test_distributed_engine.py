@@ -104,7 +104,8 @@ async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
         requests.append(request)
         return httpx.Response(
             200,
-            json={"status": "ok", "rank": 0, "ssd_deleted": 3, "hot_cleared": 0},
+            json={"status": "ok", "rank": 0, "ssd_deleted": 3, "hot_cleared": 0,
+                  "capture_ssd_deleted": 2, "capture_hot_cleared": 0},
         )
 
     remote_calls = []
@@ -127,6 +128,8 @@ async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
         await engine._client.aclose()
 
     assert result["ssd_deleted"] == 8
+    assert result["capture_ssd_deleted"] == 2
+    assert result["capture_hot_cleared"] == 0
     assert len(result["ranks"]) == 2
     assert requests[0].url.path == "/omlx/internal/cache/ssd/clear"
     assert requests[0].headers["X-oMLX-Plan-Hash"] == "d" * 64

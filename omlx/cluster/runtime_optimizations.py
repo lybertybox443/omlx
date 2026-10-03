@@ -8,7 +8,7 @@ import inspect
 import math
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +38,8 @@ def _supports_coordinator_sampling(
         return False, "requires more than one pipeline rank"
     if not batchable:
         return False, "model is not compatible with MLX-LM continuous batching"
+    if callable(getattr(pipeline_model, "coordinator_output", None)):
+        return True, "explicit scoped rank-local output contract"
     call = type(pipeline_model).__dict__.get("__call__")
     if not callable(call):
         return False, "pipeline model has no callable forward path"
@@ -219,6 +221,7 @@ def install_runtime_optimizations(
     *,
     batchable: bool,
     pipeline_parallel: bool = True,
+    runtime_options: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, dict[str, Any]]]:
     """Install opt-in token-only output while reporting every capability."""
 
@@ -236,6 +239,33 @@ def install_runtime_optimizations(
     if not pipeline_parallel:
         sampling_supported = False
         sampling_reason = "pure tensor parallelism keeps MLX-LM's synchronized sampler"
+    native_output = getattr(pipeline_model, "coordinator_output", None)
+    native_output = native_output if callable(native_output) else None
+    boundary_capture = getattr(pipeline_model, "boundary_capture_output", None)
+    # Opt-in: capture-bearing prefill overlaps by carrying captures on stage sends.
+    async_capture = bool(
+        (runtime_options or {}).get("dflash_async_prefill") and callable(boundary_capture)
+    )
+    native_prefill = bool(
+        native_output
+        and sampling_supported
+    )
+    if native_output and (
+        any(
+            (runtime_options or {}).get(key)
+            for key in (
+                "mtp_enabled",
+                "vlm_mtp_enabled",
+                "dflash_enabled",
+                "specprefill_draft_model",
+            )
+        )
+        or getattr(
+            getattr(model, "language_model", None), "_omlx_mtp_decode_enabled", False
+        )
+    ):
+        sampling_supported = False
+        sampling_reason = "speculative/sparse decoding retains shared output contract"
     generation_batch_cls = getattr(mlx_generate, "GenerationBatch", None)
     prompt_batch_cls = getattr(mlx_generate, "PromptProcessingBatch", None)
     native_async = (
@@ -253,15 +283,23 @@ def install_runtime_optimizations(
         output_vocab_size,
         rank_zero_logits_reason,
     ) = _supports_rank_zero_logits(model)
-    if execution.sampling_rank_only and pipeline_parallel and world_size > 1:
+    if (
+        (execution.sampling_rank_only or (execution.async_overlap and native_output))
+        and pipeline_parallel
+        and world_size > 1
+    ):
         agreed = _agree_across_ranks(
             group,
             {
                 "prompt": prompt_supported,
                 "rank_zero_logits": rank_zero_logits_supported,
                 "sampling": sampling_supported,
+                "prefill_output": native_prefill,
+                "capture_prefill": async_capture,
             },
         )
+        async_capture = async_capture and agreed["capture_prefill"]
+        native_prefill = native_prefill and agreed["prefill_output"]
         if sampling_supported and not agreed["sampling"]:
             sampling_supported = False
             sampling_reason = (
@@ -279,11 +317,12 @@ def install_runtime_optimizations(
     rank_zero_logits_active = sampling_active and rank_zero_logits_supported
     prefill_active = (
         execution.async_overlap
-        and sampling_active
+        and (native_prefill if native_output else sampling_active)
         and prompt_supported
         and pipeline_parallel
         and execution.prefill_step_size > 1
     )
+    async_capture = async_capture and prefill_active
     batching_enabled = execution.pipeline_microbatch_size > 1
     batching_active = batching_enabled and batchable
     capabilities = {
@@ -335,14 +374,15 @@ def install_runtime_optimizations(
             ),
         ),
         "pipeline_prefill_overlap": _capability(
-            enabled=execution.async_overlap and execution.sampling_rank_only,
+            enabled=execution.async_overlap
+            and (execution.sampling_rank_only or bool(native_output)),
             active=prefill_active,
             reason=(
                 prompt_reason
                 if prefill_active
                 else (
                     prompt_reason
-                    if sampling_active
+                    if sampling_active or native_output
                     else (
                         "requires the validated rank-zero sampling path; this model "
                         "keeps MLX-LM's synchronized prefill"
@@ -351,7 +391,16 @@ def install_runtime_optimizations(
             ),
         ),
     }
-    if not sampling_active:
+    capabilities["dflash_async_prefill"] = _capability(
+        enabled=bool((runtime_options or {}).get("dflash_async_prefill")),
+        active=async_capture,
+        reason=(
+            "DFlash layer captures travel on the stage boundary sends"
+            if async_capture
+            else "experimental option is off or its prerequisites are not met"
+        ),
+    )
+    if not sampling_active and not prefill_active:
         yield capabilities
         return
 
@@ -403,9 +452,43 @@ def install_runtime_optimizations(
         for value, args, kwargs in pending:
             sent = original_send(value, *args, **kwargs)
             mx.async_eval(sent)
+            inflight = local_state.inflight_prefill_sends
+            inflight.append(sent)
+            # One previous chunk may overlap current computation. Bound the
+            # retained activation buffers instead of queuing an entire prompt.
+            if len(inflight) > 1:
+                mx.eval(inflight.pop(0))
+
+    @contextmanager
+    def prefill_transport():
+        """Reuse bounded transport for callers that own their prompt positions."""
+        local_state.pending_prefill_sends = []
+        local_state.inflight_prefill_sends = []
+
+        def forward(callback, *args, **kwargs):
+            local_state.queue_prefill_sends = True
+            try:
+                result = callback(*args, **kwargs)
+            finally:
+                local_state.queue_prefill_sends = False
+            flush_prefill_sends()
+            return result
+
+        try:
+            yield forward
+            mx.eval(local_state.inflight_prefill_sends)
+        finally:
+            local_state.pending_prefill_sends = []
+            local_state.inflight_prefill_sends = []
+            local_state.queue_prefill_sends = False
 
     def staggered_pipeline_prompt(instance: Any, tokens: list[list[int]]) -> None:
         """Pinned PromptProcessingBatch.prompt with pipeline fill/drain."""
+        capturing = callable(getattr(instance.model, "_omlx_dflash_prefill_capture", None))
+        if capturing and not async_capture:
+            # Hidden captures perform collectives before a queued send can flush.
+            # Use the synchronous prefill contract for capture-bearing chunks.
+            return original_prompt(instance, tokens)
 
         if len(instance.uids) != len(tokens):
             raise ValueError("The batch length doesn't match the number of inputs")
@@ -448,22 +531,40 @@ def install_runtime_optimizations(
             world_size=world_size,
         )
         local_state.pending_prefill_sends = []
+        local_state.inflight_prefill_sends = []
         try:
             for slot in schedule:
                 if not slot.is_real:
                     continue
                 local_state.queue_prefill_sends = True
                 try:
-                    instance.model(
-                        tokens_array[:, slot.start : slot.end],
-                        cache=instance.prompt_cache,
-                    )
+                    with ExitStack() as scopes:
+                        if native_output:
+                            scopes.enter_context(native_output())
+                        if capturing:
+                            # No collective inside the chunk: captures follow the sends.
+                            scopes.enter_context(boundary_capture())
+                        instance.model(
+                            tokens_array[:, slot.start : slot.end],
+                            cache=instance.prompt_cache,
+                            **(
+                                {"skip_logits": True}
+                                if native_output and rank_zero_logits_supported
+                                else {}
+                            ),
+                        )
                 finally:
                     local_state.queue_prefill_sends = False
                 flush_prefill_sends()
                 mx.eval([cache.state for cache in instance.prompt_cache])
                 mx.clear_cache()
+            # No outstanding prefill transport may enter the decode phase.
+            mx.eval(local_state.inflight_prefill_sends)
+            after_prefill = getattr(instance.model, "finish_pipeline_prefill", None)
+            if callable(after_prefill):
+                after_prefill(instance.prompt_cache)
         finally:
+            local_state.inflight_prefill_sends = []
             local_state.queue_prefill_sends = False
             # A cancelled/failed prefill must never leak an old activation into
             # the next request.
@@ -475,7 +576,7 @@ def install_runtime_optimizations(
             mx.eval([cache.state for cache in instance.prompt_cache])
             mx.clear_cache()
 
-    def coordinator_generation_step(instance: Any) -> Any:
+    def run_coordinator_generation_step(instance: Any) -> Any:
         """Pinned GenerationBatch._step with one token collective per batch."""
 
         instance._current_tokens = instance._next_tokens
@@ -562,15 +663,31 @@ def install_runtime_optimizations(
             sequence_tokens.append(token)
         return input_values, instance._current_logprobs
 
+    def coordinator_generation_step(instance: Any) -> Any:
+        if native_output is not None:
+            with native_output():
+                return run_coordinator_generation_step(instance)
+        return run_coordinator_generation_step(instance)
+
+    previous_transport = getattr(model, "_omlx_prefill_transport", None)
+    if prefill_active and native_output:
+        object.__setattr__(model, "_omlx_prefill_transport", prefill_transport)
     mx.distributed.all_gather = selective_all_gather
     mx.distributed.send = queued_pipeline_send
-    type(pipeline_model).__call__ = local_pipeline_output
-    mlx_generate.GenerationBatch._step = coordinator_generation_step
+    if native_output is None:
+        type(pipeline_model).__call__ = local_pipeline_output
+    if sampling_active:
+        mlx_generate.GenerationBatch._step = coordinator_generation_step
     if prefill_active:
         mlx_generate.PromptProcessingBatch.prompt = staggered_pipeline_prompt
     try:
         yield capabilities
     finally:
+        if prefill_active and native_output:
+            if previous_transport is None:
+                object.__delattr__(model, "_omlx_prefill_transport")
+            else:
+                object.__setattr__(model, "_omlx_prefill_transport", previous_transport)
         if original_prompt is not None:
             mlx_generate.PromptProcessingBatch.prompt = original_prompt
         mlx_generate.GenerationBatch._step = original_generation_step
