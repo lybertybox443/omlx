@@ -22,14 +22,15 @@ pytestmark = pytest.mark.skipif(
 EP = 3
 
 
-def _stage_ranges(checkpoint, stages):
+def _stage_ranges(checkpoint, stages, tp=1):
     cfg = json.loads((checkpoint / "config.json").read_text())
     layers = cfg["text_config"]["num_hidden_layers"]
+    width = EP * tp
     if stages == 1:
-        return [(0, layers)] * EP
+        return [(0, layers)] * width
     half = layers // 2
-    # reversed: later half first, then earlier half, each span repeated EP times
-    return [(half, layers)] * EP + [(0, half)] * EP
+    # Later layers first; repeat each span for every TP/EP member.
+    return [(half, layers)] * width + [(0, half)] * width
 
 
 @pytest.mark.parametrize("stages", [1, 2])
@@ -81,8 +82,9 @@ def test_native_mtp_expert_cohort_matches_ordinary(
 
 @pytest.mark.parametrize("stages", [1, 2])
 @pytest.mark.parametrize("draft", ["external", "dflash", "ddtree"])
+@pytest.mark.parametrize("tp", [1, 2], ids=["tp1", "tp2"])
 def test_external_expert_cohort_matches_ordinary(
-    tmp_path, mtp_checkpoint, dflash_checkpoint, stages, draft
+    tmp_path, mtp_checkpoint, dflash_checkpoint, stages, draft, tp
 ):
     from types import SimpleNamespace
     from omlx.cluster.dflash import runtime_settings as dflash_settings
@@ -92,11 +94,11 @@ def test_external_expert_cohort_matches_ordinary(
         inspect_head, runtime_settings as external_settings,
     )
 
-    ranges = _stage_ranges(mtp_checkpoint, stages)
+    ranges = _stage_ranges(mtp_checkpoint, stages, tp)
     prompts = [PROMPTS[0], PROMPTS[1] + " w23 w24 w25"]
     baseline_dir = tmp_path / "baseline"
     baseline_dir.mkdir()
-    with served(mtp_checkpoint, ranges, baseline_dir,
+    with served(mtp_checkpoint, _stage_ranges(mtp_checkpoint, stages), baseline_dir,
                 expert_parallel_size=EP) as server:
         expected = [_content(server.chat(p, max_tokens=16, timeout=30))
                     for p in prompts]
@@ -124,6 +126,7 @@ def test_external_expert_cohort_matches_ordinary(
         options.update(dflash_reserved_bytes=reserve.total_bytes,
                        dflash_max_prompt_tokens=1024)
     with served(mtp_checkpoint, ranges, tmp_path, expert_parallel_size=EP,
+                tensor_parallel_size=tp,
                 extra_runtime_options=options, prefill_step_size=2,
                 trace_native_mtp=draft == "external",
                 trace_dflash_draft=draft != "external",
