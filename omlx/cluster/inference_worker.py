@@ -1520,6 +1520,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     tensor_parallel_size=tensor_parallel_size,
                 )
             )
+            provider._omlx_world_group = group
             if wiring.hybrid:
                 provider.pipeline_group = wiring.topology.pipeline_group
                 provider.tensor_group = wiring.topology.tensor_group
