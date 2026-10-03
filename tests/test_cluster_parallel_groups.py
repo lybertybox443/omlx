@@ -98,6 +98,51 @@ def test_malformed_rejected_before_split(tp, p):
     assert log == []
 
 
+def eplan(size, ep, **over):
+    p = plan(size, ep)
+    for a in p:
+        a.expert_parallel_size, a.expert_parallel_rank = ep, a.rank % ep
+        a.tensor_parallel_size, a.tensor_parallel_rank = 1, 0
+    for k, v in over.items():
+        setattr(p[-1], k, v)
+    return p
+
+
+def test_ep_pure_no_split():
+    log = []
+    r = build_parallel_groups(make(2, 1, 2, log), 1, eplan(2, 2), expert_parallel_size=2)
+    assert r.expert_group.rank() == 1 and r.expert_size == 2 and r.expert_rank == 1
+    assert r.tensor_group is None and r.pipeline_group is None and (r.tp_rank, r.tp_size) == (0, 1)
+    assert log == []
+
+
+def test_ep_pp_split_order():
+    for rank in range(4):
+        log = []
+        r = build_parallel_groups(make(4, rank, 2, log), 1, eplan(4, 2), expert_parallel_size=2)
+        assert log == [(rank, rank // 2, rank % 2), (rank, rank % 2, rank // 2)]
+        assert r.expert_group.size() == 2 and r.pipeline_group.size() == 2
+        assert (r.stage, r.stages, r.expert_rank, r.tensor_group) == (rank // 2, 2, rank % 2, None)
+
+
+def test_tp_ep_rejected_before_split():
+    log = []
+    with pytest.raises(ParallelGroupError):
+        build_parallel_groups(make(4, 0, 2, log), 2, expert_parallel_size=2)
+    assert log == []
+
+
+@pytest.mark.parametrize("over", [
+    {"expert_parallel_size": 1}, {"expert_parallel_rank": 0},
+    {"tensor_parallel_size": 2}, {"tensor_parallel_rank": 1}, {"end_layer": 3},
+])
+def test_ep_assignment_rejected(over):
+    log = []
+    with pytest.raises(ParallelGroupError):
+        build_parallel_groups(make(4, 0, 2, log), 1, eplan(4, 2, **over), expert_parallel_size=2)
+    assert log == []
+
+
 def test_split_unsupported_and_mismatch():
     w = NS(size=lambda: 4, rank=lambda: 0)
     with pytest.raises(ParallelGroupError, match="unsupported"):

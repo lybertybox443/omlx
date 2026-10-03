@@ -20,13 +20,22 @@ class ParallelGroups:
     tp_rank: int
     stages: int
     tp_size: int
+    expert_group: Optional[Any] = None
+    expert_rank: int = 0
+    expert_size: int = 1
 
 
-def _validate(world_size, rank, tp, assignments) -> None:
+def _validate(world_size, rank, tp, assignments, ep=1) -> None:
     if isinstance(tp, bool) or not isinstance(tp, int) or tp < 1:
         raise ParallelGroupError(f"tensor_parallel_size must be a positive int, got {tp!r}")
+    if isinstance(ep, bool) or not isinstance(ep, int) or ep < 1:
+        raise ParallelGroupError(f"expert_parallel_size must be a positive int, got {ep!r}")
+    if tp > 1 and ep > 1:
+        raise ParallelGroupError("tensor_parallel_size > 1 with expert_parallel_size > 1 unsupported")
+    axis = "expert" if ep > 1 else "tensor"
+    tp = max(tp, ep)  # tp now means stage width on the active axis
     if world_size < 1 or world_size % tp:
-        raise ParallelGroupError(f"world size {world_size} not divisible by tensor_parallel_size {tp}")
+        raise ParallelGroupError(f"world size {world_size} not divisible by {axis}_parallel_size {tp}")
     if not 0 <= rank < world_size:
         raise ParallelGroupError(f"rank {rank} outside world size {world_size}")
     if assignments is None:
@@ -42,7 +51,13 @@ def _validate(world_size, rank, tp, assignments) -> None:
             r = stage * tp + i
             if a.rank != r:
                 raise ParallelGroupError(f"assignment {r} has rank {a.rank}")
-            if a.tensor_parallel_size != tp or a.tensor_parallel_rank != i:
+            if axis == "expert":
+                if (getattr(a, "expert_parallel_size", None) != tp
+                        or getattr(a, "expert_parallel_rank", None) != i
+                        or getattr(a, "tensor_parallel_size", 1) != 1
+                        or getattr(a, "tensor_parallel_rank", 0) != 0):
+                    raise ParallelGroupError(f"rank {r} expert-parallel metadata disagrees with plan")
+            elif a.tensor_parallel_size != tp or a.tensor_parallel_rank != i:
                 raise ParallelGroupError(f"rank {r} tensor-parallel metadata disagrees with plan")
             if (a.start_layer, a.end_layer) != (row[0].start_layer, row[0].end_layer):
                 raise ParallelGroupError(f"stage {stage} ranks disagree on layer range")
@@ -68,10 +83,21 @@ def build_parallel_groups(
     world_group: Any,
     tensor_parallel_size: int,
     assignments: Optional[Sequence[Any]] = None,
+    *,
+    expert_parallel_size: int = 1,
 ) -> ParallelGroups:
     world_size, rank = world_group.size(), world_group.rank()
+    ep = expert_parallel_size
+    _validate(world_size, rank, tensor_parallel_size, assignments, ep)
+    if ep > 1:
+        stages, stage, er = world_size // ep, rank // ep, rank % ep
+        if stages == 1:
+            pipe, exp = None, world_group
+        else:
+            exp = _split(world_group, stage, er, ep, er, "expert")
+            pipe = _split(world_group, er, stage, stages, stage, "pipeline")
+        return ParallelGroups(world_group, pipe, None, rank, stage, 0, stages, 1, exp, er, ep)
     tp = tensor_parallel_size
-    _validate(world_size, rank, tp, assignments)
     stages, stage, tp_rank = world_size // tp, rank // tp, rank % tp
     if tp == 1:
         pipe, tens = world_group, None

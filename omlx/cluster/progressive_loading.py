@@ -323,12 +323,15 @@ def install_progressive_loader(
     server_module: Any,
     *,
     progress: ProgressCallback | None = None,
+    expert_group: Any = None,
 ) -> Any:
     """Install the loader only around ``ModelProvider.load_default()``."""
 
     original = server_module.sharded_load
 
     def load(*args: Any, **kwargs: Any) -> Any:
+        if expert_group is not None:
+            kwargs.setdefault("expert_group", expert_group)
         return progressive_sharded_load(*args, **kwargs, progress=progress)
 
     server_module.sharded_load = load

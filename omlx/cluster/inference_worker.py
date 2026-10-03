@@ -1280,6 +1280,7 @@ def _build_worker_topology(
     stage_links: Sequence[Any],
     *,
     build: Any = None,
+    expert_parallel_size: int = 1,
 ) -> SimpleNamespace:
     """Build the group topology once; hybrid PP x TP gets column translation.
 
@@ -1292,21 +1293,25 @@ def _build_worker_topology(
     from .parallel_groups import build_parallel_groups
 
     tp = tensor_parallel_size
-    hybrid = tp > 1 and group.size() // tp > 1
+    ep = expert_parallel_size
+    width = max(tp, ep)
+    hybrid = width > 1 and group.size() // width > 1
+    member = group.rank() % width
     links = (
         pipeline_stage_links(
             stage_links,
-            tp_size=tp,
-            tp_rank=group.rank() % tp,
+            tp_size=width,
+            tp_rank=member,
             world_size=group.size(),
         )
         if hybrid
         else stage_links
     )
-    topology = (build or build_parallel_groups)(group, tp, assignments)
+    kwargs = {"expert_parallel_size": ep} if ep > 1 else {}
+    topology = (build or build_parallel_groups)(group, tp, assignments, **kwargs)
     column = (
         [
-            dataclasses.replace(assignments[s * tp + topology.tp_rank], rank=s)
+            dataclasses.replace(assignments[s * width + member], rank=s)
             for s in range(topology.stages)
         ]
         if hybrid
@@ -1318,7 +1323,12 @@ def _build_worker_topology(
         column_assignments=column,
         stage_assignment=column[topology.stage] if hybrid else None,
         pipeline_group=topology.pipeline_group if hybrid else group,
-        runtime_group=topology.pipeline_group or topology.tensor_group or group,
+        runtime_group=(
+            topology.pipeline_group
+            or getattr(topology, "expert_group", None)
+            or topology.tensor_group
+            or group
+        ),
         pipeline_parallel=topology.stages > 1,
         stage_links=links,
     )
@@ -1348,6 +1358,9 @@ def run_worker(args: argparse.Namespace) -> int:
     plan_hash, assignments, performance_profiles, tensor_parallel_size = (
         decode_worker_contract(args.plan)
     )
+    from .deployment import decode_worker_expert_parallel_size
+
+    expert_parallel_size = decode_worker_expert_parallel_size(args.plan)
     runtime_options = decode_worker_runtime_options(args.plan)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
@@ -1373,7 +1386,15 @@ def run_worker(args: argparse.Namespace) -> int:
         raise RuntimeError("worker plan hash does not match launch contract")
     stage_link_specs = decode_worker_stage_links(args.plan)
     wiring = _build_worker_topology(
-        group, assignments, tensor_parallel_size, stage_link_specs
+        group,
+        assignments,
+        tensor_parallel_size,
+        stage_link_specs,
+        **(
+            {"expert_parallel_size": expert_parallel_size}
+            if expert_parallel_size > 1
+            else {}
+        ),
     )
 
     # Cluster v2: a deployment may give each node its own absolute model path.
@@ -1510,6 +1531,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 safety=manual_safety,
                 assignment_honored=(
                     tensor_parallel_size > 1
+                    or expert_parallel_size > 1
                     or pipeline_assignment_is_honored(args.model)
                 ),
             )
@@ -1521,7 +1543,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 )
             )
             provider._omlx_world_group = group
-            if wiring.hybrid:
+            if expert_parallel_size > 1 or wiring.hybrid:
                 provider.pipeline_group = wiring.topology.pipeline_group
                 provider.tensor_group = wiring.topology.tensor_group
             # Load synchronously on every rank so a "ready" event means the
@@ -1544,6 +1566,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 ),
                 install_progressive_loader(
                     mlx_server,
+                    expert_group=getattr(wiring.topology, "expert_group", None),
                     progress=lambda progress: marker.update(
                         "loading",
                         load_stage=progress.get("phase", "materializing_layers"),

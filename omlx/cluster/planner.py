@@ -121,8 +121,48 @@ class ModelLayout:
     kv_cache_step: int = 1
     # Per-layer bytes every TP member holds whole (not sharded). Empty = none.
     layer_tp_replicated_bytes: tuple[int, ...] = ()
+    # Verified expert-axis inventory per layer. All three empty = unverified.
+    layer_expert_counts: tuple[int, ...] = ()
+    layer_routed_expert_bytes: tuple[int, ...] = ()
+    layer_shared_expert_bytes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        inventory = tuple(
+            tuple(v)
+            for v in (
+                self.layer_expert_counts,
+                self.layer_routed_expert_bytes,
+                self.layer_shared_expert_bytes,
+            )
+        )
+        for name, values in zip(
+            ("layer_expert_counts", "layer_routed_expert_bytes",
+             "layer_shared_expert_bytes"),
+            inventory,
+        ):
+            object.__setattr__(self, name, values)
+        if any(inventory):
+            counts, routed_b, shared_b = inventory
+            if not (len(counts) == len(routed_b) == len(shared_b)
+                    == len(self.layer_weight_bytes)) or any(
+                isinstance(v, bool) or not isinstance(v, int) or v < 0
+                for values in inventory for v in values
+            ):
+                raise ValueError(
+                    "expert inventory must be aligned non-negative integers"
+                )
+            for n, r, s, total in zip(
+                counts, routed_b, shared_b, self.layer_weight_bytes
+            ):
+                if r + s > total:
+                    raise ValueError("expert bytes exceed layer weight bytes")
+                if n == 0 and (r or s):
+                    raise ValueError("dense layer cannot carry expert bytes")
+                if n > 0 and (r <= 0 or r % n):
+                    raise ValueError(
+                        "routed expert bytes must be positive and divisible "
+                        "by expert count"
+                    )
         replicated = tuple(self.layer_tp_replicated_bytes)
         object.__setattr__(self, "layer_tp_replicated_bytes", replicated)
         if replicated:
@@ -219,6 +259,12 @@ class ModelLayout:
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
             **({"layer_tp_replicated_bytes": list(self.layer_tp_replicated_bytes)}
                if self.layer_tp_replicated_bytes else {}),
+            **({"layer_expert_counts": list(self.layer_expert_counts)}
+               if self.layer_expert_counts else {}),
+            **({"layer_routed_expert_bytes": list(self.layer_routed_expert_bytes)}
+               if self.layer_routed_expert_bytes else {}),
+            **({"layer_shared_expert_bytes": list(self.layer_shared_expert_bytes)}
+               if self.layer_shared_expert_bytes else {}),
             **({"layer_kv_bytes_per_token": list(self.layer_kv_bytes_per_token),
                 "layer_kv_fixed_bytes": list(self.layer_kv_fixed_bytes),
                 "kv_cache_step": self.kv_cache_step} if self.layer_kv_bytes_per_token else {}),
@@ -264,6 +310,13 @@ class ModelLayout:
                 kv_cache_step=payload.get("kv_cache_step", 1),
                 layer_tp_replicated_bytes=tuple(
                     payload.get("layer_tp_replicated_bytes", ())
+                ),
+                layer_expert_counts=tuple(payload.get("layer_expert_counts", ())),
+                layer_routed_expert_bytes=tuple(
+                    payload.get("layer_routed_expert_bytes", ())
+                ),
+                layer_shared_expert_bytes=tuple(
+                    payload.get("layer_shared_expert_bytes", ())
                 ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
@@ -407,12 +460,24 @@ class PipelineAssignment:
 
     # Resident auxiliary models/caches, separate from the OS safety reserve.
     runtime_reserve_bytes: int = 0
+    expert_parallel_rank: int = 0
+    expert_parallel_size: int = 1
 
     def __post_init__(self) -> None:
         if (isinstance(self.runtime_reserve_bytes, bool)
                 or not isinstance(self.runtime_reserve_bytes, int)
                 or self.runtime_reserve_bytes < 0):
             raise ValueError("runtime_reserve_bytes must be a non-negative integer")
+        for name in ("expert_parallel_rank", "expert_parallel_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if self.expert_parallel_size < 1:
+            raise ValueError("expert_parallel_size must be >= 1")
+        if not 0 <= self.expert_parallel_rank < self.expert_parallel_size:
+            raise ValueError("expert_parallel_rank must be in [0, expert_parallel_size)")
+        if self.tensor_parallel_size > 1 and self.expert_parallel_size > 1:
+            raise ValueError("tensor parallel + expert parallel is not yet implemented")
         # Normalised on the way in, not read leniently on the way out: this
         # object is decoded from a command line on a machine that will size its
         # own admission from it, and a role that arrives misspelled must fail
@@ -474,6 +539,9 @@ class PipelineAssignment:
             result["predicted_compute_seconds"] = self.predicted_compute_seconds
             result["predicted_send_seconds"] = self.predicted_send_seconds
             result["predicted_stage_seconds"] = self.predicted_stage_seconds
+        if self.expert_parallel_size > 1:
+            result["expert_parallel_rank"] = self.expert_parallel_rank
+            result["expert_parallel_size"] = self.expert_parallel_size
         return result
 
 
@@ -497,6 +565,13 @@ class ShardPlan:
     # is deliberately excluded from ``plan_hash``. Empty means every node
     # loads the shared coordinator path — the legacy behavior.
     path_map: dict[str, str] = field(default_factory=dict)
+    expert_parallel_size: int = 1
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.expert_parallel_size, bool)
+                or not isinstance(self.expert_parallel_size, int)
+                or self.expert_parallel_size < 1):
+            raise ValueError("expert_parallel_size must be an integer >= 1")
 
     @property
     def max_context_tokens(self) -> int:
@@ -555,6 +630,8 @@ class ShardPlan:
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_stages": self.pipeline_stages,
         }
+        if self.expert_parallel_size > 1:
+            result["expert_parallel_size"] = self.expert_parallel_size
         if self.path_map:
             result["path_map"] = dict(sorted(self.path_map.items()))
         return result
@@ -1091,6 +1168,14 @@ def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
     return tuple(files)
 
 
+import re as _re
+
+_ROUTED_EXPERT_RE = _re.compile(
+    r"\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias)$"
+)
+_SHARED_EXPERT_RE = _re.compile(r"\.mlp\.shared_expert\.[^.]+(\.[^.]+)*$")
+
+
 def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     """Read only safetensors headers and total weights by transformer layer."""
 
@@ -1101,6 +1186,8 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     fixed_bytes = 0
     layer_sizes: dict[int, int] = {}
     replicated_sizes: dict[int, int] = {}
+    # layer -> [expert counts seen, routed bytes, shared bytes, weight projs]
+    expert_info: dict[int, list] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
     config = _model_config(root)
@@ -1140,6 +1227,28 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 layer_sizes[layer_index] = (
                     layer_sizes.get(layer_index, 0) + tensor_bytes
                 )
+                routed = _ROUTED_EXPERT_RE.search(name)
+                shared = _SHARED_EXPERT_RE.search(name)
+                if routed or shared:
+                    info = expert_info.setdefault(layer_index, [set(), 0, 0, set()])
+                    if routed:
+                        shape = spec.get("shape")
+                        count = shape[0] if isinstance(shape, list) and shape else None
+                        if (
+                            not isinstance(count, int)
+                            or isinstance(count, bool)
+                            or count <= 0
+                            or tensor_bytes % count
+                        ):
+                            raise PlanningError(
+                                f"invalid expert axis for tensor {name}"
+                            )
+                        info[0].add(count)
+                        info[1] += tensor_bytes
+                        if routed.group(2) == "weight":
+                            info[3].add(routed.group(1))
+                    else:
+                        info[2] += tensor_bytes
                 if classify_tp:
                     replicated_sizes.setdefault(layer_index, 0)
                     if _qwen4_tensor_replicated(name):
@@ -1179,9 +1288,36 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
+    expert_counts: list[int] = []
+    routed_bytes: list[int] = []
+    shared_bytes: list[int] = []
+    for index in expected_indices:
+        info = expert_info.get(index)
+        if info is None:
+            expert_counts.append(0)
+            routed_bytes.append(0)
+            shared_bytes.append(0)
+            continue
+        counts, routed_total, shared_total, projections = info
+        if (
+            len(counts) != 1
+            or len(projections) != 3
+            or shared_total <= 0
+        ):
+            raise PlanningError(
+                f"inconsistent expert metadata in layer {index}"
+            )
+        expert_counts.append(next(iter(counts)))
+        routed_bytes.append(routed_total)
+        shared_bytes.append(shared_total)
+    if not any(expert_counts):
+        expert_counts, routed_bytes, shared_bytes = [], [], []
     return ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
+        layer_expert_counts=tuple(expert_counts),
+        layer_routed_expert_bytes=tuple(routed_bytes),
+        layer_shared_expert_bytes=tuple(shared_bytes),
         layer_weight_bytes=tuple(layer_sizes[index] for index in expected_indices),
         tensor_count=tensor_count,
         activation_bytes_per_token=_activation_bytes_per_token(root),

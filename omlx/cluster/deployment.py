@@ -314,6 +314,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             kv_cache_bytes=int(payload.get("kv_cache_bytes", 0)),
             kv_bytes_per_token=int(payload.get("kv_bytes_per_token", 0)),
             max_context_tokens=int(payload.get("max_context_tokens", 0)),
+            # No int() coercion: the dataclass validates strict types.
+            expert_parallel_size=payload.get("expert_parallel_size", 1),
+            expert_parallel_rank=payload.get("expert_parallel_rank", 0),
             **predicted,
         )
     except (TypeError, ValueError) as exc:
@@ -370,6 +373,7 @@ class ClusterDeployment:
     runtime_options: dict[str, Any] = field(default_factory=dict)
     # RDMA stage edges for one launch only; never stored or compared.
     stage_links: tuple[StageLink, ...] = field(default=(), compare=False)
+    expert_parallel_size: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -428,6 +432,9 @@ class ClusterDeployment:
         for rank, (host, assignment) in enumerate(zip(self.hosts, assignments)):
             if host.node_id != assignment.node_id or assignment.rank != rank:
                 raise ValueError("host order must match node IDs and pipeline ranks")
+        _validate_expert_parallel(
+            self.expert_parallel_size, self.tensor_parallel_size, assignments
+        )
         if self.performance_profiles:
             if len(self.performance_profiles) != len(self.hosts):
                 raise ValueError(
@@ -499,6 +506,12 @@ class ClusterDeployment:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        result = self._to_dict_base()
+        if self.expert_parallel_size > 1:
+            result["expert_parallel_size"] = self.expert_parallel_size
+        return result
+
+    def _to_dict_base(self) -> dict[str, Any]:
         return {
             "schema_version": DEPLOYMENT_SCHEMA_VERSION,
             "deployment_id": self.deployment_id,
@@ -564,13 +577,20 @@ class ClusterDeployment:
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
             runtime_options=_validated_runtime_options(payload.get("runtime_options")),
+            expert_parallel_size=payload.get("expert_parallel_size", 1),
         )
 
     def encode_worker_plan(self) -> str:
         """Encode the small trusted plan as a bounded command-line argument."""
 
+        plan = (
+            {"expert_parallel_size": self.expert_parallel_size}
+            if self.expert_parallel_size > 1
+            else {}
+        )
         raw = json.dumps(
-            {
+            plan
+            | {
                 "schema_version": DEPLOYMENT_SCHEMA_VERSION,
                 "plan_hash": self.plan_hash,
                 "assignments": [
@@ -668,7 +688,39 @@ def decode_worker_contract(
         raise ValueError(
             "tensor_parallel_size must be between 1 and the assignment count"
         )
+    _validate_expert_parallel(
+        payload.get("expert_parallel_size", 1), tensor_parallel_size, parsed
+    )
     return payload["plan_hash"], parsed, profiles, tensor_parallel_size
+
+
+def decode_worker_expert_parallel_size(encoded: str) -> int:
+    """Return the validated expert-parallel degree of a worker contract."""
+
+    decode_worker_contract(encoded)
+    return _decode_worker_payload(encoded).get("expert_parallel_size", 1)
+
+
+def _validate_expert_parallel(
+    size: Any, tensor_parallel_size: int, assignments: Any
+) -> None:
+    """Shared by deployment and worker so both enforce one EP contract."""
+
+    world = len(assignments)
+    if type(size) is not int or not 1 <= size <= world:
+        raise ValueError("expert_parallel_size must be between 1 and the world size")
+    if world % size != 0:
+        raise ValueError("world size must be divisible by expert_parallel_size")
+    if size > 1 and tensor_parallel_size > 1:
+        raise ValueError("tensor and expert parallelism are mutually exclusive")
+    for item in assignments:
+        if item.expert_parallel_size != size:
+            raise ValueError("assignment expert_parallel_size mismatch")
+        if size > 1 and (
+            item.expert_parallel_rank != item.rank % size
+            or item.tensor_parallel_size != 1
+        ):
+            raise ValueError("assignment expert-parallel rank mismatch")
 
 
 def _validated_runtime_options(value: Any) -> dict[str, Any]:

@@ -144,9 +144,14 @@ def attach_stage_links(
         return cleared, _report(
             "only multi-node TCP-ring deployments have a stage edge to move"
         )
-    tp = deployment.tensor_parallel_size
+    # `tp` is the active intra-stage width: TP or EP, whichever is larger.
+    tp = max(
+        deployment.tensor_parallel_size, getattr(deployment, "expert_parallel_size", 1)
+    )
     if len(deployment.hosts) <= tp:
-        return cleared, _report("tensor-parallel deployments keep MLX's collectives")
+        return cleared, _report(
+            "tensor/expert-parallel deployments keep MLX's collectives"
+        )
     status = status_reader()
     if not status.reachable:
         return cleared, _report(status.reason)
