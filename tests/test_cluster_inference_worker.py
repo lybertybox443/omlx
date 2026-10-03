@@ -285,7 +285,8 @@ def test_loaded_stage_rejects_missing_local_layer():
         _validate_loaded_stage(_model(layers=layers), _assignment())
 
 
-def test_pure_tensor_stage_accepts_an_unset_pipeline_end_index():
+@pytest.mark.parametrize("parallel", ["tensor", "expert"])
+def test_pure_parallel_stage_accepts_an_unset_pipeline_end_index(parallel):
     assignment = PipelineAssignment(
         node_id="studio",
         rank=0,
@@ -295,8 +296,7 @@ def test_pure_tensor_stage_accepts_an_unset_pipeline_end_index():
         fixed_weight_bytes=10,
         reserve_bytes=10,
         capacity_bytes=100,
-        tensor_parallel_rank=0,
-        tensor_parallel_size=2,
+        **{f"{parallel}_parallel_rank": 0, f"{parallel}_parallel_size": 2},
     )
     model = _model(start=0, end=None, layers=[object(), object(), object()])
 

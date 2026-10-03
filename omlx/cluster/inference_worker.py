@@ -935,16 +935,18 @@ def _validate_loaded_stage(
     start = getattr(pipeline_model, "start_idx", None)
     end = getattr(pipeline_model, "end_idx", None)
     layers = getattr(pipeline_model, "layers", None)
-    pure_tensor = assignment.tensor_parallel_size > 1
-    expected_complete_tensor_stage = (
-        pure_tensor
+    intra_stage_parallel = (
+        assignment.tensor_parallel_size > 1 or assignment.expert_parallel_size > 1
+    )
+    expected_complete_parallel_stage = (
+        intra_stage_parallel
         and isinstance(layers, list)
         and assignment.start_layer == 0
         and assignment.end_layer == len(layers)
         and start in (None, 0)
         and end in (None, len(layers))
     )
-    if not expected_complete_tensor_stage and (start, end) != (
+    if not expected_complete_parallel_stage and (start, end) != (
         assignment.start_layer,
         assignment.end_layer,
     ):

@@ -563,8 +563,10 @@ def _expert_env(monkeypatch, plan=("plan",)):
 def test_explicit_expert_group_never_auto_inits_or_selects_tensor(monkeypatch):
     pl, events, utils, mx, tensor_calls, applied = _expert_env(monkeypatch)
 
+    progress = []
     model, tok, cfg = pl.progressive_sharded_load(
         "repo",
+        progress=progress.append,
         expert_group=_group("ep"),
         return_config=True,
         utils_module=utils,
@@ -583,6 +585,9 @@ def test_explicit_expert_group_never_auto_inits_or_selects_tensor(monkeypatch):
     assert applied["plan"] == ["plan"]
     assert tok == "tok"
     assert cfg == {}
+    import json
+    ready = next(item for item in progress if item["phase"] == "expert_ready")
+    assert json.loads(json.dumps(ready))["strategy"] == {"moe_layers": []}
 
 
 def test_pipeline_partitions_before_expert_inspect_apply_and_eval(monkeypatch):

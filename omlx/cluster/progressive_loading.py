@@ -257,7 +257,7 @@ def progressive_sharded_load(
         gc.collect()
         mx_module.clear_cache()
         if progress is not None:
-            progress({"phase": "expert_ready", "strategy": meta})
+            progress({"phase": "expert_ready", "strategy": vars(meta)})
     if tensor_group is not None:
         # Fixed embeddings/head weights are replicated. Materialize them first;
         # each strategy then materializes, shards, evaluates and releases one

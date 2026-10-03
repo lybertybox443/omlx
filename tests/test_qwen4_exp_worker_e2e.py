@@ -123,7 +123,10 @@ def served(
     trace_capture_restore=False,
     trace_cohort=False,
     trace_image_cohort=False,
+    trace_native_mtp=False,
+    expert_parallel_size=1,
 ):
+    import os
     state = tmp_path / "state"
     port = free_port()
     argv = worker_argv_and_state(
@@ -136,6 +139,7 @@ def served(
         mtp_depth=mtp_depth,
         mtp_adaptive=mtp_adaptive,
         extra_runtime_options=extra_runtime_options,
+        expert_parallel_size=expert_parallel_size,
     )
     if prefill_step_size is not None:
         argv.extend(["--prefill-step-size", str(prefill_step_size)])
@@ -143,6 +147,22 @@ def served(
         argv.append("--prompt-cache-ssd")
     size = len(ranges)
     environment = {}
+    if trace_native_mtp:
+        injection = tmp_path / "trace-worker"
+        injection.mkdir(exist_ok=True)
+        _append_text(injection / "sitecustomize.py",
+            "import mlx.core as mx\n"
+            "from omlx.patches.mlx_lm_mtp import batch_generator as bg\n"
+            "for name in ('_mtp_next', '_mtp_batch_next'):\n"
+            "    original = getattr(bg, name)\n"
+            "    def traced(batch, *args, _original=original, **kwargs):\n"
+            "        result = _original(batch, *args, **kwargs)\n"
+            "        if result is not None and mx.distributed.init().rank() == 0:\n"
+            "            print('EP_MTP_STEP', len(batch.uids), flush=True)\n"
+            "        return result\n"
+            "    setattr(bg, name, traced)\n"
+        )
+        environment["PYTHONPATH"] = str(injection) + os.pathsep + os.environ.get("PYTHONPATH", "")
     if simulate_cutoff:
         import os
         injection = tmp_path / "cutoff-worker"
