@@ -476,8 +476,6 @@ class PipelineAssignment:
             raise ValueError("expert_parallel_size must be >= 1")
         if not 0 <= self.expert_parallel_rank < self.expert_parallel_size:
             raise ValueError("expert_parallel_rank must be in [0, expert_parallel_size)")
-        if self.tensor_parallel_size > 1 and self.expert_parallel_size > 1:
-            raise ValueError("tensor parallel + expert parallel is not yet implemented")
         # Normalised on the way in, not read leniently on the way out: this
         # object is decoded from a command line on a machine that will size its
         # own admission from it, and a role that arrives misspelled must fail

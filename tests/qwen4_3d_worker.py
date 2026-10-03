@@ -10,7 +10,8 @@ from mlx.utils import tree_flatten
 
 from omlx.cluster.parallel_groups import build_parallel_groups
 from omlx.cluster.pipeline_compat import install_pipeline_compatibility
-from omlx.cluster.planner import NodeBudget, inspect_safetensors_layout, plan_hybrid
+from omlx.cluster.planner import NodeBudget, inspect_safetensors_layout
+from omlx.cluster.expert_planner import plan_expert_parallel
 from omlx.cluster.progressive_loading import progressive_sharded_load
 from omlx.patches.mlx_lm_pipeline_index import apply_mlx_lm_pipeline_index_patch
 from omlx.patches.qwen4_exp_mlx_lm.adapter import ADAPTER
@@ -28,15 +29,18 @@ def main():
     apply_mlx_lm_pipeline_index_patch()
 
     layout = inspect_safetensors_layout(ckpt)
-    # test-only overbudget plan: supplies stage cuts, NOT a 3D memory claim
+    # Exercise the actual combined planner with generous synthetic budgets.
     nodes = [
         NodeBudget(node_id=str(i), rank=i, capacity_bytes=1 << 40, reserve_bytes=0)
-        for i in range(world.size() // ep)
+        for i in range(world.size())
     ]
-    plan = plan_hybrid(layout, nodes, tensor_parallel_size=tp, context_tokens=32)
-    top = build_parallel_groups(world, tensor_parallel_size=tp, expert_parallel_size=ep)
+    plan = plan_expert_parallel(layout, nodes, tensor_parallel_size=tp,
+                                expert_parallel_size=ep, context_tokens=32)
+    top = build_parallel_groups(world, tensor_parallel_size=tp,
+                                expert_parallel_size=ep, assignments=plan.assignments)
+    member = world.rank() % (tp * ep)
     column = [
-        dataclasses.replace(plan.assignments[s * tp + top.tp_rank], rank=s)
+        dataclasses.replace(plan.assignments[s * tp * ep + member], rank=s)
         for s in range(top.stages)
     ]
     owned = column[top.stage]
