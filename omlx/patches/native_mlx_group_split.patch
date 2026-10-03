@@ -1,0 +1,348 @@
+diff --git a/mlx/distributed/jaccl/jaccl.cpp b/mlx/distributed/jaccl/jaccl.cpp
+index 99a4ac3..945b273 100644
+--- a/mlx/distributed/jaccl/jaccl.cpp
++++ b/mlx/distributed/jaccl/jaccl.cpp
+@@ -161,7 +161,9 @@ class JACCLGroup : public GroupImpl {
+   }
+ 
+   std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
+-    throw std::runtime_error("[jaccl] Group split not supported.");
++    // Negative key: order by parent rank. Negative colors are ordinary ids.
++    auto child = group_->split(color, key < 0 ? group_->rank() : key);
++    return std::make_shared<JACCLGroup>(std::move(child));
+   }
+ 
+  private:
+diff --git a/mlx/distributed/jaccl/lib/jaccl/group.h b/mlx/distributed/jaccl/lib/jaccl/group.h
+index 603765a..5428bb5 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/group.h
++++ b/mlx/distributed/jaccl/lib/jaccl/group.h
+@@ -4,19 +4,32 @@
+ 
+ #include <cstddef>
+ #include <memory>
++#include <stdexcept>
+ 
+ namespace jaccl {
+ 
+ /**
+  * Abstract base class for a JACCL communication group.
++ *
++ * Groups must be held through shared_ptr; a split bootstraps its child over
++ * this group and keeps it alive until the bootstrap ends.
+  */
+-class Group {
++class Group : public std::enable_shared_from_this<Group> {
+  public:
+   virtual ~Group() {}
+ 
+   virtual int rank() = 0;
+   virtual int size() = 0;
+ 
++  /**
++   * Build a child from the members passing the same color (any integer,
++   * negative included), ordered by key then parent rank. Collective over this
++   * group. Throws for groups that do not support it.
++   */
++  virtual std::shared_ptr<Group> split(int color, int key) {
++    throw std::runtime_error("[jaccl] Group split not supported.");
++  }
++
+   virtual void
+   all_sum(const void* input, void* output, size_t n_bytes, int dtype) = 0;
+ 
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+index fe856fa..bfe29d7 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+@@ -4,8 +4,105 @@
+ #include "jaccl/reduction_ops.h"
+ #include "jaccl/types.h"
+ 
++#include <algorithm>
++#include <cstring>
++#include <sstream>
++
+ namespace jaccl {
+ 
++std::shared_ptr<Group> MeshGroup::split(int color, int key) {
++  // Every integer color is a real group id; nobody is excluded, so all parent
++  // ranks run the same collectives and the bootstrap cannot deadlock.
++  auto colors = side_channel_.all_gather<int>(color);
++  auto keys = side_channel_.all_gather<int>(key);
++
++  std::vector<int> members;
++  for (int r = 0; r < size_; r++) {
++    if (colors[r] == color) {
++      members.push_back(r);
++    }
++  }
++  std::stable_sort(members.begin(), members.end(), [&](int a, int b) {
++    return keys[a] != keys[b] ? keys[a] < keys[b] : a < b;
++  });
++  int child_rank =
++      std::find(members.begin(), members.end(), rank_) - members.begin();
++  int n = members.size();
++
++  // Each child wire needs a real device to every other member.
++  std::string error;
++  std::vector<std::vector<std::string>> child_devices(
++      n_wires_, std::vector<std::string>(n));
++  for (int w = 0; w < n_wires_ && error.empty(); w++) {
++    for (int i = 0; i < n; i++) {
++      int m = members[i];
++      if (m == rank_) {
++        continue;
++      }
++      if (device_names_[w][m].empty()) {
++        std::ostringstream msg;
++        msg << "[jaccl] Cannot split: rank " << rank_ << " has no device on wire "
++            << w << " to rank " << m << " of the same color.";
++        error = msg.str();
++        break;
++      }
++      child_devices[w][i] = device_names_[w][m];
++    }
++  }
++
++  // Agree across the whole parent before throwing so nobody is left blocked.
++  auto oks = side_channel_.all_gather<int>(error.empty() ? 1 : 0);
++  if (!error.empty()) {
++    throw std::runtime_error(error);
++  }
++  if (std::find(oks.begin(), oks.end(), 0) != oks.end()) {
++    throw std::runtime_error(
++        "[jaccl] Cannot split: a peer lacks a required connection.");
++  }
++
++  // The child bootstraps over the parent side channel only while it is being
++  // created (the parent is held strongly). Every child runs the same number of
++  // rounds. Afterwards the callback switches to the child's own RDMA
++  // all_gather, holding the child weakly (no cycle) and dropping the parent.
++  struct State {
++    std::shared_ptr<MeshGroup> parent;
++    std::weak_ptr<MeshGroup> child;
++    int n;
++  };
++  auto st = std::make_shared<State>();
++  st->parent = std::static_pointer_cast<MeshGroup>(shared_from_this());
++  st->n = n;
++  std::vector<int> members_copy = members;
++  AllGatherFn fn = [st, members_copy](const char* src, char* dst, size_t nb) {
++    if (auto p = st->parent) {
++      auto all = p->side_channel_.all_gather(std::vector<char>(src, src + nb));
++      for (size_t i = 0; i < members_copy.size(); i++) {
++        auto& v = all[members_copy[i]];
++        if (v.size() < nb) {
++          throw std::runtime_error("[jaccl] Split bootstrap size mismatch.");
++        }
++        std::copy(v.begin(), v.begin() + nb, dst + i * nb);
++      }
++      return;
++    }
++    if (st->n == 1) {
++      std::memcpy(dst, src, nb);
++      return;
++    }
++    auto c = st->child.lock();
++    if (!c) {
++      throw std::runtime_error("[jaccl] Split group no longer exists.");
++    }
++    c->all_gather(src, dst, nb);
++  };
++
++  auto child = std::make_shared<MeshGroup>(
++      child_rank, child_devices, SideChannel(child_rank, n, std::move(fn)));
++  st->child = child;
++  st->parent.reset();
++  return child;
++}
++
+ MeshGroup::MeshGroup(
+     int rank,
+     const std::vector<std::vector<std::string>>& device_names,
+@@ -13,6 +110,7 @@ MeshGroup::MeshGroup(
+     : rank_(rank),
+       size_(device_names[0].size()),
+       n_wires_(device_names.size()),
++      device_names_(device_names),
+       side_channel_(std::move(sc)),
+       pool_(n_wires_ - 1) {
+   if (size_ > MESH_MAX_PEERS) {
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.h b/mlx/distributed/jaccl/lib/jaccl/mesh.h
+index aa19fdd..3f7d539 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.h
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.h
+@@ -52,6 +52,8 @@ class MeshGroup : public Group {
+ 
+   void barrier() override;
+ 
++  std::shared_ptr<Group> split(int color, int key) override;
++
+  private:
+   template <typename T, typename ReduceOp>
+   void all_reduce(
+@@ -85,6 +87,8 @@ class MeshGroup : public Group {
+   int rank_;
+   int size_;
+   int n_wires_;
++  // [wire][peer] device names, kept so split can derive a child's matrix.
++  std::vector<std::vector<std::string>> device_names_;
+   SideChannel side_channel_;
+   std::vector<std::vector<Connection>> connections_;
+   std::vector<std::vector<SharedBuffer>> buffers_;
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+index 9a81010..0e31afa 100644
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -6,6 +6,7 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <fstream>
+ #include <future>
+@@ -357,20 +358,27 @@ class RingGroup : public GroupImpl {
+     }
+ 
+     size_ = nodes.size();
++    nodes_ = std::move(nodes);
++
++    // A ring of one has no neighbors. Collectives on it do not reach a backend.
++    if (size_ == 1) {
++      return;
++    }
++
+     int connect_to = (rank_ + 1) % size_;
+ 
+     // We define the connection order by having the rank_ == size_ - 1 connect
+     // first and accept after.
+     if (rank_ < connect_to) {
+       log_info(verbose_, "Rank", rank_, "accepting");
+-      sockets_left_ = accept_connections(nodes[rank_]);
++      sockets_left_ = accept_connections(nodes_[rank_]);
+       log_info(verbose_, "Rank", rank_, "connecting to", connect_to);
+-      sockets_right_ = make_connections(nodes[connect_to], verbose);
++      sockets_right_ = make_connections(nodes_[connect_to], verbose);
+     } else {
+       log_info(verbose_, "Rank", rank_, "connecting to", connect_to);
+-      sockets_right_ = make_connections(nodes[connect_to], verbose);
++      sockets_right_ = make_connections(nodes_[connect_to], verbose);
+       log_info(verbose_, "Rank", rank_, "accepting");
+-      sockets_left_ = accept_connections(nodes[rank_]);
++      sockets_left_ = accept_connections(nodes_[rank_]);
+     }
+ 
+     // Failure if we couldn't make right or left sockets
+@@ -462,7 +470,46 @@ class RingGroup : public GroupImpl {
+   }
+ 
+   std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
+-    throw std::runtime_error("[ring] Group split not supported.");
++    key = (key < 0) ? rank_ : key;
++
++    // Pass each color and key around the ring. Each rank then computes its
++    // own subgroup.
++    std::vector<std::array<int, 2>> colors_keys(size_);
++    colors_keys[rank_] = {color, key};
++    constexpr size_t nbytes = 2 * sizeof(int);
++    for (int i = 1; i < size_; i++) {
++      int send_from = (rank_ - i + 1 + size_) % size_;
++      int recv_into = (rank_ - i + size_) % size_;
++      send(
++          sockets_right_,
++          reinterpret_cast<const char*>(colors_keys[send_from].data()),
++          nbytes);
++      recv(
++          sockets_left_,
++          reinterpret_cast<char*>(colors_keys[recv_into].data()),
++          nbytes);
++    }
++
++    // Ranks with our color, sorted by key. The parent rank breaks ties.
++    std::vector<int> members;
++    for (int r = 0; r < size_; r++) {
++      if (colors_keys[r][0] == color) {
++        members.push_back(r);
++      }
++    }
++    std::stable_sort(members.begin(), members.end(), [&](int a, int b) {
++      return colors_keys[a][1] < colors_keys[b][1];
++    });
++
++    std::vector<std::vector<detail::address_t>> nodes;
++    nodes.reserve(members.size());
++    for (int r : members) {
++      nodes.push_back(nodes_[r]);
++    }
++    int rank =
++        std::find(members.begin(), members.end(), rank_) - members.begin();
++
++    return std::make_shared<RingGroup>(rank, std::move(nodes), verbose_);
+   }
+ 
+   void all_gather(const array& input, array& output, Stream stream) override {
+@@ -805,6 +852,7 @@ class RingGroup : public GroupImpl {
+ 
+   int rank_;
+   int size_;
++  std::vector<std::vector<detail::address_t>> nodes_;
+ 
+   bool verbose_;
+ 
+diff --git a/python/tests/ring_test_distributed.py b/python/tests/ring_test_distributed.py
+index 8b4de9c..4e8ed99 100644
+--- a/python/tests/ring_test_distributed.py
++++ b/python/tests/ring_test_distributed.py
+@@ -20,8 +20,48 @@ class TestRingDistributed(mlx_distributed_tests.MLXDistributedCommonTestCase):
+         self.assertEqual(world.size(), world2.size())
+         self.assertEqual(world.rank(), world2.rank())
+ 
+-        with self.assertRaises(RuntimeError):
+-            sub = world.split(world.rank() % 2)
++        n = world.size()
++        r = world.rank()
++
++        sub = world.split(r % 2)
++        members = [x for x in range(n) if x % 2 == r % 2]
++        self.assertEqual(sub.size(), len(members))
++        self.assertEqual(sub.rank(), members.index(r))
++        self.assertEqual(
++            mx.distributed.all_sum(mx.array(r), group=sub).item(), sum(members)
++        )
++
++        # Interleave parent and subgroup collectives.
++        g = mx.distributed.all_gather(mx.array([r]), group=sub)
++        total = mx.distributed.all_sum(mx.array(1), group=world)
++        self.assertEqual(g.tolist(), members)
++        self.assertEqual(total.item(), n)
++
++        # The key sets the order in the subgroup. Parent rank breaks ties.
++        sub = world.split(r % 2, key=n - r)
++        self.assertEqual(sub.rank(), list(reversed(members)).index(r))
++        tie = world.split(r % 2, key=0)
++        self.assertEqual(tie.rank(), members.index(r))
++
++        # A color nobody shares gives a group of one.
++        solo = world.split(r)
++        self.assertEqual(solo.size(), 1)
++        self.assertEqual(solo.rank(), 0)
++
++        # Subgroups split again.
++        half = world.split(r < n // 2)
++        members = [x for x in range(n) if (x < n // 2) == (r < n // 2)]
++        self.assertEqual(half.size(), len(members))
++        nested = half.split(half.rank() % 2)
++        self.assertEqual(
++            mx.distributed.all_sum(mx.array(r), group=half).item(), sum(members)
++        )
++        self.assertEqual(nested.size(), len(members[half.rank() % 2 :: 2]))
++
++        # A split with one color keeps the whole group.
++        same = world.split(0)
++        self.assertEqual(same.size(), n)
++        self.assertEqual(same.rank(), r)
+ 
+     def test_strict_init_after_fallback(self):
+         with mlx_tests.scoped_env(
