@@ -125,6 +125,9 @@ class ModelLayout:
     layer_expert_counts: tuple[int, ...] = ()
     layer_routed_expert_bytes: tuple[int, ...] = ()
     layer_shared_expert_bytes: tuple[int, ...] = ()
+    # Per-layer per-token KV bytes each TP member holds whole (replica part of
+    # the full-head rate). Empty = unknown; per-layer KV then fails closed at TP>1.
+    layer_kv_tp_replicated_bytes_per_token: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         inventory = tuple(
@@ -173,6 +176,18 @@ class ModelLayout:
                 raise ValueError(
                     "layer_tp_replicated_bytes must be non-negative integers "
                     "matching layers and not exceeding layer weights"
+                )
+        kv_replicas = tuple(self.layer_kv_tp_replicated_bytes_per_token)
+        object.__setattr__(self, "layer_kv_tp_replicated_bytes_per_token", kv_replicas)
+        if kv_replicas:
+            full = tuple(self.layer_kv_bytes_per_token)
+            if not full or len(kv_replicas) != len(full) or any(
+                isinstance(v, bool) or not isinstance(v, int) or v < 0
+                for v in kv_replicas
+            ) or any(r > f for r, f in zip(kv_replicas, full)):
+                raise ValueError(
+                    "layer_kv_tp_replicated_bytes_per_token must be aligned "
+                    "non-negative integers not exceeding layer_kv_bytes_per_token"
                 )
         object.__setattr__(
             self, "runtime_options", validate_runtime_options(self.runtime_options)
@@ -259,6 +274,9 @@ class ModelLayout:
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
             **({"layer_tp_replicated_bytes": list(self.layer_tp_replicated_bytes)}
                if self.layer_tp_replicated_bytes else {}),
+            **({"layer_kv_tp_replicated_bytes_per_token":
+                list(self.layer_kv_tp_replicated_bytes_per_token)}
+               if self.layer_kv_tp_replicated_bytes_per_token else {}),
             **({"layer_expert_counts": list(self.layer_expert_counts)}
                if self.layer_expert_counts else {}),
             **({"layer_routed_expert_bytes": list(self.layer_routed_expert_bytes)}
@@ -310,6 +328,9 @@ class ModelLayout:
                 kv_cache_step=payload.get("kv_cache_step", 1),
                 layer_tp_replicated_bytes=tuple(
                     payload.get("layer_tp_replicated_bytes", ())
+                ),
+                layer_kv_tp_replicated_bytes_per_token=tuple(
+                    payload.get("layer_kv_tp_replicated_bytes_per_token", ())
                 ),
                 layer_expert_counts=tuple(payload.get("layer_expert_counts", ())),
                 layer_routed_expert_bytes=tuple(
@@ -2139,12 +2160,13 @@ def _kv_bytes_for_stage(
     if context_tokens <= 0:
         return 0
     if model.layer_kv_bytes_per_token:
-        if tensor_parallel_size != 1:
-            raise PlanningError("per-layer KV budgets require a validated TP cache contract")
         stop = start_layer + layer_count
         tokens = ((context_tokens + model.kv_cache_step - 1) // model.kv_cache_step) * model.kv_cache_step
-        return (sum(model.layer_kv_bytes_per_token[start_layer:stop]) * tokens
-                + sum(model.layer_kv_fixed_bytes[start_layer:stop]))
+        per_token = _kv_bytes_per_token_for_stage(
+            model, layer_count, tensor_parallel_size, start_layer
+        )
+        # Fixed bytes stay replicated on every TP member.
+        return per_token * tokens + sum(model.layer_kv_fixed_bytes[start_layer:stop])
     total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
     if model.kv_replicated_across_tp:
         return total
@@ -2160,9 +2182,16 @@ def _kv_bytes_per_token_for_stage(
     """What one more token of context costs this node."""
 
     if model.layer_kv_bytes_per_token:
-        if tensor_parallel_size != 1:
+        stop = start_layer + layer_count
+        full = model.layer_kv_bytes_per_token[start_layer:stop]
+        if tensor_parallel_size == 1:
+            return sum(full)
+        if not model.layer_kv_tp_replicated_bytes_per_token:
             raise PlanningError("per-layer KV budgets require a validated TP cache contract")
-        return sum(model.layer_kv_bytes_per_token[start_layer:start_layer + layer_count])
+        replicas = model.layer_kv_tp_replicated_bytes_per_token[start_layer:stop]
+        return sum(
+            r + -(-(f - r) // tensor_parallel_size) for f, r in zip(full, replicas)
+        )
     if model.kv_bytes_per_token_per_layer <= 0:
         return 0
     per_token = model.kv_bytes_per_token_per_layer * layer_count
@@ -2380,6 +2409,16 @@ def plan_hybrid(
     kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
     if model.kv_replicated_across_tp:
         kv_bytes_per_layer *= tensor_parallel_size
+    if model.layer_kv_bytes_per_token:
+        # Each layer's local TP KV budget, times TP for the aggregate view.
+        kv_per_layer = tuple(
+            _kv_bytes_for_stage(
+                model, 1, context_tokens, tensor_parallel_size, start_layer=i
+            ) * tensor_parallel_size
+            for i in range(len(model.layer_weight_bytes))
+        )
+    else:
+        kv_per_layer = (kv_bytes_per_layer,) * len(model.layer_weight_bytes)
     replicated_bytes = model.layer_tp_replicated_bytes or (0,) * len(
         model.layer_weight_bytes
     )
@@ -2389,9 +2428,9 @@ def plan_hybrid(
             stage_budgets,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + (tensor_parallel_size - 1) * replicated + kv_bytes_per_layer
-                for weight_bytes, replicated in zip(
-                    model.layer_weight_bytes, replicated_bytes
+                weight_bytes + (tensor_parallel_size - 1) * replicated + kv
+                for weight_bytes, replicated, kv in zip(
+                    model.layer_weight_bytes, replicated_bytes, kv_per_layer
                 )
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
@@ -2417,7 +2456,8 @@ def plan_hybrid(
         per_member = stage_layer_bytes // tensor_parallel_size
         remainder = stage_layer_bytes % tensor_parallel_size
         kv_bytes = _kv_bytes_for_stage(
-            model, end - start, context_tokens, tensor_parallel_size
+            model, end - start, context_tokens, tensor_parallel_size,
+            start_layer=start,
         )
         for tp_rank, node in enumerate(group):
             sharded_bytes = per_member + (1 if tp_rank < remainder else 0)
@@ -2452,7 +2492,8 @@ def plan_hybrid(
                     tensor_parallel_size=tensor_parallel_size,
                     kv_cache_bytes=kv_bytes,
                     kv_bytes_per_token=_kv_bytes_per_token_for_stage(
-                        model, end - start, tensor_parallel_size
+                        model, end - start, tensor_parallel_size,
+                        start_layer=start,
                     ),
                     max_context_tokens=_max_context_for_stage(
                         model,
@@ -2460,6 +2501,7 @@ def plan_hybrid(
                         layer_count=end - start,
                         weight_bytes=model.fixed_weight_bytes + held_layer_bytes,
                         tensor_parallel_size=tensor_parallel_size,
+                        start_layer=start,
                     ),
                     sharded_weight_bytes=(
                         sharded_bytes if tensor_parallel_size > 1 else 0

@@ -7,7 +7,8 @@ from pathlib import Path
 
 
 def cache_budget(model_path, options):
-    reset = dict(layer_kv_bytes_per_token=(), layer_kv_fixed_bytes=(), kv_cache_step=1)
+    reset = dict(layer_kv_bytes_per_token=(), layer_kv_fixed_bytes=(),
+                 layer_kv_tp_replicated_bytes_per_token=(), kv_cache_step=1)
     if not options.get("turboquant_kv_enabled"):
         return reset
     config = json.loads((Path(model_path) / "config.json").read_text())
@@ -51,19 +52,22 @@ def cache_budget(model_path, options):
         if options.get("turboquant_skip_last", True) and len(full_attention) > 1
         else -1
     )
-    rates, fixed = [], []
+    rates, fixed, replicas = [], [], []
     for index, kind in enumerate(kinds):
         if kind == "full_attention":
             compressed = index != skip
             rates.append((heads * packed * 2 if compressed else 2 * raw) + auxiliary)
             # Rotation matrices and codebooks; independent of the token count.
             fixed.append(16 * padded * padded + 65536 if compressed else 0)
+            replicas.append(auxiliary)
         else:
             # Preserve the existing conservative recurrent-layer allowance.
             rates.append(raw)
             fixed.append(0)
+            replicas.append(0)
     return dict(
         layer_kv_bytes_per_token=tuple(rates),
         layer_kv_fixed_bytes=tuple(fixed),
+        layer_kv_tp_replicated_bytes_per_token=tuple(replicas),
         kv_cache_step=8192,
     )
