@@ -125,10 +125,57 @@ def test_ep_pp_split_order():
         assert (r.stage, r.stages, r.expert_rank, r.tensor_group) == (rank // 2, 2, rank % 2, None)
 
 
-def test_tp_ep_rejected_before_split():
+def make3(size, rank, tp, ep, log):
+    stages = size // (tp * ep)
+    sizes = iter([tp, ep, stages])
+
+    def split(color, key=-1):
+        log.append((rank, color, key))
+        n = next(sizes)
+        return NS(size=lambda: n, rank=lambda: key)
+
+    return NS(size=lambda: size, rank=lambda: rank, split=split)
+
+
+def plan3(size, tp, ep):
+    w, stages = tp * ep, size // (tp * ep)
+    return [NS(rank=r, tensor_parallel_size=tp, tensor_parallel_rank=r % tp,
+               expert_parallel_size=ep, expert_parallel_rank=r % w // tp,
+               start_layer=(stages - 1 - r // w) * 4, end_layer=(stages - 1 - r // w) * 4 + 4)
+            for r in range(size)]
+
+
+@pytest.mark.parametrize("size,tp,ep", [(12, 2, 3), (6, 2, 3)])
+def test_tp_ep_pp_every_rank(size, tp, ep):
+    w, stages = tp * ep, size // (tp * ep)
+    for rank in range(size):
+        log = []
+        r = build_parallel_groups(make3(size, rank, tp, ep, log), tp, plan3(size, tp, ep),
+                                  expert_parallel_size=ep)
+        stage, er, tr = rank // w, rank % w // tp, rank % tp
+        want = [(rank, stage * ep + er, tr), (rank, stage * tp + tr, er)]
+        if stages > 1:
+            want.append((rank, er * tp + tr, stage))
+        assert log == want
+        assert (r.stage, r.stages, r.tp_rank, r.tp_size) == (stage, stages, tr, tp)
+        assert (r.expert_rank, r.expert_size) == (er, ep)
+        assert r.tensor_group.size() == tp and r.expert_group.size() == ep
+        assert (r.pipeline_group is None) == (stages == 1)
+
+
+@pytest.mark.parametrize("size,p", [
+    (4, None), (12, plan3(12, 2, 3)[:-1]),
+    (12, [NS(**{**vars(a), "expert_parallel_size": 1}) if a.rank == 5 else a for a in plan3(12, 2, 3)]),
+    (12, [NS(**{**vars(a), "expert_parallel_rank": 0}) if a.rank == 5 else a for a in plan3(12, 2, 3)]),
+    (12, [NS(**{**vars(a), "tensor_parallel_size": 1}) if a.rank == 5 else a for a in plan3(12, 2, 3)]),
+    (12, [NS(**{**vars(a), "tensor_parallel_rank": 0}) if a.rank == 5 else a for a in plan3(12, 2, 3)]),
+    (12, [NS(**{**vars(a), "end_layer": 3}) if a.rank == 5 else a for a in plan3(12, 2, 3)]),
+])
+def test_tp_ep_pp_fail_closed_before_split(size, p):
     log = []
+    tp, ep = (2, 3) if size == 12 else (2, 3)
     with pytest.raises(ParallelGroupError):
-        build_parallel_groups(make(4, 0, 2, log), 2, expert_parallel_size=2)
+        build_parallel_groups(make3(size, 0, tp, ep, log), tp, p, expert_parallel_size=ep)
     assert log == []
 
 
