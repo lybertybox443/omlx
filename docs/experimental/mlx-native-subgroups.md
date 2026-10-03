@@ -4,7 +4,8 @@
 
 MLX upstream 0.32.2 : `Group.split` n'existe pas par défaut pour les backends ring et JACCL.
 Le patch local adapte les PR upstream fermées et non fusionnées
-https://github.com/ml-explore/mlx/pull/4218 et /4282, ainsi que l'issue #3205.
+https://github.com/ml-explore/mlx/pull/4218 et
+https://github.com/ml-explore/mlx/pull/4282, ainsi que l'issue #3205.
 Aucune PR n'est publiée, aucun push n'est demandé.
 
 ## Kit
@@ -48,10 +49,26 @@ Retour arrière : supprimer le venv isolé. L'application partagée n'est pas to
 
 - Roue CPU isolée compilée, bibliothèque JACCL incluse.
 - Quatre processus en anneau : `test_groups` réussi (split, key, imbriqué, singleton).
-- Qwen4 TPxPP complet en anneau : bloqué, runtime GPU patché indisponible sur ce Mac (compilateur Metal absent).
-- N Macs physiques, RDMA et performances : reportés par l'utilisateur.
+- Build GPU natif compilé : MLX 0.32.4.dev, base `0e3ff36`, Metal disponible, test GPU minimal (somme = 6) réussi.
+- Roue GPU stockée hors dépôt (`outputs`) : `cp311-cp311-macosx_27_0_arm64`, SHA256 `8363195459afca3eeacf1ffaf21f78f6a06eb988c37e07ebe42a43ce1cac5fd4`.
+- Preuve locale (`outputs/expert-hybrid-ring-gpu.log`) : 3 tests réussis. Qwen4 EP quantifié en world 3 et world 6, puis TP2xPP2 en world 4 sur GPU, en localhost. Parité sur tous les tokens et logits à 1e-4.
+- L'ancien constat « compilateur Metal absent, test bloqué » est obsolète : il est faux désormais.
+- N Macs physiques, RDMA et performances : REPORTÉS (DEFERRED).
+
+## Compatibilité de la roue
+
+- ABI et plateforme actuelles : macOS 27 arm64, Python 3.11. Ce n'est pas une roue universelle.
+- Pour d'autres workers compatibles, reconstruire avec `scripts/build_mlx_subgroups.py`.
+
+## API
+
+- Option `expert_parallel_size` pour l'EP.
+- `allow_experimental_subgroups` : opt-in, réservé au mode hybride et au runtime patché.
+- TP+EP en 3D : rejeté explicitement pour l'instant.
+- La feuille de route n'est pas terminée ; rien n'indique le contraire.
 
 ## Limites
 
-- Aucune preuve physique JACCL.
+- Aucune preuve physique JACCL. Le maillage JACCL exige des liens directs.
 - Aucune affirmation de performance supérieure.
+- Preuve locale seulement : pas de validation multi-Mac ni RDMA.

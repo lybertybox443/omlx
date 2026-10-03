@@ -3986,6 +3986,7 @@ class Qwen4ExpModel(nn.Module):
             hidden_size=self.args.hidden_size,
             defer_write=hc_fused.write_enabled(),
             wire_dtype=embedding_dtype,
+            group=group,
         )
         self.fa_idx, self.ssm_idx = _pipeline.local_cache_indices(self.pipeline_layers)
 
@@ -4653,7 +4654,11 @@ class LanguageModel(Qwen3_5LanguageModel):
         accepted_values = self._normalize_accepted_counts(accepted)
         if self.model.pipeline_stage is not None:
             try:
-                accepted_values = _pipeline.agree_accepted(accepted_values, block_size)
+                accepted_values = _pipeline.agree_accepted(
+                    accepted_values,
+                    block_size,
+                    group=self.model.pipeline_stage.group,
+                )
             except _pipeline.PipelineContractError:
                 if gdn_states is not None:
                     gdn_states.abort()

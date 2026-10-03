@@ -19,6 +19,13 @@ from .planner import (
 _MISSING = object()
 _ASSIGNMENT_CONTRACT = "_omlx_honors_pipeline_assignment"
 _ACTIVE_ASSIGNMENTS: tuple[PipelineAssignment, ...] | None = None
+_ACTIVE_PIPELINE_GROUP: Any = None
+
+
+def active_pipeline_group() -> Any:
+    """Pipeline group supplied with the active plan, if any."""
+
+    return _ACTIVE_PIPELINE_GROUP
 
 
 def active_assignments() -> tuple[PipelineAssignment, ...] | None:
@@ -34,14 +41,17 @@ def active_assignments() -> tuple[PipelineAssignment, ...] | None:
 @contextmanager
 def _record_active_assignments(
     assignments: Sequence[PipelineAssignment],
+    *,
+    group: Any = None,
 ) -> Iterator[None]:
-    global _ACTIVE_ASSIGNMENTS
-    previous = _ACTIVE_ASSIGNMENTS
+    global _ACTIVE_ASSIGNMENTS, _ACTIVE_PIPELINE_GROUP
+    previous = _ACTIVE_ASSIGNMENTS, _ACTIVE_PIPELINE_GROUP
     _ACTIVE_ASSIGNMENTS = tuple(assignments)
+    _ACTIVE_PIPELINE_GROUP = group
     try:
         yield
     finally:
-        _ACTIVE_ASSIGNMENTS = previous
+        _ACTIVE_ASSIGNMENTS, _ACTIVE_PIPELINE_GROUP = previous
 
 
 @contextmanager
@@ -51,13 +61,14 @@ def unsharded_model_loading() -> Iterator[None]:
     Use on the worker's serialized model-loading thread, never concurrently
     with target construction: the assignment state is process-global.
     """
-    global _ACTIVE_ASSIGNMENTS
-    previous = _ACTIVE_ASSIGNMENTS
+    global _ACTIVE_ASSIGNMENTS, _ACTIVE_PIPELINE_GROUP
+    previous = _ACTIVE_ASSIGNMENTS, _ACTIVE_PIPELINE_GROUP
     _ACTIVE_ASSIGNMENTS = None
+    _ACTIVE_PIPELINE_GROUP = None
     try:
         yield
     finally:
-        _ACTIVE_ASSIGNMENTS = previous
+        _ACTIVE_ASSIGNMENTS, _ACTIVE_PIPELINE_GROUP = previous
 
 
 def _mark_assignment_contract(method: Any) -> Any:
@@ -350,6 +361,8 @@ def _install_nemotron_h_pipeline(
 @contextmanager
 def install_pipeline_compatibility(
     assignments: Sequence[PipelineAssignment],
+    *,
+    group: Any = None,
 ) -> Iterator[None]:
     """Install unequal sharding plus pinned-runtime model compatibility.
 
@@ -358,7 +371,7 @@ def install_pipeline_compatibility(
     """
 
     with ExitStack() as stack:
-        stack.enter_context(_record_active_assignments(assignments))
+        stack.enter_context(_record_active_assignments(assignments, group=group))
         stack.enter_context(install_unequal_pipeline_plan(assignments))
         stack.enter_context(_install_nemotron_h_pipeline(assignments))
         yield

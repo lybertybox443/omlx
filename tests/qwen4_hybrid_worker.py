@@ -64,7 +64,7 @@ def main():
     owned = column[stage]
     lo, hi = owned.start_layer, owned.end_layer
 
-    with install_pipeline_compatibility(column):
+    with install_pipeline_compatibility(column, group=top.pipeline_group):
         loaded = progressive_sharded_load(
             ckpt,
             pipeline_group=top.pipeline_group,

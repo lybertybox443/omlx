@@ -137,7 +137,8 @@ def apply_expert_strategy(model, group, *, mx_module, progress=None, plan=None):
             for a in _ARRAYS:
                 arr = getattr(p, a, None)
                 if arr is not None:
-                    setattr(p, a, arr[lo:hi])
+                    # contiguous releases the full parent buffer after slicing
+                    setattr(p, a, mx_module.contiguous(arr[lo:hi]))
                 del arr
             if hasattr(p, "num_experts"):  # cached local count; router stays global
                 try:

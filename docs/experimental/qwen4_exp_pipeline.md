@@ -1260,7 +1260,7 @@ verdict. `check_processors` refuses before any fork a processor that is neither 
 nor a known pure closure (grammar, arbitrary callables with side effects: not cloneable per
 branch, hence unsupported). Admission counts the sampler's vocabulary buffers whenever
 processors are present.
-Engine-level local test (`tests/test_zz_ddtree_engine.py`, named to run last because loading a
+Engine-level local test (`tests/test_ddtree_engine.py`, named to run last because loading a
 Qwen4 engine applies process-global mlx-vlm patches): `EnginePool.get_engine` on a tiny Qwen4
 checkpoint + the DFlash test drafter with the public options; greedy, penalized and cached
 (SSD, 4-token blocks) requests equal the ordinary engine, a grouped branch forward (>=2

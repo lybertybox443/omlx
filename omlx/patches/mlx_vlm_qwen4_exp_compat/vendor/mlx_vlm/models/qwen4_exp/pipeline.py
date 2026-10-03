@@ -36,7 +36,7 @@ reverse rank convention, and Exo PR #2283 (Apache-2.0) for repairing the
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
@@ -63,6 +63,9 @@ class PipelineStage:
     hidden_size: int
     defer_write: bool
     wire_dtype: Any
+    # Explicit collective group; excluded from equality/repr so fingerprints
+    # and the wire contract stay unchanged. None keeps the legacy call shape.
+    group: Any = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0 <= self.rank < self.size:
@@ -187,6 +190,10 @@ def planned_layer_range(
     if plan is None:
         return None
     if group is None:
+        from omlx.cluster.pipeline_compat import active_pipeline_group
+
+        group = active_pipeline_group()
+    if group is None:
         group = mx.distributed.init()
     by_rank = {item.rank: item for item in plan}
     rank, size = group.rank(), group.size()
@@ -262,13 +269,20 @@ def unpack_boundary(
     return hidden_states, (branch, gate)
 
 
+def _group_kwargs(stage: Any) -> dict:
+    group = getattr(stage, "group", None)
+    return {} if group is None else {"group": group}
+
+
 def receive_boundary(
     stage: PipelineStage, batch: int, tokens: int
 ) -> tuple[mx.array, tuple | None]:
     """Lazily receive the boundary tensor from the preceding stage."""
 
     template = mx.zeros((batch, tokens, stage.boundary_width), dtype=stage.wire_dtype)
-    packed = mx.distributed.recv_like(template, stage.source_rank)
+    packed = mx.distributed.recv_like(
+        template, stage.source_rank, **_group_kwargs(stage)
+    )
     return unpack_boundary(stage, packed)
 
 
@@ -283,7 +297,9 @@ def receive_boundary_captures(
 
     width = stage.boundary_width + captures * stage.hidden_size
     template = mx.zeros((batch, tokens, width), dtype=stage.wire_dtype)
-    packed = mx.distributed.recv_like(template, stage.source_rank)
+    packed = mx.distributed.recv_like(
+        template, stage.source_rank, **_group_kwargs(stage)
+    )
     hidden_states, write = unpack_boundary(stage, packed)
     carried = packed[..., stage.boundary_width :]
     return (
@@ -353,7 +369,9 @@ def hand_off(
             )
     if captures:
         packed = mx.concatenate([packed, *captures], axis=-1)
-    sent = mx.distributed.send(packed, stage.destination_rank)
+    sent = mx.distributed.send(
+        packed, stage.destination_rank, **_group_kwargs(stage)
+    )
     _keep_send_in_graph(cache, sent)
     placeholder = mx.zeros(
         (*hidden_states.shape[:-1], stage.hidden_size), dtype=stage.wire_dtype
@@ -370,7 +388,7 @@ def gather_output(stage: PipelineStage, output: mx.array) -> mx.array:
             f"the stage contract ({stage.hidden_size}, {stage.wire_dtype})"
         )
     batch = output.shape[0]
-    return mx.distributed.all_gather(output)[:batch]
+    return mx.distributed.all_gather(output, **_group_kwargs(stage))[:batch]
 
 
 def local_cache_indices(layers: Sequence[Any]) -> tuple[int | None, int | None]:
@@ -419,7 +437,7 @@ def gather_layer_captures(stage, capture_layer_ids, local_captures, output):
     # rank, including stages which own none of the requested layers.
     mx.eval(output)
     local = mx.stack([local_captures.get(i, mx.zeros_like(output)) for i in ids])
-    shared = mx.distributed.all_sum(local)
+    shared = mx.distributed.all_sum(local, **_group_kwargs(stage))
     mx.eval(shared)
     return [shared[i] for i in range(len(ids))]
 
@@ -432,14 +450,18 @@ def gather_mtp_output(stage: PipelineStage, output: mx.array, residual: mx.array
             "MTP hidden state does not match the stage contract"
         )
     packed = mx.concatenate((output, residual), axis=-1)
-    gathered = mx.distributed.all_gather(packed)[: output.shape[0]]
+    gathered = mx.distributed.all_gather(packed, **_group_kwargs(stage))[
+        : output.shape[0]
+    ]
     # Finish this forward before a speculative commit introduces its own
     # collectives; image position graphs can otherwise reorder the two.
     mx.eval(gathered)
     return gathered[..., :width], gathered[..., width:]
 
 
-def agree_accepted(accepted: list[int], block_size: int) -> list[int]:
+def agree_accepted(
+    accepted: list[int], block_size: int, *, group: Any = None
+) -> list[int]:
     """Reject divergent decisions collectively before any rank commits its cache."""
     valid = (
         bool(accepted)
@@ -449,10 +471,13 @@ def agree_accepted(accepted: list[int], block_size: int) -> list[int]:
         )
     )
     header = mx.array([[len(accepted), block_size, int(valid)]], dtype=mx.int32)
-    headers = mx.distributed.all_gather(header).tolist()
+    kwargs = {} if group is None else {"group": group}
+    headers = mx.distributed.all_gather(header, **kwargs).tolist()
     if not all(row == headers[0] and row[2] == 1 for row in headers):
         raise PipelineContractError("ranks disagree on the speculative commit shape")
-    votes = mx.distributed.all_gather(mx.array([accepted], dtype=mx.int32)).tolist()
+    votes = mx.distributed.all_gather(
+        mx.array([accepted], dtype=mx.int32), **kwargs
+    ).tolist()
     if not all(row == votes[0] for row in votes):
         raise PipelineContractError("ranks disagree on accepted speculative tokens")
     return votes[0]

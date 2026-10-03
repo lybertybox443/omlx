@@ -95,6 +95,30 @@ def test_quantized_matches_reference(n):
     assert mx.allclose(total, expected, atol=1e-5, rtol=1e-5).item()
 
 
+def test_quantized_expert_slices_are_made_contiguous():
+    ref, cfg = _moe(inter=32)
+    nn.quantize(
+        ref.switch_mlp,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda p, m: hasattr(m, "to_quantized"),
+    )
+    mx.eval(ref.parameters())
+    calls = []
+
+    class _RecMx(_FakeMx):
+        def contiguous(self, a, *args, **kw):
+            calls.append(a.shape)
+            return mx.contiguous(a, *args, **kw)
+
+    model = _Model([copy.deepcopy(ref)])
+    apply_expert_strategy(model, _group(2, 0), mx_module=_RecMx())
+    local_n = cfg.num_experts // 2
+    # gate/up/down x weight/scales/biases
+    assert len(calls) == 9
+    assert all(s[0] == local_n for s in calls)
+
+
 def test_expert_range_uneven_and_empty():
     assert [expert_range(4, 3, r) for r in range(3)] == [(0, 2), (2, 3), (3, 4)]
     assert [expert_range(4, 6, r) for r in range(6)][4:] == [(4, 4), (4, 4)]

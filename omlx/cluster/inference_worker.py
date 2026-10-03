@@ -1358,9 +1358,7 @@ def run_worker(args: argparse.Namespace) -> int:
     plan_hash, assignments, performance_profiles, tensor_parallel_size = (
         decode_worker_contract(args.plan)
     )
-    from .deployment import decode_worker_expert_parallel_size
-
-    expert_parallel_size = decode_worker_expert_parallel_size(args.plan)
+    expert_parallel_size = getattr(assignments[0], "expert_parallel_size", 1)
     runtime_options = decode_worker_runtime_options(args.plan)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
@@ -1517,7 +1515,12 @@ def run_worker(args: argparse.Namespace) -> int:
             set_assigned_stage,
         )
 
-        with install_pipeline_compatibility(wiring.column_assignments):
+        compat_kwargs = (
+            {"group": wiring.topology.pipeline_group} if wiring.hybrid else {}
+        )
+        with install_pipeline_compatibility(
+            wiring.column_assignments, **compat_kwargs
+        ):
             # Compatibility hooks are installed before asking about support,
             # so the answer describes the exact methods load_default() will
             # call. Unknown and custom unmarked methods remain fail-closed.
