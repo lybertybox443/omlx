@@ -452,6 +452,8 @@ class ClusterPlanRequest(BaseModel):
     allocation: Literal["balanced", "proportional"] = "balanced"
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    expert_parallel_size: int = Field(default=1, ge=1, le=64, strict=True)
+    allow_experimental_subgroups: bool = False
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
@@ -506,6 +508,8 @@ class ClusterDeploymentRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    expert_parallel_size: int = Field(default=1, ge=1, le=64, strict=True)
+    allow_experimental_subgroups: bool = False
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
@@ -770,14 +774,23 @@ _PLACEMENT_FIELDS = (
     "memory_guard_tier",
     "tensor_parallel_rank",
     "tensor_parallel_size",
+    "expert_parallel_rank",
+    "expert_parallel_size",
 )
+_EP_PLACEMENT_FIELDS = ("expert_parallel_rank", "expert_parallel_size")
 
 
 def _placement_rows(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Who holds what, under which memory constraints, rank-ordered."""
 
     rows = [
-        {field: item.get(field) for field in _PLACEMENT_FIELDS}
+        {
+            field: item.get(field)
+            for field in _PLACEMENT_FIELDS
+            # EP keys only when EP is active: default signatures stay stable.
+            if field not in _EP_PLACEMENT_FIELDS
+            or (item.get("expert_parallel_size") or 1) > 1
+        }
         for item in plan.get("assignments", [])
     ]
     rows.sort(key=lambda row: (row.get("rank") or 0, str(row.get("node_id") or "")))
@@ -871,19 +884,29 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
 
 
 def _create_cluster_plan(request: ClusterPlanRequest):
-    if request.tensor_parallel_size > 1 and request.tensor_parallel_size != len(
-        request.nodes
+    if request.tensor_parallel_size > 1 and request.expert_parallel_size > 1:
+        raise PlanningError(
+            "Tensor parallelism and expert parallelism cannot be combined; "
+            "choose one of them."
+        )
+    width = max(request.tensor_parallel_size, request.expert_parallel_size)
+    if (
+        width > 1
+        and width != len(request.nodes)
+        and not request.allow_experimental_subgroups
     ):
         raise PlanningError(
             "Tensor parallelism must use every detected node. Combining tensor "
             "parallelism with multiple pipeline stages is not supported by the "
             "pinned MLX model sharding path; choose 1 for pipeline-only or "
-            f"{len(request.nodes)} for one tensor-parallel stage."
+            f"{len(request.nodes)} for one tensor-parallel stage. Explicit "
+            "subgroups require a patched MLX with Group.split and the "
+            "allow_experimental_subgroups opt-in."
         )
     model, nodes = _model_and_nodes(request)
     if (
         len(nodes) > 1
-        and request.tensor_parallel_size == 1
+        and width == 1
         and model.source != "synthetic"
         and not model.supports_pipeline
     ):
@@ -902,7 +925,25 @@ def _create_cluster_plan(request: ClusterPlanRequest):
         tuple(node.node_id.strip() for node in request.nodes),
     )
     defaults = execution_profile(request.execution_profile)
-    if request.tensor_parallel_size > 1:
+    if request.expert_parallel_size > 1:
+        if request.allocation != "balanced":
+            raise PlanningError(
+                "RAM-proportional allocation is a pipeline-only rule; expert "
+                "parallelism uses the expert planner (allocation='balanced')"
+            )
+        from .expert_planner import plan_expert_parallel
+
+        plan = plan_expert_parallel(
+            model,
+            nodes,
+            expert_parallel_size=request.expert_parallel_size,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
+    elif request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
             raise PlanningError(
                 "RAM-proportional allocation is a pipeline-only rule; tensor "
@@ -2879,6 +2920,8 @@ def _create_deployment(
         allocation=request.allocation,
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
+        expert_parallel_size=request.expert_parallel_size,
+        allow_experimental_subgroups=request.allow_experimental_subgroups,
         target_context_tokens=request.target_context_tokens,
         path_map=request.path_map,
     )
@@ -2922,6 +2965,7 @@ def _create_deployment(
         execution=execution,
         performance_profiles=_request_performance_profiles(request.nodes),
         tensor_parallel_size=request.tensor_parallel_size,
+        expert_parallel_size=plan.expert_parallel_size,
         target_context_tokens=request.target_context_tokens,
         path_map=validate_model_path_map(request.path_map, tuple(host_ids)),
     )
@@ -2936,9 +2980,21 @@ def _build_performance_plan(
     workload_profile: str,
     microbatch_size: int,
     context_tokens: int,
+    expert_parallel_size: int = 1,
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
+    if expert_parallel_size > 1:
+        from .expert_planner import plan_expert_parallel
+
+        return plan_expert_parallel(
+            model,
+            nodes,
+            expert_parallel_size=expert_parallel_size,
+            workload_profile=workload_profile,
+            microbatch_size=microbatch_size,
+            context_tokens=context_tokens,
+        )
     if tensor_parallel_size > 1:
         return plan_hybrid(
             model,
@@ -2992,6 +3048,7 @@ def _performance_optimized_deployment(
         model,
         nodes,
         tensor_parallel_size=deployment.tensor_parallel_size,
+        expert_parallel_size=deployment.expert_parallel_size,
         workload_profile=deployment.execution.profile,
         microbatch_size=deployment.execution.pipeline_microbatch_size,
         context_tokens=request.target_context_tokens,
@@ -3009,6 +3066,7 @@ def _performance_optimized_deployment(
             model,
             nodes,
             tensor_parallel_size=deployment.tensor_parallel_size,
+            expert_parallel_size=deployment.expert_parallel_size,
             workload_profile=execution.profile,
             microbatch_size=execution.pipeline_microbatch_size,
             context_tokens=request.target_context_tokens,
