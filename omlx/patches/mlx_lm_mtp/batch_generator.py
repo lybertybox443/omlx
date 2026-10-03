@@ -262,6 +262,11 @@ def apply() -> bool:
 
         def patched_filter(self, keep, *args, **kwargs):
             old_uids = list(getattr(self, "uids", []) or [])
+            try:
+                kept = {old_uids[int(i)] for i in keep}
+            except Exception:
+                kept = set(old_uids)
+            _grammar_leave_speculative(self, set(old_uids) - kept)
             result = original_filter(self, keep, *args, **kwargs)
             _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
             _release_drafter_uids(self.model, set(old_uids) - set(self.uids))
@@ -573,7 +578,8 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) == 0:
         return False
-    if _has_grammar_processors(gen_batch):
+    # Grammar is wired only for ddtree (processors snapshot per UID); others stay refused.
+    if _has_grammar_processors(gen_batch) and getattr(drafter, "ddtree", None) is None:
         return False
     # XTC changes the target distribution but is absent from acceptance math.
     # Resolve each active row's sampler because the generator is reused.
@@ -762,7 +768,9 @@ def _ineligibility_reason(gen_batch: Any) -> str:
         return ""
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
         return "pending prompt work may still merge into this singleton batch"
-    if _has_grammar_processors(gen_batch):
+    if _has_grammar_processors(gen_batch) and (
+        getattr(_drafter_for(gen_batch.model), "ddtree", None) is None
+    ):
         return "grammar-constrained decoding uses GenerationBatch._step hooks"
     return ""
 
@@ -1067,7 +1075,9 @@ def _grammar_enter_speculative(gen_batch: Any) -> None:
         proc.begin_speculative(history_len)
 
 
-def _grammar_leave_speculative(gen_batch: Any) -> None:
+def _grammar_leave_speculative(
+    gen_batch: Any, uids: Optional[set] = None
+) -> None:
     """Hand grammar processors back to the scheduler's deferred accept.
 
     Runs on every MTP exit. ``gen_batch.tokens[row]`` is the streamed
@@ -1083,7 +1093,10 @@ def _grammar_leave_speculative(gen_batch: Any) -> None:
         return
     tokens_rows = getattr(gen_batch, "tokens", None) or []
     pending = getattr(gen_batch, "_next_tokens", None) is not None
+    row_uids = list(getattr(gen_batch, "uids", []) or [])
     for row, procs in enumerate(processors_by_seq):
+        if uids is not None and (row >= len(row_uids) or row_uids[row] not in uids):
+            continue
         for proc in grammar_processors(procs):
             if not proc.speculative:
                 continue
@@ -1114,8 +1127,10 @@ def _drop_mtp_state(
     released at activation (``take_primed``), on real multi-row merges
     (``patched_extend``), or with the cache itself at request end.
     """
-    _grammar_leave_speculative(gen_batch)
     state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is None and getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None:
+        return None  # active batch keeps its grammars speculative
+    _grammar_leave_speculative(gen_batch)
     if state is None:
         return None
     if log_stats:
@@ -1171,6 +1186,7 @@ def _drop_mtp_batch_state(
     reason: str,
     *,
     log_stats: bool = False,
+    leave_grammar: bool = True,
 ) -> Optional[_MtpBatchState]:
     batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
     if batch_state is None:
@@ -1178,6 +1194,8 @@ def _drop_mtp_batch_state(
     from . import batched_head
 
     batched_head.flush(batch_state)
+    if leave_grammar:
+        _grammar_leave_speculative(gen_batch)
     if log_stats:
         for state in list(batch_state.states.values()):
             try:
@@ -1232,7 +1250,9 @@ def _drop_invalid_mtp_batch_state(
     if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
         if len(uids) == 1:
             gen_batch._omlx_mtp_state = batch_state.states[uids[0]]
-            _drop_mtp_batch_state(gen_batch, "filter-to-singleton")
+            _drop_mtp_batch_state(
+                gen_batch, "filter-to-singleton", leave_grammar=False
+            )
             return None
         return batch_state
     return _drop_mtp_batch_state(gen_batch, reason)

@@ -174,6 +174,64 @@ def test_drop_without_state_syncs_and_defers(cg):
     assert _mask(p, []) == _ref(cg, _ids('{"k":'))
 
 
+def _multi(procs, histories, uids, batch_state=False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        uids=list(uids),
+        logits_processors=[[p] for p in procs],
+        tokens=[list(h) for h in histories],
+        _next_tokens=None,
+        _omlx_mtp_batch_state=SimpleNamespace(states={}) if batch_state else None,
+    )
+
+
+def test_filter_leaves_only_removed_uid(cg):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _grammar_leave_speculative
+
+    a, b = _proc(cg), _proc(cg)
+    _mask(a, PROMPT + _ids('{"k": "a'))
+    _mask(b, PROMPT + _ids('{"k": "b'))
+    gb = _multi([a, b], [PROMPT + _ids('{"k"')] * 2, [1, 2])
+    _grammar_leave_speculative(gb, {1})
+    assert not a.speculative and b.speculative
+
+
+def test_batch_exit_resyncs_each_row(cg):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _drop_mtp_batch_state
+
+    a, b = _proc(cg), _proc(cg)
+    _mask(a, PROMPT + _ids('{"k": "a'))
+    _mask(b, PROMPT + _ids('{"k": "b'))
+    gb = _multi([a, b], [PROMPT + _ids('{"k"'), PROMPT + _ids('{"k":')], [1, 2], True)
+    _drop_mtp_batch_state(gb, "test")
+    assert not a.speculative and not b.speculative
+    assert _mask(a, []) == _ref(cg, _ids('{"k"'))
+    assert _mask(b, []) == _ref(cg, _ids('{"k":'))
+
+
+def test_migration_to_singleton_keeps_matcher(cg):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _drop_mtp_batch_state
+
+    p = _proc(cg)
+    _mask(p, PROMPT + _ids('{"k": "a'))
+    gb = _multi([p], [PROMPT + _ids('{"k"')], [1], True)
+    _drop_mtp_batch_state(gb, "filter-to-singleton", leave_grammar=False)
+    assert p.speculative
+    assert not hasattr(gb, "_omlx_mtp_batch_state")
+
+
+def test_drop_singleton_absent_keeps_active_batch(cg):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _drop_mtp_state
+
+    a, b = _proc(cg), _proc(cg)
+    _mask(a, PROMPT + _ids('{"k": "a'))
+    _mask(b, PROMPT + _ids('{"k": "b'))
+    gb = _multi([a, b], [PROMPT] * 2, [1, 2], True)
+    _drop_mtp_state(gb, "test")
+    assert a.speculative and b.speculative
+
+
 # -- positioned MTPProcessingSampler wiring ---------------------------------
 
 from omlx.speculative.processing_sampler import (  # noqa: E402
@@ -238,3 +296,41 @@ class TestProcessingSampler:
         assert _mask(proc, PROMPT) == _ref(cg, [])
         proc.accept_token(ord("{"))
         assert _mask(proc, PROMPT + [ord("{")]) == _ref(cg, [ord("{")])
+
+
+def test_ddtree_processed_logprobs_grammar_branches(cg):
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import TokenBuffer
+
+    from omlx.speculative import ddtree_branches as branches
+
+    target = _ids(TEXT)
+    # First depth where the grammar offers a sibling to the target token.
+    i = next(
+        i for i in range(len(target)) if len(_ref(cg, target[:i]) - {target[i]}) > 0
+    )
+    alt = min(_ref(cg, target[:i]) - {target[i]})
+    paths = [target[: i + 1], target[:i] + [alt]]  # divergent, same length
+
+    def build(proc):
+        proc.begin_speculative(len(PROMPT))
+        batch = SimpleNamespace(
+            logits_processors=[[proc]], _token_context=[TokenBuffer(PROMPT)]
+        )
+        return branches.processed_logprobs(batch, mx.zeros((2, 2, VOCAB_SIZE)))
+
+    proc, other = _proc(cg), _proc(cg)
+    other_before = _mask(other, PROMPT)
+    at = build(proc)
+    snap = proc.snapshot_state()
+    for branch, path in enumerate(paths):
+        for pos in range(2):
+            lp = at(branch, pos, path)
+            allowed = {t for t in range(VOCAB_SIZE) if float(lp[t].item()) > -1e30}
+            assert allowed == _ref(cg, path[: pos + 1])  # == linear matcher
+            assert proc.snapshot_state() == snap  # base restored
+    # Illegal token is masked before it could be accepted.
+    illegal = _first_illegal(cg, target[:1])
+    assert float(at(0, 0, paths[0])[illegal].item()) < -1e30
+    assert _mask(other, PROMPT) == other_before  # second UID untouched

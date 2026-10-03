@@ -270,8 +270,10 @@ def check_processors(procs: Any) -> None:
 
     Repetition / presence / frequency penalties and token suppression are pure functions
     of (prefix tokens, logits). The thinking-budget processor keeps state but exposes
-    ``snapshot_state``/``restore_state``. Anything else (grammar automata, arbitrary
-    callables with side effects) cannot be cloned per branch and is refused.
+    ``snapshot_state``/``restore_state``. Grammar processors are supported when they are
+    snapshotable (rewindable per request). Anything else (non-snapshotable
+    automata, arbitrary callables with side effects) cannot be cloned per branch
+    and is rejected.
     """
     for proc in procs or ():
         if hasattr(proc, "snapshot_state") and hasattr(proc, "restore_state"):

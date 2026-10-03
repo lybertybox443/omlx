@@ -1,7 +1,8 @@
 """Local ddtree through the real EnginePool/VLMBatchedEngine load of a tiny Qwen4 checkpoint.
 
-Named ``zz`` so it runs last: loading a Qwen4 engine applies process-global mlx-vlm
-patches that other test files (e.g. the qwen_vlm MTP ones) do not expect to see.
+Isolated worker, not collected by normal discovery. Loading a Qwen4 engine applies
+process-global mlx-vlm patches, so ``test_ddtree_engine.py`` runs each scenario here
+in its own subprocess.
 """
 
 from __future__ import annotations
@@ -180,3 +181,124 @@ async def test_sampled_requests_walk_the_target_distribution_through_the_engine(
     keys = set(base) | set(walked)
     distance = sum(abs(base[k] - walked[k]) for k in keys) / (2 * count)
     assert distance < 0.3, (distance, base, walked)
+
+
+class _EosAfter:
+    """Normal sampler for ``after`` draws, then the tokenizer's real EOS."""
+
+    def __init__(self, inner, eos, after, armed):
+        self._inner, self._eos, self._after, self._armed, self._n = inner, eos, after, armed, 0
+
+    def __call__(self, logprobs):
+        self._n += 1
+        if self._armed["on"] and self._n > self._after:
+            return mx.full(logprobs.shape[:-1], self._eos, dtype=mx.int32)
+        return self._inner(logprobs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.asyncio
+async def test_real_eos_inside_a_branched_cohort_stops_cleanly(root, trace, monkeypatch):
+    from omlx import scheduler
+
+    armed, real_make, eos = {"on": True}, scheduler.omlx_make_sampler, []
+    monkeypatch.setattr(
+        scheduler, "omlx_make_sampler",
+        lambda *a, **k: _EosAfter(real_make(*a, **k), eos[0], 8, armed),
+    )
+    kwargs = dict(temperature=1.0, top_k=4, max_tokens=64)
+
+    async def scenario(mode):
+        pool, engine = await _engine(root, mode)
+        try:
+            ids = engine.tokenizer.eos_token_id
+            eos[:] = [ids[0] if isinstance(ids, list) else ids]
+            armed["on"] = True
+            out = await _run(engine, PROMPTS[:2], **kwargs)
+            for o in out:
+                assert o.finish_reason == "stop", o
+                assert 0 < o.completion_tokens < 64, o
+                assert eos[0] not in (o.tokens or [])[:-1], o
+            armed["on"] = False
+            after = await _run(engine, PROMPTS[:2], temperature=0.0, max_tokens=6)
+            return [(a.text, a.completion_tokens, a.finish_reason) for a in after]
+        finally:
+            await pool.shutdown() if hasattr(pool, "shutdown") else None
+
+    plain_after = await scenario(None)
+    assert trace["tree"] == 0
+    tree_after = await scenario("ddtree")
+    assert trace["tree"] > 0 and trace["cohort"], trace
+    assert any(requests >= 2 for requests, _ in trace["cohort"]), trace
+    assert tree_after == plain_after
+    assert all(0 < n <= 6 for _, n, _ in tree_after)
+
+
+JSON_TOKENS = ["{", "}", '"k"', ":", "[", "]", ",", '"a"', '"b"']
+
+
+@pytest.fixture
+def grammar_root(root, tmp_path):
+    import shutil
+
+    path = tmp_path / "grammar"
+    shutil.copytree(root / "qwen4", path / "qwen4")
+    shutil.copytree(root / "draft", path / "draft")
+    file = path / "qwen4" / "tokenizer.json"
+    data = json.loads(file.read_text())
+    vocab = data["model"]["vocab"]
+    for token in [t for t, i in vocab.items() if 50 <= i <= 58]:
+        del vocab[token]
+    vocab.update({token: 50 + n for n, token in enumerate(JSON_TOKENS)})
+    file.write_text(json.dumps(data))
+    return path
+
+
+@pytest.mark.asyncio
+async def test_real_xgrammar_json_schema_matches_ordinary_through_the_engine(grammar_root, trace):
+    import xgrammar as xgr
+
+    schema = json.dumps({
+        "type": "object",
+        "properties": {"k": {"type": "array", "items": {"enum": ["a", "b"]}, "minItems": 4, "maxItems": 4}},
+        "required": ["k"],
+        "additionalProperties": False,
+    })
+
+    def fresh(engine):
+        vocab = json.loads((grammar_root / "qwen4" / "tokenizer.json").read_text())["model"]["vocab"]
+        assert len(vocab) == 64
+        ordered = [token for token, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+        info = xgr.TokenizerInfo(
+            ordered, vocab_type=xgr.VocabType.RAW, vocab_size=64,
+            stop_token_ids=[engine.tokenizer.eos_token_id],
+        )
+        return xgr.GrammarCompiler(info).compile_json_schema(schema)
+
+    async def grammar_run(engine, prompts):
+        outs = await asyncio.gather(*(
+            engine.generate(prompt=p, max_tokens=40, temperature=0.0, compiled_grammar=fresh(engine))
+            for p in prompts
+        ))
+        for o in outs:
+            assert o.finish_reason == "stop", o
+            value = json.loads(o.text)
+            assert set(value) == {"k"} and len(value["k"]) == 4 and set(value["k"]) <= {"a", "b"}, o.text
+        return outs
+
+    pool, plain = await _engine(grammar_root, None)
+    try:
+        expected = [o.text for o in await grammar_run(plain, PROMPTS[:2])]
+    finally:
+        await pool.shutdown() if hasattr(pool, "shutdown") else None
+
+    pool, engine = await _engine(grammar_root, "ddtree")
+    try:
+        out = await grammar_run(engine, PROMPTS[:2])
+        assert [o.text for o in out] == expected
+        assert trace["tree"] > 0 and any(requests >= 2 for requests, _ in trace["cohort"]), trace
+        await grammar_run(engine, PROMPTS[2:3])  # fresh grammar, same engine
+    finally:
+        await pool.shutdown() if hasattr(pool, "shutdown") else None

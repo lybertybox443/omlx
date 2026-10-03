@@ -145,9 +145,11 @@ def test_local_loading_gate_and_penalty_refusal():
     reject = VLMBatchedEngine._reject_ddtree_sampling
     reject(linear, 1.3, 0.5, {"compiled_grammar": object()})  # linear deployments keep grammar
     reject(tree, 1.3, 0.5, {"frequency_penalty": 0.5})  # penalties are replayed per branch
-    for args in ((1.0, 0.0, {"compiled_grammar": object()}), (1.0, 0.0, {"logit_bias": {1: 1.0}})):
-        with pytest.raises(ValueError, match="ddtree"):
-            reject(tree, *args)
+    reject(tree, 1.0, 0.0, {"compiled_grammar": object()})  # grammar now admitted
+    with pytest.raises(ValueError, match="ddtree"):
+        reject(tree, 1.0, 0.0, {"logit_bias": {1: 1.0}})
+    with pytest.raises(Exception):  # non-snapshotable grammar object stays refused
+        branches.check_processors([object()])
 
 
 def test_processed_logprobs_use_exact_node_prefix_and_rewind_state():

@@ -2901,12 +2901,12 @@ class VLMBatchedEngine(BaseEngine):
         request work, what would become a logits processor."""
         if getattr(self._dflash_drafter, "ddtree", None) is None:
             return
-        # Penalties and the thinking budget are replayed per branch; the grammar automaton
-        # cannot be snapshotted, and no logit_bias processor exists in the API.
-        if kwargs.get("compiled_grammar") is not None or kwargs.get("logit_bias"):
+        # Penalties, thinking budget and grammar (snapshot protocol) are replayed per
+        # branch; no logit_bias processor exists in the API.
+        if kwargs.get("logit_bias"):
             raise ValueError(
-                "dflash_verify_mode=ddtree does not support guided grammar (its automaton "
-                "state cannot be cloned per branch); remove it or use 'adaptive'/'dflash'"
+                "dflash_verify_mode=ddtree does not support logit_bias; "
+                "remove it or use 'adaptive'/'dflash'"
             )
 
 

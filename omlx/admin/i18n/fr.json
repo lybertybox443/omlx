@@ -2021,7 +2021,7 @@
   "modal.model_settings.dflash_sink_kv_cache": "Réutiliser les KV des sinks DFlash",
   "modal.model_settings.dflash_sink_kv_cache_hint": "Conserve les projections du préfixe du batch actif. Désactiver réduit la mémoire conservée mais recalcule ces projections à chaque draft. Sans effet si les sinks sont à zéro.",
   "modal.model_settings.dflash_ddtree_max_branches": "ddtree : branches maximum",
-  "modal.model_settings.dflash_ddtree_max_branches_hint": "Déploiements distribués ou Qwen4 locaux ; requêtes greedy et échantillonnées (pénalités et budget de réflexion rejoués par branche ; grammaire guidée refusée). Branches candidates vérifiées par cycle (2 à 16 ; défaut 4).",
+  "modal.model_settings.dflash_ddtree_max_branches_hint": "Déploiements distribués ou Qwen4 locaux ; requêtes greedy et échantillonnées (pénalités et budget de réflexion rejoués par branche ; grammaire guidée prise en charge via des processeurs par requête rembobinables ; logit bias refusé). Branches candidates vérifiées par cycle (2 à 16 ; défaut 4).",
   "modal.model_settings.dflash_ddtree_max_nodes": "ddtree : nœuds maximum",
   "modal.model_settings.dflash_ddtree_max_nodes_hint": "Borne sur les tokens de draft distincts des branches (2 à 64 ; défaut 8).",
   "modal.model_settings.dflash_ddtree_memory_bytes": "ddtree : budget mémoire incrémental par étage (octets)",
