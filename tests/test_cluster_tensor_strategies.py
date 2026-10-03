@@ -175,6 +175,32 @@ def test_qwen4_exp_preflight_rejects_late_layer_before_mutation(monkeypatch):
     assert (attn.num_k_heads, attn.num_v_heads) == (2, 4)
 
 
+def test_qwen4_exp_stage_with_absent_prefix(monkeypatch):
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model, layers = _qwen4_layers()
+    gdn, att = layers[0].linear_attn, layers[1].self_attn
+    before = gdn.in_proj_qkv.weight.shape
+    model.model.layers = [None, layers[1]]  # stage [1, 2)
+    events = []
+    ts._shard_qwen4_exp(model, _FakeGroup(2, 0), mx, events.append)
+    assert model.model.layers[0] is None
+    assert gdn.in_proj_qkv.weight.shape == before
+    assert (gdn.num_k_heads, gdn.num_v_heads) == (2, 4)
+    assert (att.num_attention_heads, att.num_key_value_heads) == (2, 1)
+    assert att.q_proj.weight.shape[0] == 2 * 2 * 8
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+    out = att(mx.random.normal((1, 3, 32)), cache=QSAKVCache())
+    mx.eval(out)
+    assert out.shape == (1, 3, 32)
+    assert [(e["layer"], e["layers_loaded"], e["layers_total"]) for e in events] == [(1, 1, 1)]
+    model.model.layers = [None, None]
+    with pytest.raises(ValueError, match="no local layers"):
+        ts._shard_qwen4_exp(model, _FakeGroup(2, 0), mx, None)
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_qwen4_exp_real_shard_dimensions_and_forward(monkeypatch, rank):
     from omlx.cluster import tensor_strategies as ts
@@ -210,3 +236,116 @@ def test_qwen4_exp_real_shard_dimensions_and_forward(monkeypatch, rank):
     out = gdn(mx.random.normal((1, 3, 32)))
     mx.eval(out)
     assert out.shape == (1, 3, 32)
+
+
+class _Layer:
+    def __init__(self):
+        self.sharded = 0
+
+    def parameters(self):
+        return {}
+
+
+class _Inner:
+    def __init__(self, layers):
+        self.layers = layers
+
+
+class _Native:
+    model_type = "native_fake"
+
+    def __init__(self, layers):
+        self.model = _Inner(layers)
+
+    def shard(self, group):
+        for layer in self.model.layers:
+            layer.sharded += 1
+
+
+def _stage(prefix=1, owned=2, suffix=1):
+    layers = [_Layer() for _ in range(owned)]
+    return _Native([None] * prefix + layers + [None] * suffix), layers
+
+
+def _fake_adapter(monkeypatch, seen, fail=False):
+    from types import SimpleNamespace
+
+    from omlx.cluster import tensor_strategies as ts
+
+    def adapter(model, group, mx_module, progress):
+        seen.append(list(model.model.layers))
+        count = len(model.model.layers)
+        for i in range(count):
+            progress(
+                {"layer": i, "layers_loaded": i + 1, "layers_total": count}
+            )
+        if fail:
+            raise ValueError("boom")
+
+    adapter._omlx_tensor_strategy = SimpleNamespace(name="fake")
+    monkeypatch.setitem(ts._ADAPTERS, "native_fake", adapter)
+
+
+def test_registered_strategy_sees_only_owned_layers(monkeypatch):
+    from omlx.cluster.tensor_strategies import apply_tensor_strategy
+
+    model, layers = _stage()
+    original = model.model.layers
+    prefix = list(original)
+    seen, events = [], []
+    _fake_adapter(monkeypatch, seen)
+    assert (
+        apply_tensor_strategy(
+            model, _FakeGroup(2, 0), mx_module=mx, progress=events.append
+        )
+        == "fake"
+    )
+    assert seen == [layers]
+    assert [e["layer"] for e in events] == [1, 2]
+    assert [e["layers_loaded"] for e in events] == [1, 2]
+    assert all(e["layers_total"] == 2 for e in events)
+    assert model.model.layers is original and original == prefix
+
+
+def test_failure_restores_original_layer_list(monkeypatch):
+    from omlx.cluster.tensor_strategies import apply_tensor_strategy
+
+    model, _ = _stage()
+    original = model.model.layers
+    prefix = list(original)
+    _fake_adapter(monkeypatch, [], fail=True)
+    with pytest.raises(ValueError):
+        apply_tensor_strategy(
+            model, _FakeGroup(2, 0), mx_module=mx, progress=lambda e: None
+        )
+    assert model.model.layers is original and original == prefix
+
+
+def test_native_layer_loop_sees_only_owned_and_shards_once():
+    from omlx.cluster.tensor_strategies import apply_tensor_strategy
+
+    model, layers = _stage()
+    original = model.model.layers
+    events = []
+    assert (
+        apply_tensor_strategy(
+            model, _FakeGroup(2, 0), mx_module=mx, progress=events.append
+        )
+        == "native"
+    )
+    assert [layer.sharded for layer in layers] == [1, 1]
+    assert [e["layer"] for e in events] == [1, 2]
+    assert model.model.layers is original and original[0] is None
+
+
+@pytest.mark.parametrize("shape", ["empty", "hole"])
+def test_invalid_owned_range_rejected_before_mutation(shape):
+    from omlx.cluster.tensor_strategies import apply_tensor_strategy
+
+    a, b = _Layer(), _Layer()
+    layers = [None, None] if shape == "empty" else [a, None, b]
+    model = _Native(layers)
+    with pytest.raises(RuntimeError, match="contiguous"):
+        apply_tensor_strategy(model, _FakeGroup(2, 0), mx_module=mx)
+    assert model.model.layers is layers
+    assert a.sharded == b.sharded == 0

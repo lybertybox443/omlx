@@ -20,10 +20,75 @@ from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.rdma import launch_links
 from omlx.cluster.rdma.daemon import DaemonStatus, PeerStatus
 from omlx.cluster.rdma.links import NodeAddress
-from omlx.cluster.rdma.stage_plan import StageLink, links_for_rank, validate_stage_links
+from omlx.cluster.rdma.stage_plan import (
+    StageLink,
+    links_for_rank,
+    pipeline_stage_links,
+    validate_stage_links,
+)
 from omlx.cluster.rdma.verification import LinkVerification
 
 _LINK = StageLink(1, 0, "linka", "/tmp/mcdma-rpcd.linka.sock")
+
+
+def _sl(sender, receiver, name, stride=1):
+    return StageLink(sender, receiver, name, f"/tmp/{name}.sock", stride)
+
+
+def test_stride_serialization_legacy_unchanged():
+    assert "rank_stride" not in _LINK.to_dict()
+    assert StageLink.from_dict(_LINK.to_dict()) == _LINK
+    wide = _sl(4, 2, "w", 2)
+    assert wide.to_dict()["rank_stride"] == 2
+    assert StageLink.from_dict(wide.to_dict()) == wide
+
+
+@pytest.mark.parametrize("stride", [0, -1, True, 1.5])
+def test_bad_stride_rejected(stride):
+    with pytest.raises(ValueError):
+        _sl(4, 2, "w", stride)
+
+
+def test_validate_rejects_dup_incoming_and_range():
+    with pytest.raises(ValueError):
+        validate_stage_links([_sl(2, 1, "a"), _sl(3, 1, "b", 2)])
+    with pytest.raises(ValueError):
+        validate_stage_links([_sl(2, 1, "a")], world_size=2)
+
+
+@pytest.mark.parametrize("tp,rank", [(2, 0), (2, 1), (3, 0), (3, 2)])
+def test_pipeline_stage_links_translate(tp, rank):
+    world = tp * 2
+    links = [_sl(tp + c, c, f"l{c}", tp) for c in range(tp)]
+    out = pipeline_stage_links(links, tp, rank, world)
+    assert len(out) == 1
+    assert (out[0].sender_rank, out[0].receiver_rank, out[0].rank_stride) == (1, 0, 1)
+    assert out[0].link == f"l{rank}"
+    assert out[0].service_socket == f"/tmp/l{rank}.sock"
+
+
+def test_pipeline_stage_links_passthrough_and_pure_tp():
+    assert pipeline_stage_links([_LINK], 1, 0, 2) == (_LINK,)
+    with pytest.raises(ValueError):
+        pipeline_stage_links([_sl(2, 0, "a", 2)], 2, 0, 2)
+
+
+def test_pipeline_stage_links_reject_malformed():
+    for bad in (
+        [_sl(3, 0, "a", 3)],  # cross column
+        [_sl(2, 0, "a", 2)],  # world 4 tp 2 ok control below
+    ):
+        if bad[0].link == "a" and bad[0].sender_rank == 2:
+            assert pipeline_stage_links(bad, 2, 0, 4)
+        else:
+            with pytest.raises(ValueError):
+                pipeline_stage_links(bad, 2, 0, 4)
+    with pytest.raises(ValueError):
+        pipeline_stage_links([_sl(1, 0, "a")], 2, 0, 4)  # stride != tp
+    with pytest.raises(ValueError):
+        pipeline_stage_links([_sl(2, 0, "a", 2), _sl(4, 0, "b", 4)], 2, 0, 6)
+    with pytest.raises(ValueError):
+        pipeline_stage_links([_sl(2, 0, "a", 2)], 2, 0, 2)  # out of world
 
 
 def _deployment(**changes) -> ClusterDeployment:
@@ -320,5 +385,59 @@ def test_tensor_parallel_deployments_keep_mlx_collectives():
         ),
     )
     deployment, report, _ = _attach(tp)
+    assert deployment.stage_links == ()
+    assert report["reason"] == "tensor-parallel deployments keep MLX's collectives"
+
+
+_IPS = {"mac": "10.0.0.1", "spark-a": "10.0.0.2", "spark-b": "10.0.0.3", "spark-c": "10.0.0.4"}
+
+
+def _hybrid(tp=2, n=4):
+    return _deployment(
+        tensor_parallel_size=tp,
+        assignments=tuple(
+            PipelineAssignment(
+                h, i, *((4, 8, 4) if i < tp else (0, 4, 4)), 1, 1, 8,
+                tensor_parallel_rank=i % tp, tensor_parallel_size=tp,
+            )
+            for i, h in enumerate(list(_IPS)[:n])
+        ),
+        hosts=tuple(
+            ClusterHost(h, "127.0.0.1" if i == 0 else f"worker@{_IPS[h]}", (_IPS[h],))
+            for i, h in enumerate(list(_IPS)[:n])
+        ),
+    )
+
+
+def test_hybrid_tp2_links_next_stage_column_zero_to_rank_zero():
+    probed = []
+
+    def verify(link, node, **kwargs):
+        probed.append(node.node_id)
+        return LinkVerification(link.name, node.node_id, True, "", 1.0)
+
+    nodes = tuple(
+        NodeAddress(h, f"worker@{_IPS[h]}", (_IPS[h],), python_executable="/opt/py")
+        for h in ("spark-a", "spark-b", "spark-c")
+    )
+    deployment, report, _ = _attach(
+        _hybrid(),
+        nodes=lambda: nodes,
+        verify=verify,
+        status_reader=lambda: _up(host="10.0.0.3"),
+    )
+    assert probed == ["spark-b"]
+    assert deployment.stage_links == (
+        StageLink(2, 0, "linka", "/tmp/mcdma-rpcd.linka.sock", 2),
+    )
+    assert report["edges"][0]["sender_rank"] == 2
+    assert report["reason"] == "rank 2 sends to rank 0 over linka"
+
+
+def test_pure_tensor_parallel_is_never_probed():
+    def never(*args, **kwargs):
+        raise AssertionError("pure TP must not probe")
+
+    deployment, report, _ = _attach(_hybrid(2, 2), verify=never)
     assert deployment.stage_links == ()
     assert report["reason"] == "tensor-parallel deployments keep MLX's collectives"

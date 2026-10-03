@@ -144,19 +144,21 @@ def attach_stage_links(
         return cleared, _report(
             "only multi-node TCP-ring deployments have a stage edge to move"
         )
-    if deployment.tensor_parallel_size != 1:
+    tp = deployment.tensor_parallel_size
+    if len(deployment.hosts) <= tp:
         return cleared, _report("tensor-parallel deployments keep MLX's collectives")
     status = status_reader()
     if not status.reachable:
         return cleared, _report(status.reason)
     # Rank 0 is always this coordinator; the deployment pins its SSH target to 127.0.0.1.
+    # Sender: column 0 of the next pipeline stage (rank tp). Other columns use MLX's group.
     receiver = deployment.hosts[0].node_id
-    rank_one = deployment.hosts[1]
+    rank_one = deployment.hosts[tp]
     sender = rank_one.node_id
     known = nodes()
     enrolled = next((item for item in known if item.node_id == sender), None)
     if enrolled is None:
-        return cleared, _report(f"rank 1 ({sender}) is not an enrolled CUDA worker")
+        return cleared, _report(f"rank {tp} ({sender}) is not an enrolled CUDA worker")
     # Probe exactly where mlx.launch starts rank 1, not wherever the enrollment record points.
     node = replace(
         enrolled,
@@ -186,7 +188,7 @@ def attach_stage_links(
     records = store()
     if records is not None:
         records.record(verification)
-    edge = {"sender_rank": 1, "receiver_rank": 0, **verification.to_dict()}
+    edge = {"sender_rank": tp, "receiver_rank": 0, **verification.to_dict()}
     if not verification.verified:
         release_links(deployment.deployment_id)
         logger.warning(
@@ -196,11 +198,12 @@ def attach_stage_links(
             f"link {link.name} failed its pre-launch check: {verification.reason}", edge
         )
     stage = StageLink(
-        sender_rank=1,
+        sender_rank=tp,
         receiver_rank=0,
         link=link.name,
         service_socket=layout.service_socket_path(link.name),
+        rank_stride=tp,
     )
     return replace(deployment, stage_links=(stage,)), _report(
-        f"rank 1 sends to rank 0 over {link.name}", edge
+        f"rank {tp} sends to rank 0 over {link.name}", edge
     )

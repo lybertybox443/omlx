@@ -639,7 +639,11 @@ def _shard_qwen4_exp_preflight(layers: list[Any], size: int, rank: int = 0) -> N
         raise ValueError(f"group size ({size}) must be positive")
     if not 0 <= rank < size:
         raise ValueError(f"rank ({rank}) must be in [0, {size})")
+    if not any(layer is not None for layer in layers):
+        raise ValueError("qwen4_exp stage has no local layers")
     for layer in layers:
+        if layer is None:  # absent prefix/suffix of a pipeline stage
+            continue
         if layer.is_linear:
             attn = layer.linear_attn
             _require_divisible(attn.num_k_heads, size, "linear key heads")
@@ -673,9 +677,10 @@ def _shard_qwen4_exp(
     layers = list(layers)
     size = int(group.size())
     rank = int(group.rank())
-    total = len(layers)
     _shard_qwen4_exp_preflight(layers, size, rank)
-    for index, layer in enumerate(layers):
+    local = [(i, layer) for i, layer in enumerate(layers) if layer is not None]
+    total = len(local)
+    for done, (index, layer) in enumerate(local):
         # PLE (resident or mmap-backed) stays replicated: admission is owned
         # by the loader and rank-local rewiring is not applied here.
         if layer.is_linear:
@@ -752,7 +757,7 @@ def _shard_qwen4_exp(
             progress,
             strategy=QWEN4_EXP.name,
             layer=index,
-            loaded=index + 1,
+            loaded=done + 1,
             total=total,
         )
 
@@ -768,17 +773,35 @@ def apply_tensor_strategy(
 
     model_type = _model_type(model)
     adapter = _ADAPTERS.get(model_type)
-    if adapter is not None:
-        strategy = adapter._omlx_tensor_strategy  # type: ignore[attr-defined]
-        adapter(model, group, mx_module, progress)
-        return strategy.name
-    if not callable(getattr(model, "shard", None)):
+    if adapter is None and not callable(getattr(model, "shard", None)):
         raise RuntimeError(
             f"tensor parallelism is unsupported for model type {model_type!r}: "
             "no registered strategy and no native shard method"
         )
-    _native_layerwise_shard(model, group, mx_module, progress)
-    return "native"
+    owner, original = _common_layer_owner(model)
+    owned = [i for i, layer in enumerate(original) if layer is not None]
+    if len(owned) != len(original):
+        if not owned or owned[-1] - owned[0] + 1 != len(owned):
+            raise RuntimeError(
+                "tensor strategy requires a non-empty contiguous owned layer range"
+            )
+        first = owned[0]
+        inner = progress
+        if inner is not None:
+
+            def progress(event: dict[str, Any]) -> None:  # noqa: F811
+                inner({**event, "layer": event["layer"] + first})
+
+        owner.layers = [original[i] for i in owned]
+    try:
+        if adapter is None:
+            _native_layerwise_shard(model, group, mx_module, progress)
+            return "native"
+        strategy = adapter._omlx_tensor_strategy  # type: ignore[attr-defined]
+        adapter(model, group, mx_module, progress)
+        return strategy.name
+    finally:
+        owner.layers = original
 
 
 __all__ = [

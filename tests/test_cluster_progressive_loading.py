@@ -406,3 +406,134 @@ def test_progressive_loader_checks_tokenizer_trust_before_model_load(tmp_path):
         )
 
     assert calls == [("tokenizer", {"trust_remote_code": False})]
+
+
+def _hybrid_env(model_type="qwen3_next", native=False):
+    events = []
+    layer_names = ["l0", "l1", "l2", "l3"]
+
+    class Model:
+        def __init__(self):
+            self.model_type = model_type
+            self.model = SimpleNamespace(layers=list(layer_names))
+            self.model.pipeline = lambda g: (
+                events.append(("pipeline", g.name)),
+                setattr(self.model, "layers", self.model.layers[2:]),
+            )
+            if native:
+                self.shard = lambda g: None
+
+        def parameters(self):
+            params = [("model.embed_tokens.weight", "emb")]
+            params += [
+                (f"model.layers.{i}.w", n)
+                for i, n in enumerate(self.model.layers, start=2)
+                if len(self.model.layers) < 4
+            ] or [(f"model.layers.{i}.w", n) for i, n in enumerate(self.model.layers)]
+            return params
+
+    class MX(_FakeMX):
+        distributed = SimpleNamespace(init=lambda: None)
+
+        def eval(self, *values):
+            events.append(("eval", values))
+
+    class Path(type(__import__("pathlib").Path())):
+        pass
+
+    def download(repo, allow_patterns=None):
+        events.append(("download", None if allow_patterns is None
+                       else sorted(allow_patterns)))
+        return Path("/m")
+
+    utils = SimpleNamespace(
+        _download=download,
+        load_config=lambda p: {},
+        load_tokenizer=lambda *a, **k: "tok",
+        load_model=lambda *a, **k: (Model(), {}),
+        tree_flatten=lambda v: v,
+        json=json,
+        open=lambda *a, **k: __import__("io").StringIO(json.dumps({"weight_map": {
+            "model.embed_tokens.weight": "a.safetensors",
+            "model.layers.2.w": "b.safetensors",
+            "model.layers.3.w": "b.safetensors",
+        }})),
+    )
+    return events, utils, MX()
+
+
+def _group(name, size=2):
+    return SimpleNamespace(name=name, size=lambda: size)
+
+
+def test_hybrid_partitions_before_tensor_and_downloads_local_files_only(monkeypatch):
+    events, utils, mx = _hybrid_env()
+    import omlx.cluster.progressive_loading as pl
+    import omlx.utils.model_loading as ml
+
+    monkeypatch.setattr(ml, "ensure_model_code_trusted", lambda *a, **k: None)
+    seen = []
+
+    def strategy(model, group, *, mx_module, progress=None):
+        seen.append((list(model.model.layers), group.name))
+        events.append(("tensor", group.name))
+        return "qwen3_next"
+
+    monkeypatch.setattr(pl, "apply_tensor_strategy", strategy)
+    pipe, tens = _group("pp"), _group("tp")
+    pl.progressive_sharded_load(
+        "repo", pipe, tens, utils_module=utils, mx_module=mx
+    )
+
+    assert ("download", ["a.safetensors", "b.safetensors"]) in events
+    assert not any(e == ("download", None) for e in events)
+    kinds = [e[0] for e in events]
+    assert kinds.index("pipeline") < kinds.index("tensor")
+    assert seen == [(["l2", "l3"], "tp")]
+    # no whole-layer eval before sharding
+    before = events[: kinds.index("tensor")]
+    evals = [e for e in before if e[0] == "eval"]
+    assert evals
+    assert all(e[1] == ("emb",) for e in evals)
+    assert not any(
+        n in str(e[1]) for e in evals for n in ("l0", "l1", "l2", "l3")
+    )
+    assert ("eval", ("emb",)) in before
+
+
+def test_hybrid_rejects_unknown_native_before_download(monkeypatch):
+    events, utils, mx = _hybrid_env(model_type="unknown_type", native=True)
+    import omlx.utils.model_loading as ml
+
+    monkeypatch.setattr(ml, "ensure_model_code_trusted", lambda *a, **k: None)
+    events.clear()
+    monkeypatch.setattr(
+        "omlx.cluster.progressive_loading.native_shard_is_layer_local",
+        lambda f: (False, "x"),
+    )
+    with pytest.raises(ValueError, match="tensor parallelism"):
+        progressive_sharded_load(
+            "repo", _group("pp"), _group("tp"), utils_module=utils, mx_module=mx
+        )
+    assert all(e[0] not in ("pipeline", "eval") for e in events)
+    initial = sorted([
+        "*.json", "*.py", "tokenizer.model", "*.tiktoken",
+        "tiktoken.model", "*.txt", "*.jsonl", "*.jinja",
+    ])
+    downloads = [e for e in events if e[0] == "download"]
+    assert downloads
+    assert all(e[1] == initial for e in downloads)
+    assert not any(
+        e[1] is None or any("safetensors" in x for x in e[1])
+        for e in downloads
+    )
+
+
+def test_hybrid_requires_distinct_groups(monkeypatch):
+    _events, utils, mx = _hybrid_env()
+    import omlx.utils.model_loading as ml
+
+    monkeypatch.setattr(ml, "ensure_model_code_trusted", lambda *a, **k: None)
+    g = _group("same")
+    with pytest.raises(ValueError, match="distinct"):
+        progressive_sharded_load("repo", g, g, utils_module=utils, mx_module=mx)

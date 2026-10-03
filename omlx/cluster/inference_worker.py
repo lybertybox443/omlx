@@ -45,6 +45,7 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
+from .rdma.stage_plan import pipeline_stage_links
 from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
@@ -1272,6 +1273,57 @@ def _apply_rank_wired_limit(budget_bytes: int) -> int:
     return int(applied or 0)
 
 
+def _build_worker_topology(
+    group: Any,
+    assignments: Sequence[PipelineAssignment],
+    tensor_parallel_size: int,
+    stage_links: Sequence[Any],
+    *,
+    build: Any = None,
+) -> SimpleNamespace:
+    """Build the group topology once; hybrid PP x TP gets column translation.
+
+    World group and original assignments stay for control, telemetry and
+    admission. Pipeline code sees only this rank's tp column, rank = stage.
+    """
+
+    import dataclasses
+
+    from .parallel_groups import build_parallel_groups
+
+    tp = tensor_parallel_size
+    hybrid = tp > 1 and group.size() // tp > 1
+    links = (
+        pipeline_stage_links(
+            stage_links,
+            tp_size=tp,
+            tp_rank=group.rank() % tp,
+            world_size=group.size(),
+        )
+        if hybrid
+        else stage_links
+    )
+    topology = (build or build_parallel_groups)(group, tp, assignments)
+    column = (
+        [
+            dataclasses.replace(assignments[s * tp + topology.tp_rank], rank=s)
+            for s in range(topology.stages)
+        ]
+        if hybrid
+        else list(assignments)
+    )
+    return SimpleNamespace(
+        topology=topology,
+        hybrid=hybrid,
+        column_assignments=column,
+        stage_assignment=column[topology.stage] if hybrid else None,
+        pipeline_group=topology.pipeline_group if hybrid else group,
+        runtime_group=topology.pipeline_group or topology.tensor_group or group,
+        pipeline_parallel=topology.stages > 1,
+        stage_links=links,
+    )
+
+
 def run_worker(args: argparse.Namespace) -> int:
     """Initialize one strict rank, load only its layers, then serve on rank zero."""
 
@@ -1319,6 +1371,10 @@ def run_worker(args: argparse.Namespace) -> int:
         )
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
+    stage_link_specs = decode_worker_stage_links(args.plan)
+    wiring = _build_worker_topology(
+        group, assignments, tensor_parallel_size, stage_link_specs
+    )
 
     # Cluster v2: a deployment may give each node its own absolute model path.
     # The rank's path comes from the signed contract's path_map; nodes without
@@ -1440,7 +1496,7 @@ def run_worker(args: argparse.Namespace) -> int:
             set_assigned_stage,
         )
 
-        with install_pipeline_compatibility(assignments):
+        with install_pipeline_compatibility(wiring.column_assignments):
             # Compatibility hooks are installed before asking about support,
             # so the answer describes the exact methods load_default() will
             # call. Unknown and custom unmarked methods remain fail-closed.
@@ -1464,6 +1520,9 @@ def run_worker(args: argparse.Namespace) -> int:
                     tensor_parallel_size=tensor_parallel_size,
                 )
             )
+            if wiring.hybrid:
+                provider.pipeline_group = wiring.topology.pipeline_group
+                provider.tensor_group = wiring.topology.tensor_group
             # Load synchronously on every rank so a "ready" event means the
             # complete distributed graph and weights are resident.
             #
@@ -1509,7 +1568,9 @@ def run_worker(args: argparse.Namespace) -> int:
                 **_loaded_stage(provider.model),
             )
             # Validate the loaded pipeline stage before any TP mutation
-            _validate_loaded_stage(provider.model, assignment)
+            _validate_loaded_stage(
+                provider.model, wiring.stage_assignment or assignment
+            )
             # A model that builds its own stage proves, with one collective
             # issued after the load, that every rank agrees on the wire
             # layout and that the ranges chain from layer 0 to the last.
@@ -1517,7 +1578,9 @@ def run_worker(args: argparse.Namespace) -> int:
                 getattr(getattr(provider.model, "model", None), "pipeline_stage", None)
                 is not None
             ):
-                model_adapter(provider.model).verify_contract(provider.model, group)
+                model_adapter(provider.model).verify_contract(
+                    provider.model, wiring.pipeline_group
+                )
             # Pure TP was applied layer-by-layer by the progressive loader.
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
@@ -1526,16 +1589,16 @@ def run_worker(args: argparse.Namespace) -> int:
             with (
                 install_stage_links(
                     mx,
-                    group,
-                    decode_worker_stage_links(args.plan),
-                    rank=rank,
+                    wiring.pipeline_group,
+                    wiring.stage_links,
+                    rank=wiring.topology.stage if wiring.hybrid else rank,
                 ) as stage_links,
                 install_runtime_optimizations(
                     provider.model,
-                    group,
+                    wiring.runtime_group,
                     execution,
                     batchable=provider.is_batchable,
-                    pipeline_parallel=tensor_parallel_size == 1,
+                    pipeline_parallel=wiring.pipeline_parallel,
                     runtime_options=runtime_options,
                 ) as optimizations,
             ):

@@ -9,7 +9,11 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from .tensor_strategies import apply_tensor_strategy, supports_model_type
+from .tensor_strategies import (
+    apply_tensor_strategy,
+    native_shard_is_layer_local,
+    supports_model_type,
+)
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -133,7 +137,10 @@ def progressive_sharded_load(
         trust_remote_code=trust_remote_code,
     )
     has_pipeline = hasattr(model, "model") and hasattr(model.model, "pipeline")
-    has_native_tensor = callable(getattr(model, "shard", None))
+    native_shard = getattr(model, "shard", None)
+    has_native_tensor = callable(native_shard) and bool(
+        native_shard_is_layer_local(native_shard)[0]
+    )
     model_type = str(
         getattr(
             model,
@@ -157,9 +164,11 @@ def progressive_sharded_load(
     if not has_pipeline and not has_tensor and tensor_group is None:
         raise ValueError("The model does not support any sharding")
     if pipeline_group is not None and tensor_group is not None:
-        raise ValueError(
-            "progressive loading does not combine pipeline and tensor groups"
-        )
+        if pipeline_group is tensor_group:
+            raise ValueError("pipeline_group and tensor_group must be distinct")
+        for name, grp in (("pipeline", pipeline_group), ("tensor", tensor_group)):
+            if int(grp.size()) < 1:
+                raise ValueError(f"{name}_group has invalid size {grp.size()}")
     if pipeline_group is tensor_group is None:
         group = mx_module.distributed.init()
         if has_tensor:
@@ -195,25 +204,27 @@ def progressive_sharded_load(
     adapter = getattr(model, "_omlx_adapter", None)
     layer_index = adapter.trunk_layer_index if adapter is not None else _layer_index
     if pipeline_group is not None:
+        # Partition before any evaluation so only stage-local layers exist.
         model.model.pipeline(pipeline_group)
-        materialize_parameters_progressively(
-            model.parameters(),
-            mx_module=mx_module,
-            tree_flatten=utils_module.tree_flatten,
-            progress=progress,
-            layer_index=layer_index,
-        )
-    elif tensor_group is not None:
+        if tensor_group is None:
+            materialize_parameters_progressively(
+                model.parameters(),
+                mx_module=mx_module,
+                tree_flatten=utils_module.tree_flatten,
+                progress=progress,
+                layer_index=layer_index,
+            )
+    if tensor_group is not None:
         # Fixed embeddings/head weights are replicated. Materialize them first;
         # each strategy then materializes, shards, evaluates and releases one
         # transformer layer before touching the next.
         flat = utils_module.tree_flatten(model.parameters())
-        fixed = [value for path, value in flat if _layer_index(path) is None]
+        fixed = [value for path, value in flat if layer_index(path) is None]
         layer_count = len(
             {
                 index
                 for path, _value in flat
-                if (index := _layer_index(path)) is not None
+                if (index := layer_index(path)) is not None
             }
         )
         if progress is not None:
@@ -242,7 +253,7 @@ def progressive_sharded_load(
         sharded_fixed = [
             value
             for path, value in utils_module.tree_flatten(model.parameters())
-            if _layer_index(path) is None
+            if layer_index(path) is None
         ]
         _eval_values(mx_module, sharded_fixed)
         mx_module.clear_cache()

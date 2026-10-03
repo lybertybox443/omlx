@@ -1818,3 +1818,57 @@ def test_install_thinking_budget_support_is_noop_without_think_tokens():
     with inference_worker._install_thinking_budget_support(server, Tokenizer()):
         assert server._make_logits_processors(None) == ["base-processor"]
     assert server._make_logits_processors is FakeServer._make_logits_processors
+
+
+def test_hybrid_worker_topology_column_and_link_translation():
+    import dataclasses
+
+    from omlx.cluster.inference_worker import _build_worker_topology
+
+    class G:
+        def __init__(self, r, n):
+            self.r, self.n = r, n
+
+        def rank(self):
+            return self.r
+
+        def size(self):
+            return self.n
+
+        def split(self, color, key):
+            return G(key, 2)
+
+    @dataclasses.dataclass(frozen=True)
+    class A:
+        rank: int
+        tensor_parallel_size: int
+        tensor_parallel_rank: int
+        start_layer: int
+        end_layer: int
+
+    world = G(3, 4)  # early stage 0 (layers 0:4), tp_rank 1
+    # Real planner: highest stage owns early layers, rank 0 owns late layers.
+    items = [A(r, 2, r % 2, 4 - (r // 2) * 4, 8 - (r // 2) * 4) for r in range(4)]
+    w = _build_worker_topology(world, items, 2, ())
+    assert w.hybrid and w.topology.world_group is world
+    assert w.topology.pipeline_group is not w.topology.tensor_group
+    assert [a.rank for a in w.column_assignments] == [0, 1]
+    assert [a.tensor_parallel_rank for a in w.column_assignments] == [1, 1]
+    assert w.stage_assignment.rank == 1 and w.stage_assignment.start_layer == 0
+    assert [a.rank for a in items] == [0, 1, 2, 3]  # originals untouched
+    assert w.pipeline_parallel and w.runtime_group is w.topology.pipeline_group
+    from omlx.cluster.rdma.stage_plan import StageLink
+
+    link = StageLink(2, 0, "mbx", "/tmp/s.sock", rank_stride=2)
+    calls = []
+    assert _build_worker_topology(world, items, 2, (link,)).stage_links == ()
+    w0 = _build_worker_topology(G(2, 4), items, 2, (link,))
+    assert [(x.sender_rank, x.receiver_rank, x.link) for x in w0.stage_links] == [
+        (1, 0, "mbx")
+    ]
+    bad = SimpleNamespace(
+        sender_rank=2, receiver_rank=0, link="mbx", service_socket="s", rank_stride=3
+    )
+    with pytest.raises(ValueError):
+        _build_worker_topology(world, items, 2, (bad,), build=calls.append)
+    assert calls == []  # refused before any group split
