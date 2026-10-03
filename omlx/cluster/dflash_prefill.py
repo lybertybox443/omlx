@@ -13,9 +13,19 @@ def install_dflash_prefill(model, drafter):
     original_prompt = PromptProcessingBatch.prompt
     original_generate = PromptProcessingBatch.generate
 
-    def media():
+    def media(batch, index):
         image = getattr(model, "_omlx_image_request", None)
-        return getattr(image, "capture_identity", None)
+        if image is not None:
+            return getattr(image, "capture_identity", None)
+        if not getattr(model, "_omlx_vision_cache_enabled", False):
+            return None
+        meta = getattr(batch.prompt_cache[-1], "cache", None)
+        if not isinstance(meta, list) or len(meta) < 2 or meta[1] is None:
+            return None
+        if meta[1].ndim != 2 or index >= meta[1].shape[0]:
+            return None
+        digest = bytes(meta[1][index].tolist())
+        return digest.hex() if any(digest) else None
 
     def prompt(batch, tokens):
         if batch.model is not model:
@@ -47,7 +57,7 @@ def install_dflash_prefill(model, drafter):
                     )
                     if uid not in sparse:
                         drafter.store_request_captures(
-                            str(uid), full[index], start + count, media()
+                            str(uid), full[index], start + count, media(batch, index)
                         )
             consumed += width
 
@@ -81,15 +91,40 @@ def install_dflash_prefill(model, drafter):
             model._omlx_dflash_sparse_prefill = None
             return
         restored = []
-        for uid, prefix in zip(batch.uids, batch.tokens):
+        for index, (uid, prefix) in enumerate(zip(batch.uids, batch.tokens)):
             restored.append(
                 uid in prepared
                 or not prefix
                 or drafter.restore_request_captures(
-                    str(uid), prefix, len(prefix), media()
+                    str(uid), prefix, len(prefix), media(batch, index)
                 )
             )
-        if not all(restored):
+        missing = [i for i, ok in enumerate(restored) if not ok]
+        if (
+            missing
+            and getattr(model, "_omlx_image_request", None) is None
+            and any(media(batch, i) is not None for i in missing)
+        ):
+            raise RuntimeError(
+                "DFlash image capture missing without active image request"
+            )
+        if missing and len(missing) < len(restored):
+            prefixes = [list(batch.tokens[i]) for i in missing]
+            work = batch._copy()
+            work.filter(missing)
+            for i in missing:
+                drafter.release_request(str(batch.uids[i]))
+            work.prompt_cache = _merge_caches([model.make_cache() for _ in missing])
+            work.tokens = [[] for _ in missing]
+            prompt(work, prefixes)
+            local = {index: n for n, index in enumerate(missing)}
+            batch.prompt_cache = _merge_caches(
+                [
+                    work.extract_cache(local[i]) if i in local else batch.extract_cache(i)
+                    for i in range(len(restored))
+                ]
+            )
+        elif missing:
             prefixes = [list(row) for row in batch.tokens]
             for uid in batch.uids:
                 drafter.release_request(str(uid))
@@ -150,9 +185,17 @@ def install_dflash_prefill(model, drafter):
     PromptProcessingBatch.generate = generate
     PromptProcessingBatch._copy = copy
     PromptProcessingBatch.extend = extend
+    flag = "_omlx_prefill_capture_active"
+    had_flag = flag in vars(drafter)
+    old_flag = vars(drafter).get(flag)
+    setattr(drafter, flag, True)
     try:
         yield
     finally:
+        if had_flag:
+            setattr(drafter, flag, old_flag)
+        else:
+            vars(drafter).pop(flag, None)
         PromptProcessingBatch.prompt = original_prompt
         PromptProcessingBatch.generate = original_generate
         PromptProcessingBatch._copy = original_copy

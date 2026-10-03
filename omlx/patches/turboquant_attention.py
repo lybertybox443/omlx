@@ -449,10 +449,12 @@ def _patch_vlm_target_verify_attention() -> None:
     The upstream verify path slices ``keys[:, :, : prefix + i + 1, :]`` per
     draft row before calling SDPA. With TurboQuant the fetched keys/values
     are packed ``_QuantizedStateProxy`` objects that are not subscriptable,
-    so every verify forward crashes (issue #2139). Route TurboQuant caches
-    through one causal SDPA call instead — the TurboQuant-patched dispatcher
-    handles decode-shaped multi-row natively with identical semantics (row i
-    attends the first ``prefix + i + 1`` positions).
+    so every verify forward crashes (issue #2139). Unpadded single-row
+    caches keep the packed causal SDPA path. Left-padded batches and explicit
+    array masks dequantize the packed state once, then run dense attention
+    per padding group and query: leading padding is trimmed, keys are
+    cut at the causal end, and the caller's array mask (bool or additive,
+    broadcast over batch/query/key dims) is sliced to match.
     """
     try:
         from mlx_vlm.models.qwen3_5 import language as q35_lang
@@ -487,31 +489,76 @@ def _patch_vlm_target_verify_attention() -> None:
             return sdpa(
                 queries, keys, values, cache=cache, scale=scale, mask="causal"
             )
-        # Left-padded batches / explicit array masks: dequantize once and
-        # replicate the caller's per-row causal slicing on dense arrays.
+        # Dequantize once; preserve upstream padding groups and explicit masks.
         dk, dv = real_cache.dequantize(keys_state=keys, values_state=values)
         dk = dk.astype(queries.dtype)
         dv = dv.astype(queries.dtype)
         L = queries.shape[2]
-        prefix_len = dk.shape[-2] - L
-        return mx.concatenate(
-            [
-                sdpa(
-                    queries[:, :, i : i + 1, :],
-                    dk[:, :, : prefix_len + i + 1, :],
-                    dv[:, :, : prefix_len + i + 1, :],
-                    cache=None,
-                    scale=scale,
-                    mask=(
-                        mask[..., i : i + 1, : prefix_len + i + 1]
-                        if isinstance(mask, mx.array) and mask.ndim >= 4
-                        else None
-                    ),
-                )
-                for i in range(L)
-            ],
-            axis=2,
-        )
+        B = queries.shape[0]
+
+        pads = None
+        for c in (cache, real_cache):
+            pads = getattr(c, "_qwen3_5_decode_left_padding", None)
+            if pads is not None:
+                break
+        if pads is None:
+            for c in (cache, real_cache):
+                info = q35_lang._qwen3_5_left_padding_info(c)
+                if info is not None and info[1] > 0:
+                    pads = info[0]
+                    break
+        if pads is not None:
+            pads = [int(p) for p in pads]
+            if len(pads) != B or max(pads) <= 0:
+                pads = None
+
+        def _rows(q, k, v, m, pad):
+            pl = k.shape[-2] - L
+
+            def _crop(i):
+                if m is None:
+                    return None
+                r = m[..., 0:1, :] if m.shape[-2] == 1 else m[..., i : i + 1, :]
+                if r.shape[-1] == 1:
+                    return r
+                return r[..., pad : pad + pl + i + 1]
+
+            return mx.concatenate(
+                [
+                    sdpa(
+                        q[:, :, i : i + 1, :],
+                        k[:, :, : pl + i + 1, :],
+                        v[:, :, : pl + i + 1, :],
+                        cache=None,
+                        scale=scale,
+                        mask=_crop(i),
+                    )
+                    for i in range(L)
+                ],
+                axis=2,
+            )
+
+        arr_mask = mask if isinstance(mask, mx.array) and mask.ndim >= 4 else None
+        if pads is None:
+            return _rows(queries, dk, dv, arr_mask, 0)
+
+        outs = {}
+        for pad in sorted(set(pads)):
+            rows = [i for i, p in enumerate(pads) if p == pad]
+            idx = mx.array(rows, dtype=mx.int32)
+            gm = arr_mask
+            if gm is not None and gm.shape[0] == B and B > 1:
+                gm = mx.take(gm, idx, axis=0)
+            out = _rows(
+                mx.take(queries, idx, axis=0),
+                mx.take(dk, idx, axis=0)[:, :, pad:, :],
+                mx.take(dv, idx, axis=0)[:, :, pad:, :],
+                gm,
+                pad,
+            )
+            for j, r in enumerate(rows):
+                outs[r] = out[j : j + 1]
+        return mx.concatenate([outs[i] for i in range(B)], axis=0)
 
     q35_lang._qwen3_5_left_padded_attention = patched
     q35_lang._omlx_tq_target_verify_original = original

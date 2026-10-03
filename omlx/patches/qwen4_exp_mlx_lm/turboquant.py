@@ -105,6 +105,8 @@ class QSATurboQuantKVCache(_QSAIndexerCache, _BaseCache):
         memo[id(self)] = copied
         copied.state = deepcopy(self.state, memo)
         copied.meta_state = self.meta_state
+        copied._cache.key_codec = deepcopy(self._cache.key_codec, memo)
+        copied._cache.value_codec = deepcopy(self._cache.value_codec, memo)
         return copied
 
     def extract(self, index):
@@ -127,6 +129,8 @@ class QSATurboQuantKVCache(_QSAIndexerCache, _BaseCache):
             _filter_state(values, indices),
         )
         result.meta_state = self.meta_state
+        result._cache.key_codec = self._cache.key_codec
+        result._cache.value_codec = self._cache.value_codec
         positions = self.index_position_ids
         positions = (
             positions[:, index : index + 1]
@@ -278,9 +282,38 @@ class _BatchTurboQuantStorage(BatchTurboQuantKVCache):
         import mlx.core as mx
 
         self.keys = _map_state(self.keys, lambda array, ndim: mx.depends(array, value))
+        self.values = _map_state(self.values, lambda array, ndim: mx.depends(array, value))
 
     def size(self):
         return self._idx
+
+    def _zero_length_like(self, src, rows):
+        """Zero-length packed K/V with `rows` batch and src codecs; no data copied."""
+        import mlx.core as mx
+
+        def empty(array, ndim):
+            return mx.zeros((rows,) + tuple(array.shape[1:]), dtype=array.dtype)
+
+        return (
+            _map_state(_slice_state(src.keys, 0), empty),
+            _map_state(_slice_state(src.values, 0), empty),
+        )
+
+    def extend(self, other):
+        from copy import copy
+
+        if self.keys is None and other.keys is not None:
+            self.keys, self.values = self._zero_length_like(
+                other, self.left_padding.shape[0]
+            )
+            self.key_codec, self.value_codec = other.key_codec, other.value_codec
+        elif other.keys is None and self.keys is not None:
+            other = copy(other)
+            other.keys, other.values = self._zero_length_like(
+                self, other.left_padding.shape[0]
+            )
+            other.key_codec, other.value_codec = self.key_codec, self.value_codec
+        super().extend(other)
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         import mlx.core as mx
@@ -300,6 +333,10 @@ class _BatchTurboQuantStorage(BatchTurboQuantKVCache):
         if padding is None:
             return
         if self.keys is not None:
+            # Rejected right-padding tokens may hold NaN; clear only that tail.
+            for row, p in enumerate(padding.tolist()):
+                if p > 0:
+                    self.zero_row_tail(row, max(0, self._idx - p), self._idx)
             # Roll the live prefix, never capacity slack after a speculative trim.
             def roll(array, ndim):
                 return dynamic_roll(array, padding[:, None], axis=2)

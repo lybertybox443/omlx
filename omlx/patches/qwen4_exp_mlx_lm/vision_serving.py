@@ -161,18 +161,12 @@ class VisionRequest:
             self.save_prefix = None
 
     def copy_cache(self, cache):
-        import mlx.core as mx
-        from mlx.utils import tree_map
+        from copy import deepcopy
 
-        snapshot = self.make_cache()
-        for source, target in zip(cache, snapshot, strict=True):
-            if hasattr(source, "extract"):
-                source = source.extract(0)
-            target.state = tree_map(
-                lambda value: mx.array(value) if isinstance(value, mx.array) else value,
-                source.state,
-            )
-        return snapshot
+        return [
+            deepcopy(entry.extract(0) if hasattr(entry, "extract") else entry)
+            for entry in cache
+        ]
 
     def forward_kwargs(self, inputs):
         start = self.offset
@@ -220,6 +214,177 @@ class ImageCache:
         return cache, rest
 
 
+_IMAGE_PREFILL_COUNTER = __import__("itertools").count()
+
+
+class ImageCohortCache:
+    """Wrap base cache for image cohorts; prefill an image prompt prefix collectively."""
+
+    def __init__(self, cache, model):
+        self.cache, self.model, self.pending = cache, model, None
+
+    def __getattr__(self, name):
+        return getattr(self.cache, name)
+
+    def __len__(self):
+        return len(self.cache)
+
+    def _layers(self):
+        return sum(layer is not None for layer in self.model.model.layers)
+
+    def _fail(self, error):
+        import mlx.core as mx
+
+        if int(mx.distributed.all_sum(mx.array(int(error is not None))).item()):
+            raise RuntimeError(f"image prefill preparation failed: {error or 'peer rank'}")
+
+    def _snapshot(self, state, cache, count):
+        copy_ = state.copy_cache(cache)
+        ensure_vision_metadata(copy_, count, state.deltas, state.capture_identity)
+        return copy_
+
+    def clear_pending(self):
+        pending, self.pending = self.pending, None
+        if pending is not None:
+            drafter = pending.get("drafter")
+            capture_id = pending.get("capture_request_id")
+            if drafter is not None and capture_id is not None:
+                drafter.release_request(capture_id)
+
+    def prepare(self, key, payload, prompt, prefill_step_size):
+        import mlx.core as mx
+
+        self.clear_pending()
+        error = state = cache = rest = drafter = temp_id = None
+        namespaced = (key, "image", payload.get("identity"))
+        try:
+            state = VisionRequest(self.model, payload)
+        except Exception as exc:
+            error = exc
+        self._fail(error)
+        try:
+            count = self._layers()
+            base, rest = self.cache.fetch_nearest_cache(namespaced, prompt)
+            if len(rest) == 0:
+                raise ValueError("fully cached image prompt cannot be re-prefixed")
+            if base is None:
+                cache = self.model.make_cache()
+            else:
+                ensure_vision_metadata(base, count, state.deltas, state.capture_identity)
+                cache = state.copy_cache(base)
+            ensure_vision_metadata(cache, count, state.deltas, state.capture_identity)
+            state.offset = len(prompt) - len(rest)
+            drafter = getattr(self.model.language_model, "_omlx_drafter", None)
+            if drafter is not None and getattr(drafter, "_omlx_prefill_capture_active", False):
+                temp_id = f"image-prefill:{next(_IMAGE_PREFILL_COUNTER)}"
+                if state.offset > 0 and not drafter.restore_request_captures(
+                    temp_id, prompt, state.offset, state.capture_identity
+                ):
+                    # image hidden captures unavailable: redo whole prompt, never as text
+                    cache = self.model.make_cache()
+                    ensure_vision_metadata(cache, count, state.deltas, state.capture_identity)
+                    state.offset = 0
+                    rest = list(prompt)
+            else:
+                drafter = None
+        except Exception as exc:
+            error = exc
+        if error is not None and drafter is not None and temp_id is not None:
+            drafter.release_request(temp_id)
+        try:
+            self._fail(error)
+        except BaseException:
+            if drafter is not None and temp_id is not None and error is None:
+                drafter.release_request(temp_id)
+            raise
+        language = self.model.language_model
+        missing = object()
+        prior = [
+            getattr(self.model, "_omlx_image_request", missing),
+            getattr(language, "_position_ids", None),
+            getattr(language, "_rope_deltas", None),
+        ]
+        object.__setattr__(self.model, "_omlx_image_request", state)
+        prior_capture = getattr(self.model, "_omlx_dflash_prefill_capture", missing)
+        ok = False
+        if drafter is not None:
+            identity = state.capture_identity
+
+            def capture(hidden, width):
+                mx.eval(hidden)
+                drafter.seed_request(temp_id, hidden, position=state.offset - width)
+                drafter.store_request_captures(
+                    temp_id, prompt, state.offset, identity
+                )
+
+            object.__setattr__(self.model, "_omlx_dflash_prefill_capture", capture)
+        try:
+            end = len(prompt) - 1
+            while state.offset < end:
+                stop = min(state.offset + prefill_step_size, end)
+                snap = getattr(self.cache, "prefill_snapshot_step", None)
+                if isinstance(snap, int) and snap > 0:
+                    stop = min(stop, (state.offset // snap + 1) * snap)
+                inputs = mx.array(prompt[state.offset : stop])[None]
+                logits = self.model(inputs, cache=cache)
+                mx.eval(logits, [entry.state for entry in cache])
+                state.offset = stop
+                save = getattr(self.cache, "save_prefill_snapshot", None)
+                if callable(save) and isinstance(snap, int) and snap > 0 and stop % snap == 0:
+                    save(namespaced, prompt[:stop], self._snapshot(state, cache, count))
+            self.cache.insert_cache(namespaced, prompt[:-1], self._snapshot(state, cache, count))
+            ok = True
+        finally:
+            if drafter is not None:
+                if prior_capture is missing:
+                    object.__delattr__(self.model, "_omlx_dflash_prefill_capture")
+                else:
+                    object.__setattr__(self.model, "_omlx_dflash_prefill_capture", prior_capture)
+                if not ok:
+                    drafter.release_request(temp_id)
+            if prior[0] is missing:
+                object.__delattr__(self.model, "_omlx_image_request")
+            else:
+                object.__setattr__(self.model, "_omlx_image_request", prior[0])
+            language._position_ids, language._rope_deltas = prior[1], prior[2]
+        self.pending = {
+            "key": key, "prompt": list(prompt), "cache": cache,
+            "rest": list(rest), "all_tokens": list(prompt[:-1]),
+        }
+        if drafter is not None and state.offset > 0:
+            self.pending["drafter"] = drafter
+            self.pending["capture_request_id"] = temp_id
+        elif drafter is not None:
+            drafter.release_request(temp_id)
+
+    def fetch_nearest_cache(self, key, prompt):
+        p = self.pending
+        if p and p["key"] == key and p["prompt"] == list(prompt):
+            return p["cache"], p["rest"]
+        self.clear_pending()
+        return self.cache.fetch_nearest_cache(key, prompt)
+
+    def prefetch_nearest_cache(self, key, prompt):
+        p = self.pending
+        if p and p["key"] == key and p["prompt"] == list(prompt):
+            return p["cache"], p["rest"]
+        self.clear_pending()
+        return self.cache.prefetch_nearest_cache(key, prompt)
+
+    def insert_cache(self, key, tokens, cache, **kwargs):
+        count = self._layers()
+        if len(cache) == count + 1 and not (
+            isinstance(key, tuple) and len(key) == 3 and key[1] == "image"
+        ):
+            tail = ensure_vision_metadata(cache, count)
+            digest = bytes(tail.cache[1][0].tolist())
+            if any(digest):
+                key = (key, "image", digest.hex())
+        elif len(cache) not in (count, count + 1):
+            raise ValueError("vision cache length mismatch")
+        return self.cache.insert_cache(key, tokens, cache, **kwargs)
+
+
 @contextmanager
 def install_vision_serving(model, provider, server):
     import mlx.core as mx
@@ -231,6 +396,10 @@ def install_vision_serving(model, provider, server):
     original_tokenize = generator._tokenize
     original_single = generator._serve_single
     original_generate = server.stream_generate
+    batch_cls = server.BatchGenerator
+    original_insert = batch_cls.insert_segments
+    controller = None
+    wrapped = []
     processor = None
     missing = object()
     prior_marker = getattr(model, "_omlx_vision_cache_enabled", missing)
@@ -257,13 +426,28 @@ def install_vision_serving(model, provider, server):
         return original_share(self, request)
 
     def batchable(self, args):
-        return not hasattr(args, "_omlx_image") and original_batchable(self, args)
+        return original_batchable(self, args)
 
     def tokenize(self, tokenizer, request, args):
+        nonlocal controller
         payload = getattr(args, "_omlx_image", None)
+        if isinstance(self.prompt_cache, ImageCohortCache):
+            self.prompt_cache.clear_pending()
         if payload is None:
             return original_tokenize(self, tokenizer, request, args)
+        if "error" in payload:
+            raise ValueError(payload["error"])
         prompt = payload["input_ids"][0].tolist()
+        if original_batchable(self, args) and getattr(
+            model, "_omlx_image_request", None
+        ) is None:
+            if not isinstance(self.prompt_cache, ImageCohortCache):
+                wrapped.append((self, self.prompt_cache))
+                self.prompt_cache = ImageCohortCache(self.prompt_cache, model)
+            controller = self.prompt_cache
+            controller.prepare(
+                provider.model_key, payload, prompt, self.cli_args.prefill_step_size
+            )
         state = "normal"
         if tokenizer.has_thinking and tokenizer.rfind_think_start(
             prompt
@@ -277,6 +461,10 @@ def install_vision_serving(model, provider, server):
         if payload is None:
             return original_single(self, request, stream)
         cache = self.prompt_cache
+        base = cache
+        if isinstance(cache, ImageCohortCache):
+            cache.clear_pending()
+            base = cache.cache
         try:
             if "error" in payload:
                 raise ValueError(payload["error"])
@@ -292,7 +480,7 @@ def install_vision_serving(model, provider, server):
                 raise ValueError(
                     "image embedding preparation failed on a rank"
                 ) from failure
-            self.prompt_cache = ImageCache(cache, payload["identity"], state)
+            self.prompt_cache = ImageCache(base, payload["identity"], state)
             state.save_prefix = lambda tokens, snapshot: self.prompt_cache.insert_cache(
                 self.model_provider.model_key, tokens, snapshot
             )
@@ -317,6 +505,50 @@ def install_vision_serving(model, provider, server):
         else:
             yield from original_generate(*args, **kwargs)
 
+    def insert_segments(
+        self,
+        segments,
+        max_tokens=None,
+        caches=None,
+        all_tokens=None,
+        samplers=None,
+        logits_processors=None,
+        stop_sequences=None,
+    ):
+        pending = controller.pending if controller is not None else None
+        if (
+            self.model is model
+            and pending is not None
+            and caches is not None
+            and len(caches) == 1
+            and caches[0] is pending["cache"]
+        ):
+            segments = [[[pending["prompt"][-1]]]]
+            all_tokens = [pending["all_tokens"]]
+            controller.pending = None
+        else:
+            pending = None
+        capture_id = pending.get("capture_request_id") if pending else None
+        try:
+            uids = original_insert(
+                self,
+                segments=segments,
+                max_tokens=max_tokens,
+                caches=caches,
+                all_tokens=all_tokens,
+                samplers=samplers,
+                logits_processors=logits_processors,
+                stop_sequences=stop_sequences,
+            )
+            if capture_id is not None:
+                pending["drafter"].adopt_request(capture_id, str(uids[0]))
+        except BaseException:
+            if capture_id is not None:
+                pending["drafter"].release_request(capture_id)
+            raise
+        return uids
+
+    batch_cls.insert_segments = insert_segments
     server.stream_generate = generate
     generator._share_request = share
     generator._is_batchable = batchable
@@ -329,6 +561,11 @@ def install_vision_serving(model, provider, server):
             object.__delattr__(model, "_omlx_vision_cache_enabled")
         else:
             object.__setattr__(model, "_omlx_vision_cache_enabled", prior_marker)
+        batch_cls.insert_segments = original_insert
+        for owner, base in wrapped:
+            if isinstance(owner.prompt_cache, ImageCohortCache):
+                owner.prompt_cache.clear_pending()
+            owner.prompt_cache = base
         server.stream_generate = original_generate
         generator._share_request = original_share
         generator._is_batchable = original_batchable

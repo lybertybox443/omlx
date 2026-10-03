@@ -122,6 +122,7 @@ def served(
     simulate_cutoff=False,
     trace_capture_restore=False,
     trace_cohort=False,
+    trace_image_cohort=False,
 ):
     state = tmp_path / "state"
     port = free_port()
@@ -201,6 +202,38 @@ def served(
             "fused._tree_group = traced\n"
         )
         environment["PYTHONPATH"] = str(injection) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    if trace_image_cohort:
+        import os
+        injection = tmp_path / "trace-worker"
+        injection.mkdir(exist_ok=True)
+        _append_text(injection / "sitecustomize.py",
+            "from contextlib import contextmanager\n"
+            "import omlx.patches.qwen4_exp_mlx_lm.vision_serving as vision\n"
+            "original_install = vision.install_vision_serving\n"
+            "@contextmanager\n"
+            "def traced_install(model, provider, server):\n"
+            "    cls = type(model)\n"
+            "    original_call = cls.__call__\n"
+            "    def traced_call(self, inputs, *args, **kwargs):\n"
+            "        cache = kwargs.get('cache')\n"
+            "        if cache is None and args:\n"
+            "            cache = args[0]\n"
+            "        if cache is not None and self is model and inputs.shape[0] >= 2:\n"
+            "            import mlx.core as mx\n"
+            "            digest = cache[-1].cache[1]\n"
+            "            if (digest.ndim == 2 and digest.shape == (inputs.shape[0], 32)\n"
+            "                    and bool(mx.any(digest != 0).item()) and mx.distributed.init().rank() == 0):\n"
+            "                print('IMAGE_COHORT_DECODE', inputs.shape[0], flush=True)\n"
+            "        return original_call(self, inputs, *args, **kwargs)\n"
+            "    cls.__call__ = traced_call\n"
+            "    try:\n"
+            "        with original_install(model, provider, server):\n"
+            "            yield\n"
+            "    finally:\n"
+            "        cls.__call__ = original_call\n"
+            "vision.install_vision_serving = traced_install\n"
+        )
+        environment["PYTHONPATH"] = str(injection) + os.pathsep + os.environ.get("PYTHONPATH", "")
     with RingProcesses(size, lambda rank: argv, env=environment) as processes:
         deadline = time.monotonic() + READY_TIMEOUT
         while True:
@@ -242,6 +275,8 @@ class SimpleServed:
         url = f"http://127.0.0.1:{self.port}/v1/chat/completions"
         if not stream:
             reply = httpx.post(url, json=body, timeout=timeout)
+            if reply.is_error:
+                print("WORKER_HTTP_ERROR", reply.status_code, reply.text[:2000], flush=True)
             reply.raise_for_status()
             return reply.json()
         pieces = []
@@ -519,6 +554,41 @@ def test_image_http_matches_whole_model_and_isolates_cache(
         assert reply.status_code >= 400
         assert "image preparation failed" in reply.text
         assert _content(server.chat(red)) == expected_red
+
+
+@pytest.mark.parametrize("ranges", [TWO_RANKS, THREE_RANKS])
+def test_image_cohorts_mix_media_text_and_replay(
+    checkpoint, tmp_path, ranges, reference
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    red = _image_content((255, 0, 0))
+    blue = _image_content((0, 0, 255))
+    blue[0] = {"type": "text", "text": "w10 w11 w12 w13 w14 w15 w16 w17 w18"}
+    expected_red = _whole_image_reference(checkpoint, red)
+    expected_blue = _whole_image_reference(checkpoint, blue)
+    expected_text = reference(PROMPTS[0])
+    expected = {"red": expected_red, "blue": expected_blue, "text": expected_text}
+    requests = {"red": red, "blue": blue, "text": PROMPTS[0]}
+    with served(
+        checkpoint, ranges, tmp_path, prefill_step_size=2, trace_image_cohort=True
+    ) as server:
+        for order in (("red", "blue", "text"), ("blue", "text", "red")):
+            with ThreadPoolExecutor(3) as pool:
+                futures = {
+                    name: pool.submit(server.chat, requests[name], timeout=90)
+                    for name in order
+                }
+                for name, future in futures.items():
+                    assert _content(future.result()) == expected[name], name
+        assert server.chat(red, stream=True) == expected_red
+        output = "".join(server.processes.output(0))
+        sizes = [
+            int(line.split()[1])
+            for line in output.splitlines()
+            if line.startswith("IMAGE_COHORT_DECODE ")
+        ]
+        assert sizes and max(sizes) >= 2
 
 
 @pytest.fixture(scope="module")
@@ -991,6 +1061,101 @@ def test_turboquant_ssd_restart(checkpoint, tmp_path):
                 assert result["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
             else:
                 expected = _content(result)
+
+
+@pytest.mark.parametrize("draft", ["ordinary", "native", "external", "dflash", "ddtree"])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("ssd", [False, True])
+def test_image_speculative_cohorts_preserve_row_cache(
+    mtp_checkpoint, dflash_checkpoint, tmp_path, draft, quantized, ssd
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from omlx.cluster.dflash import runtime_settings as dflash_settings
+    from omlx.cluster.planner import inspect_safetensors_layout
+    from omlx.cluster.specprefill import DraftReservation
+    from omlx.patches.qwen4_exp_mlx_lm.external_mtp import inspect_head
+    from omlx.patches.qwen4_exp_mlx_lm.external_mtp import (
+        runtime_settings as external_settings,
+    )
+
+    compressed = {
+        "turboquant_kv_enabled": True,
+        "turboquant_kv_bits": 3.5,
+        "turboquant_skip_last": False,
+    } if quantized else {}
+    red = _image_content((255, 0, 0))
+    blue = _image_content((0, 0, 255))
+    blue[0] = {"type": "text", "text": "w10 w11 w12 w13 w14 w15 w16 w17 w18"}
+    requests = {"red": red, "blue": blue, "text": PROMPTS[0]}
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    with served(mtp_checkpoint, THREE_RANKS, baseline_dir,
+                extra_runtime_options=compressed) as server:
+        expected = {
+            name: _content(server.chat(prompt, timeout=30))
+            for name, prompt in requests.items()
+        }
+
+    options = dict(compressed)
+    depth = None
+    if draft == "native":
+        depth = 2
+    elif draft == "external":
+        options.update(external_settings(SimpleNamespace(
+            vlm_mtp_enabled=True, vlm_mtp_draft_model=str(mtp_checkpoint),
+            vlm_mtp_draft_block_size=3,
+        )))
+        _, reserve = inspect_head(mtp_checkpoint, 1024)
+        options.update(vlm_mtp_reserved_bytes=reserve, vlm_mtp_max_prompt_tokens=1024)
+    elif draft == "ordinary":
+        pass
+    else:
+        kwargs = {}
+        if draft == "ddtree":
+            kwargs = dict(
+                dflash_verify_mode="ddtree", dflash_ddtree_max_branches=3,
+                dflash_ddtree_max_nodes=7, dflash_ddtree_memory_bytes=1 << 40,
+            )
+        options.update(dflash_settings(SimpleNamespace(
+            dflash_enabled=True, dflash_draft_model=str(dflash_checkpoint),
+            dflash_block_size=3,
+            dflash_draft_sink_size=3,
+            # Capture store off: text prefix rebuilds, adopted image seed stays.
+            dflash_capture_cache=False,
+            dflash_async_prefill=True,
+            **kwargs,
+        )))
+        reserve = DraftReservation.from_layout(
+            inspect_safetensors_layout(dflash_checkpoint),
+            max_prompt_tokens=1024, workspace_bytes=1024**3,
+        )
+        options.update(
+            dflash_reserved_bytes=reserve.total_bytes,
+            dflash_max_prompt_tokens=1024,
+        )
+    with served(
+        mtp_checkpoint, THREE_RANKS, tmp_path, mtp_depth=depth,
+        extra_runtime_options=options, prefill_step_size=2,
+        trace_image_cohort=True, ssd_cache=ssd,
+    ) as server:
+        for order in (("red", "blue", "text"), ("blue", "text", "red")):
+            with ThreadPoolExecutor(3) as pool:
+                futures = {
+                    name: pool.submit(server.chat, requests[name], timeout=90)
+                    for name in order
+                }
+                for name, future in futures.items():
+                    assert _content(future.result()) == expected[name], name
+        assert server.chat(red, stream=True) == expected["red"]
+        output = "".join(server.processes.output(0))
+        sizes = [
+            int(line.split()[1])
+            for line in output.splitlines()
+            if line.startswith("IMAGE_COHORT_DECODE ")
+        ]
+        assert sizes and max(sizes) >= 2
 
 
 @pytest.mark.parametrize("draft", ["native", "external", "dflash", "ddtree"])

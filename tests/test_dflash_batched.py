@@ -912,3 +912,21 @@ def test_shared_drafter_evicts_once_reloads_once_and_shares_failure():
     peer = SharedDFlash(None, share=lambda value: {"error": "x"}, rank=1, evict=True)
     peer.fallback()
     assert peer.evicted and peer.ensure_loaded() is False and peer.reload_failed
+
+
+def test_adopt_request_restore_and_occupied_destination():
+    d = _tiny_drafter(seed=0, sink_size=0)
+    d.seed_request("image-temp", _captured(5, 19), position=0)
+    d.adopt_request("image-temp", "7")
+    assert d.restore_request_captures("7", list(range(5)), 5, "media") is True
+    assert d.restore_request_captures("7", list(range(5)), 6, "media") is False
+    d.bind_uid("7", 7)
+    row = d._row(7)
+    assert row.fed + sum(int(part.shape[1]) for part in row.pending) == 5
+    d.seed_request("src", _captured(3, 1), position=0)
+    d.seed_request("dst", _captured(3, 2), position=0)
+    with pytest.raises(ValueError):
+        d.adopt_request("src", "dst")
+    assert "src" in d._request_seeds and "dst" in d._request_seeds
+    for rid in ("src", "dst", "7"):
+        d.release_request(rid)

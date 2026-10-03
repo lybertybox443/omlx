@@ -63,6 +63,8 @@ def install_specprefill_serving(model, provider, server, options, *, group=None)
     scorer = None
 
     def batchable(self, args):
+        if getattr(args, "_omlx_image", None) is not None:
+            return original_batchable(self, args)
         return False
 
     def single(self, request, stream):

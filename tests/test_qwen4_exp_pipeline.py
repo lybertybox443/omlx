@@ -114,6 +114,310 @@ def _assignments(ranges=RANGES, layers=LAYERS):
     ]
 
 
+@pytest.mark.parametrize("bits", [3, 3.5, 4])
+def test_turboquant_rollback_clears_poisoned_padding(bridge, bits):
+    from omlx.patches.qwen4_exp_mlx_lm.turboquant import (
+        BatchQSATurboQuantKVCache,
+    )
+
+    def leaves(state):
+        return [v for _, v in tree_flatten(state) if isinstance(v, mx.array)]
+
+    mx.random.seed(0)
+    cache = BatchQSATurboQuantKVCache([0, 0], bits=bits)
+    keys = mx.random.normal((2, 2, 5, 8))
+    values = mx.random.normal((2, 2, 5, 8))
+    cache.update_and_fetch(keys, values)
+    cache.update_indexer(
+        mx.random.normal((2, 5, 4)), mx.broadcast_to(mx.arange(5), (2, 5))
+    )
+    storage = cache.kv_cache
+    saved = [mx.array(v) for v in leaves((storage.keys, storage.values))]
+    mx.eval(saved)
+    storage.values.norms[0, :, 3:5] = float("nan")
+    cache.prepare(right_padding=[2, 0])
+    cache.finalize()
+
+    after = leaves((storage.keys, storage.values))
+    assert len(after) == len(saved)
+    for new, old in zip(after, saved):
+        if new.ndim < 3 or new.shape[2] < 5:
+            continue
+        if mx.issubdtype(new.dtype, mx.floating):
+            assert bool(mx.all(mx.isfinite(new)).item())
+        assert mx.array_equal(new[0, :, 2:5], old[0, :, 0:3])
+        assert mx.array_equal(new[1], old[1])
+
+    keys1 = mx.random.normal((2, 2, 1, 8))
+    cache.update_and_fetch(keys1, mx.random.normal((2, 2, 1, 8)))
+    cache.update_indexer(
+        mx.random.normal((2, 1, 4)), mx.array([[3], [5]])
+    )
+    mask = cache.make_mask(1)
+    if isinstance(mask, mx.array) and mx.issubdtype(mask.dtype, mx.floating):
+        assert bool(mx.all(mx.isfinite(mask)).item())
+    assert all(
+        bool(mx.all(mx.isfinite(v)).item())
+        for v in leaves((storage.keys, storage.values))
+        if mx.issubdtype(v.dtype, mx.floating)
+    )
+    assert cache.index_offset == cache.size()
+
+
+def test_image_cache_copy_keeps_turboquant_geometry(bridge):
+    from omlx.patches.qwen4_exp_mlx_lm.turboquant import QSATurboQuantKVCache
+    from omlx.patches.qwen4_exp_mlx_lm.vision_serving import VisionRequest
+
+    original = QSATurboQuantKVCache(bits=3.5, seed=7)
+    mx.random.seed(8)
+    k = mx.random.normal((1, 2, 5, 8))
+    v = mx.random.normal((1, 2, 5, 8))
+    original.update_and_fetch(k, v)
+    original.update_indexer(
+        mx.random.normal((1, 5, 4)),
+        mx.broadcast_to(mx.arange(5)[None, None, :], (3, 1, 5)),
+    )
+    mx.eval(original.state)
+
+    request = VisionRequest.__new__(VisionRequest)
+    copied = request.copy_cache([original])[0]
+
+    assert type(copied) is QSATurboQuantKVCache
+    assert copied.bits == original.bits
+    assert copied.seed == original.seed
+    assert original.offset == 5 and copied.offset == 5
+    assert original._cache.key_codec.dim == 8
+    assert original._cache.value_codec.dim == 8
+    assert copied._cache.key_codec is not None
+    assert copied._cache.value_codec is not None
+    assert copied._cache.key_codec.dim == 8
+    assert copied._cache.value_codec.dim == 8
+    assert copied._cache.key_codec is not original._cache.key_codec
+
+    def _deq(c):
+        out = (
+            c._cache.key_codec.dequantize(c._cache.keys),
+            c._cache.value_codec.dequantize(c._cache.values),
+        )
+        mx.eval(out)
+        return out
+
+    ok, ov = _deq(original)
+    ck, cv = _deq(copied)
+    assert mx.array_equal(ok, ck).item()
+    assert mx.array_equal(ov, cv).item()
+
+    before = [mx.array(a) for a in original.state if isinstance(a, mx.array)]
+    mx.eval(before)
+
+    copied.update_and_fetch(mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8)))
+    copied.update_indexer(
+        mx.random.normal((1, 1, 4)),
+        mx.broadcast_to(mx.arange(5, 6)[None, None, :], (3, 1, 1)),
+    )
+    mx.eval(copied.state)
+
+    assert original.offset == 5
+    assert copied.offset == 6
+    nk, nv = _deq(copied)
+    assert bool(mx.all(mx.isfinite(nk)).item()) and bool(mx.all(mx.isfinite(nv)).item())
+    ok2, ov2 = _deq(original)
+    assert mx.array_equal(ok, ok2).item()
+    assert mx.array_equal(ov, ov2).item()
+    after = [a for a in original.state if isinstance(a, mx.array)]
+    assert len(before) == len(after)
+    for b, a in zip(before, after):
+        assert mx.array_equal(b, a).item()
+
+
+@pytest.mark.parametrize("bits", [3.5, 4])
+@pytest.mark.parametrize("head_dim", [8, 32])
+def test_turboquant_active_join_preserves_rows(bridge, bits, head_dim):
+    from omlx.patches.qwen4_exp_mlx_lm.turboquant import QSATurboQuantKVCache
+
+    D = head_dim
+    lens = [17, 8, 23]
+
+    def build():
+        rows = []
+        for n in lens:
+            c = QSATurboQuantKVCache(bits=bits, seed=0)
+            k = mx.random.normal((1, 2, n, D))
+            v = mx.random.normal((1, 2, n, D))
+            ik = mx.random.normal((1, n, 4))
+            c.update_and_fetch(k, v)
+            c.update_indexer(ik, mx.arange(n)[None])
+            rows.append(c)
+        return rows
+
+    mx.random.seed(1)
+    rows = build()
+    mx.random.seed(1)
+    refs = build()
+    batch = QSATurboQuantKVCache.merge(rows[:2])
+    for j in range(6):
+        k = mx.random.normal((2, 2, 1, D))
+        v = mx.random.normal((2, 2, 1, D))
+        ik = mx.random.normal((2, 1, 4))
+        batch.update_and_fetch(k, v)
+        batch.update_indexer(ik, mx.array([[17 + j], [8 + j]]))
+        for i, p in enumerate((17, 8)):
+            refs[i].update_and_fetch(k[i:i + 1], v[i:i + 1])
+            refs[i].update_indexer(ik[i:i + 1], mx.array([[p + j]]))
+    batch.extend(rows[2].to_batch([0]))
+    offsets = []
+    for i in range(3):
+        got = batch.extract(i)
+        offsets.append(int(got.offset))
+        gk, gv = got.dequantize()
+        rk, rv = refs[i].dequantize()
+        assert mx.allclose(gk, rk, atol=1e-5).item()
+        assert mx.allclose(gv, rv, atol=1e-5).item()
+    assert offsets == [23, 14, 23]
+
+    q = mx.random.normal((3, 4, 1, D))
+    width = batch.size()
+    mask = (mx.arange(width)[None, :] >= mx.array(batch.left_padding)[:, None])
+    mask = mask[:, None, None, :]
+    fk, fv = batch.kv_cache.dequantize()
+    fk = mx.repeat(fk.astype(mx.float32), 2, axis=1)
+    fv = mx.repeat(fv.astype(mx.float32), 2, axis=1)
+    ref = mx.fast.scaled_dot_product_attention(
+        q.astype(mx.float32), fk, fv, scale=D ** -0.5, mask=mask
+    )
+    for _ in range(3):
+        out = batch.kv_cache.decode_attention(
+            q, keys_state=batch.kv_cache.state[0], values_state=batch.kv_cache.state[1], scale=D ** -0.5, mask=mask
+        )
+        mx.eval(out)
+        assert mx.all(mx.isfinite(out)).item()
+        assert mx.allclose(out.astype(mx.float32), ref, atol=3e-3).item()
+
+
+@pytest.mark.parametrize("bits", [3.5, 4])
+def test_turboquant_cold_padded_prefill_split_join(bridge, bits):
+    import copy
+
+    from omlx.patches.qwen4_exp_mlx_lm.turboquant import QSATurboQuantKVCache
+
+    D, H, W = 8, 2, 4
+
+    def warm(n):
+        c = QSATurboQuantKVCache(bits=bits, seed=0)
+        k = mx.random.normal((1, H, n, D))
+        v = mx.random.normal((1, H, n, D))
+        ik = mx.random.normal((1, n, W))
+        c.update_and_fetch(k, v)
+        c.update_indexer(ik, mx.arange(n)[None])
+        return c, k, v
+
+    mx.random.seed(3)
+    img17, k17, v17 = warm(17)
+    img26, k26, v26 = warm(26)
+    mx.random.seed(3)
+    ref17, _, _ = warm(17)  # independent dense-original reference
+    ref26, _, _ = warm(26)
+    mx.eval(ref17.state, ref26.state)
+    text = QSATurboQuantKVCache(bits=bits, seed=0)
+    ref_text = QSATurboQuantKVCache(bits=bits, seed=0)
+
+    reverse = QSATurboQuantKVCache.merge([text, img17])
+    assert reverse.kv_cache.keys.norms.shape[0] == 2
+    assert reverse.offset.tolist() == [0, 17]
+    assert reverse.left_padding.tolist() == [17, 0]
+    assert text._cache.keys is None and text._cache.values is None
+    batch = QSATurboQuantKVCache.merge([img17, text])
+    assert text._cache.keys is None and text._cache.values is None
+    batch.prepare(lengths=[0, 10], right_padding=[10, 0])
+    nan = mx.array(float("nan"))
+    for c0 in range(0, 10, 2):
+        k = mx.random.normal((2, H, 2, D))
+        v = mx.random.normal((2, H, 2, D))
+        v = mx.concatenate([mx.full((1, H, 2, D), nan), v[1:]], axis=0)
+        ik = mx.random.normal((2, 2, W))
+        pos = mx.array([[17 + c0, 18 + c0], [c0, c0 + 1]])
+        batch.update_and_fetch(k, v)
+        batch.update_indexer(ik, pos)
+        mx.eval(batch.state)
+        ref_text.update_and_fetch(k[1:], v[1:])
+        ref_text.update_indexer(ik[1:], pos[1:])
+    batch.finalize()
+    mx.eval(batch.state)
+
+    got = batch.extract(0)
+    gk, gv = got.dequantize()
+    rk, rv = ref17.dequantize()
+    assert mx.allclose(gk[..., :17, :], rk, atol=1e-5).item()
+    assert mx.allclose(gv[..., :17, :], rv, atol=1e-5).item()
+    fk, fv = batch.kv_cache.dequantize()
+    assert mx.all(mx.isfinite(fk)).item() and mx.all(mx.isfinite(fv)).item()
+
+    # PromptBatch.split: deepcopy, filter text row, copy image row.
+    text_c = copy.deepcopy(batch)
+    text_c.filter([1])
+    img_c = copy.deepcopy(batch)
+    img_c.filter([0])
+    tail = {}
+    for name, c, pos in (("img", img_c, 17), ("text", text_c, 10)):
+        k = mx.random.normal((1, H, 1, D))
+        v = mx.random.normal((1, H, 1, D))
+        ik = mx.random.normal((1, 1, W))
+        c.update_and_fetch(k, v)
+        c.update_indexer(ik, mx.array([[pos]]))
+        mx.eval(c.state)
+        for state in c.dequantize():
+            assert mx.all(mx.isfinite(state)).item()
+        tail[name] = (k, v, ik, pos)
+    ref17.update_and_fetch(tail["img"][0], tail["img"][1])
+    ref17.update_indexer(tail["img"][2], mx.array([[17]]))
+    ref_text.update_and_fetch(tail["text"][0], tail["text"][1])
+    ref_text.update_indexer(tail["text"][2], mx.array([[10]]))
+
+    img_c.extend(img26.to_batch([0]))
+    img_c.extend(text_c)
+    img_c.filter([2, 0, 1])
+    expected = [ref_text, ref17, ref26]
+    offsets = []
+    for i, ref in enumerate(expected):
+        row = img_c.extract(i)
+        offsets.append(int(row.offset))
+        ek, ev = row.dequantize()
+        rk, rv = ref.dequantize()
+        assert mx.allclose(ek, rk, atol=1e-5).item()
+        assert mx.allclose(ev, rv, atol=1e-5).item()
+    assert offsets == [11, 18, 26]
+
+
+def test_image_pending_cleanup_is_idempotent(bridge):
+    from types import SimpleNamespace
+    from omlx.patches.qwen4_exp_mlx_lm.vision_serving import ImageCohortCache
+
+    released = []
+    drafter = SimpleNamespace(release_request=released.append)
+    base = SimpleNamespace(
+        fetch_nearest_cache=lambda key, prompt: ("fetched", prompt),
+        prefetch_nearest_cache=lambda key, prompt: ("prefetched", prompt),
+    )
+    cache = ImageCohortCache(base, SimpleNamespace())
+    def pending(capture_id):
+        return dict(key="model", prompt=[1], cache=[], rest=[1],
+                    drafter=drafter, capture_request_id=capture_id)
+    cache.pending = pending("first")
+    assert cache.fetch_nearest_cache("model", [1]) == ([], [1])
+    assert released == [] and cache.pending is not None
+    assert cache.fetch_nearest_cache("other", [1]) == ("fetched", [1])
+    assert released == ["first"] and cache.pending is None
+    cache.pending = pending("second")
+    assert cache.prefetch_nearest_cache("other", [1]) == ("prefetched", [1])
+    cache.pending = pending("third")
+    cache.clear_pending()
+    cache.clear_pending()
+    cache.pending = dict(key="model", prompt=[1])
+    cache.clear_pending()
+    assert released == ["first", "second", "third"]
+    assert cache.pending is None
+
+
 @contextlib.contextmanager
 def _as_rank(monkeypatch, rank: int, ranges=RANGES):
     """Install the plan and a runtime group that says "this is rank ``rank``"."""
@@ -584,7 +888,7 @@ def test_active_assignments_are_scoped_to_the_install():
 
 
 def test_bridge_returns_logits_for_generate_and_batch_generator(bridge, checkpoint):
-    from mlx_lm.generate import BatchGenerator, stream_generate
+    from mlx_lm.generate import BatchGenerator, StopSequences, stream_generate
     from mlx_lm.sample_utils import make_sampler
     from mlx_lm.utils import load
 
@@ -605,7 +909,10 @@ def test_bridge_returns_logits_for_generate_and_batch_generator(bridge, checkpoi
     ]
     generator = BatchGenerator(model, max_tokens=6, prefill_step_size=4)
     try:
-        (uid,) = generator.insert([prompt], max_tokens=[6])
+        (uid,) = generator.insert(
+            [prompt], max_tokens=[6],
+            stop_sequences=[StopSequences([[token] for token in tokenizer.eos_token_ids])],
+        )
         batched = []
         while len(batched) < 6:
             for response in generator.next_generated():

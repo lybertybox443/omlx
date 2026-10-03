@@ -72,6 +72,10 @@ class SharedDFlash:
             result = self.draft_model.restore_request_captures(request_id, tokens, boundary, media)
         return self.share(result)
 
+    def adopt_request(self, source_id, request_id):
+        if self.rank == 0:
+            self.draft_model.adopt_request(source_id, request_id)
+
     def bind_uid(self, request_id, uid):
         if self.rank == 0:
             self.draft_model.bind_uid(request_id, uid)

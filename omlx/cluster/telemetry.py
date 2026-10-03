@@ -1348,6 +1348,7 @@ def install_server_telemetry(
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
             self._omlx_tokens: dict[Any, list[int]] = {}
+            self._omlx_cache_keys: dict[Any, Any] = {}
             self._omlx_prepared_cancel_vote: tuple[int, tuple[int, ...]] | None = None
             telemetry.register_batch_generator(self)
 
@@ -1387,6 +1388,9 @@ def install_server_telemetry(
                             token for segment in segments[index] for token in segment
                         ]
                         self._omlx_tokens[uid] = prefix + body
+                        self._omlx_cache_keys[uid] = getattr(
+                            snapshot_ctx, "model", None
+                        )
             return uids
 
         def remove(self, uids: Any) -> Any:
@@ -1405,6 +1409,7 @@ def install_server_telemetry(
             result = super().remove(uid_values)
             for uid in uid_values:
                 self._omlx_tokens.pop(uid, None)
+                self._omlx_cache_keys.pop(uid, None)
             telemetry.cancel_uids(uid_values)
             return result
 
@@ -1428,7 +1433,7 @@ def install_server_telemetry(
             processed, total = int(progress[0]), int(progress[1])
             absolute = len(full) - total + processed
             if absolute > 0 and absolute % snapshot_step == 0:
-                model = getattr(snapshot_ctx, "model", None)
+                model = self._omlx_cache_keys.get(uid)
                 if model is not None:
                     try:
                         extracted = self.extract_cache([uid]).get(uid)
@@ -1438,6 +1443,7 @@ def install_server_telemetry(
                         ssd_store.put(model, full[:absolute], extracted[0])
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
+                self._omlx_cache_keys.pop(uid, None)
 
         def _omlx_align_prefill_step(self, sequences) -> None:
             if ssd_store is None:
@@ -1477,6 +1483,10 @@ def install_server_telemetry(
             elapsed = time.perf_counter() - started
             for response in generation_responses:
                 response.token = _python_token_id(response.token)
+                if getattr(response, "finish_reason", None) is not None:
+                    finished_uid = getattr(response, "uid", None)
+                    self._omlx_tokens.pop(finished_uid, None)
+                    self._omlx_cache_keys.pop(finished_uid, None)
             for response in prompt_responses:
                 progress = getattr(response, "progress", None)
                 uid = getattr(response, "uid", None)
@@ -1511,6 +1521,17 @@ def install_server_telemetry(
             disk_entries = len(ssd_store) if ssd_store is not None else 0
             disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
             return len(self) + disk_entries, self.nbytes + disk_bytes
+
+        @property
+        def prefill_snapshot_step(self) -> int | None:
+            return snapshot_step if ssd_store is not None else None
+
+        def save_prefill_snapshot(self, model: Any, tokens: list[int], cache: Any) -> None:
+            """Persist an aligned prefill boundary; unaligned writes are skipped."""
+
+            if ssd_store is None or not tokens or len(tokens) % snapshot_step:
+                return
+            ssd_store.put(model, tokens, cache)
 
         def _fetch_observed(self, model: Any, tokens: list[int]) -> Any:
             return super().fetch_nearest_cache(model, tokens)

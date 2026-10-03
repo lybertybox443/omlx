@@ -401,7 +401,19 @@ class DFlashDrafter:
             snapshot["sinks"] = row.sinks
         self.capture_store.put(tokens, boundary, media, snapshot)
 
+    def adopt_request(self, source_id: str, request_id: str) -> None:
+        if not isinstance(source_id, str) or not isinstance(request_id, str):
+            raise ValueError("DFlash request ids must be strings")
+        if source_id == request_id or source_id not in self._request_seeds:
+            return
+        if request_id in self._request_seeds:
+            raise ValueError("DFlash adopt destination is occupied")
+        self._request_seeds[request_id] = self._request_seeds.pop(source_id)
+
     def restore_request_captures(self, request_id, tokens, boundary, media=None):
+        row = self._request_seeds.get(request_id)
+        if row is not None and boundary == row.fed + sum(int(p.shape[1]) for p in row.pending):
+            return True
         if self.capture_store is None:
             return False
         snapshot = self.capture_store.get(tokens, boundary, media)

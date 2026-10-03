@@ -22,6 +22,103 @@ from omlx.turboquant_kv import (
 pytestmark = pytest.mark.turboquant
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("bits", [3.5, 4.0])
+@pytest.mark.parametrize("head_dim", [8, 32, 64])
+def test_vlm_tq_masked_decode_small_head_dense_parity(head_dim, bits, dtype):
+    pads, B, KH, QH, T = [6, 0, 15], 3, 2, 4, 26
+    mx.random.seed(1234 + head_dim)
+    k = mx.random.normal((B, KH, T, head_dim)).astype(dtype)
+    v = mx.random.normal((B, KH, T, head_dim)).astype(dtype)
+    q = mx.random.normal((B, QH, 1, head_dim)).astype(dtype)
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache as VLMBatchTurboQuantKVCache
+
+    cache = VLMBatchTurboQuantKVCache(pads, bits=bits)
+    ks, vs = cache.update_and_fetch(k, v)
+    t = mx.arange(T)
+    allow = (t[None, :] >= mx.array(pads)[:, None]) & (t[None, :] <= T - 1)
+    mask = allow[:, None, None, :]
+    scale = head_dim**-0.5
+
+    dk, dv = cache.dequantize(keys_state=ks, values_state=vs)
+    mx.eval(dk, dv)
+    # Packed decode scales queries in their dtype, then scores in float32.
+    ref = mx.fast.scaled_dot_product_attention(
+        (q * scale).astype(mx.float32), dk, dv, scale=1.0, mask=mask
+    ).astype(q.dtype)
+    mx.eval(ref)
+    assert mx.isfinite(ref).all().item()
+    for _ in range(5):
+        out = cache.decode_attention(
+            q, keys_state=ks, values_state=vs, scale=scale, mask=mask
+        )
+        mx.eval(out)
+        assert mx.isfinite(out).all().item()
+        assert mx.allclose(
+            out.astype(mx.float32), ref.astype(mx.float32), atol=3e-3, rtol=3e-3
+        ).item()
+
+
+@pytest.mark.parametrize("qdim", ["L", "1"])
+@pytest.mark.parametrize("kdim", ["T", "1"])
+def test_vlm_verify_unequal_padding_explicit_mask_broadcast(monkeypatch, qdim, kdim):
+    q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+    from omlx.patches.turboquant_attention import _patch_vlm_target_verify_attention
+
+    for name in ("_omlx_tq_target_verify_patched", "_qwen3_5_left_padded_attention"):
+        monkeypatch.setattr(q35, name, getattr(q35, name, False), raising=False)
+    q35._omlx_tq_target_verify_patched = False
+    _patch_vlm_target_verify_attention()
+    if not q35._omlx_tq_target_verify_patched:
+        pytest.skip("verify patch not applicable")
+
+    B, H, L, T, D = 2, 2, 2, 6, 32
+    pads = [0, 2]
+    mx.random.seed(0)
+    q = mx.random.normal((B, H, L, D))
+    k = mx.random.normal((B, H, T, D))
+    v = mx.random.normal((B, H, T, D))
+    t = mx.arange(T)
+    rows = []
+    for p in pads:
+        rows.append(
+            mx.stack([(t >= p) & (t <= T - L + i) for i in range(L)])
+        )
+    full = mx.stack(rows)[:, None]  # (B,1,L,T) finite: every row has valid keys
+    mask = full
+    if qdim == "1":
+        mask = (t[None, :] >= mx.array(pads)[:, None])[:, None, None, :]
+        full = mx.broadcast_to(mask, (B, 1, L, T))
+    if kdim == "1":
+        mask = mx.ones((B, 1, 1 if qdim == "1" else L, 1), dtype=mx.bool_)
+        full = mx.broadcast_to(mask, (B, 1, L, T))
+
+    cache = BatchTurboQuantKVCache(pads)
+    ks, vs = cache.update_and_fetch(k, v)
+    cache._qwen3_5_decode_left_padding = pads
+
+    scale = D**-0.5
+    out = q35._qwen3_5_left_padded_attention(
+        q, ks, vs, cache=cache, scale=scale, mask=mask
+    )
+
+    dk, dv = cache.dequantize(keys_state=ks, values_state=vs)
+    dk = dk.astype(q.dtype)
+    dv = dv.astype(q.dtype)
+    pad_col = mx.array(pads)[:, None, None, None]
+    refs = []
+    for i in range(L):
+        vis = (t[None, None, None, :] >= pad_col) & (t <= T - L + i)
+        m = full[:, :, i : i + 1, :] & vis
+        s = (q[:, :, i : i + 1] @ dk.swapaxes(-1, -2)) * scale
+        s = mx.where(m, s, -mx.inf)
+        refs.append(mx.softmax(s, axis=-1) @ dv)
+    ref = mx.concatenate(refs, axis=2)
+    assert out.shape == ref.shape
+    assert bool(mx.all(mx.isfinite(out)).item())
+    assert mx.allclose(out, ref, atol=1e-5).item()
+
+
 def _sample_unit_vectors(count: int, dim: int) -> mx.array:
     vectors = mx.random.normal((count, dim))
     return vectors / mx.linalg.norm(vectors, axis=-1, keepdims=True)
