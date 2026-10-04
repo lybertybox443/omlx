@@ -219,13 +219,23 @@ class DecoderLayer(nn.Module):
         )
 
 
-class TextModel(nn.Module):
+from omlx.cluster.native_text_pipeline import NativeTextPipelineMixin
+from omlx.cluster.pipeline_compat import planned_layer_range
+
+
+class TextModel(NativeTextPipelineMixin, nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.embed_norm = RMSNormNoScale(args.rms_norm_eps)
-        self.layers = [DecoderLayer(args, idx) for idx in range(args.num_hidden_layers)]
+        self.num_hidden_layers = args.num_hidden_layers
+        owned = planned_layer_range(args.num_hidden_layers)
+        start, end = owned or (0, args.num_hidden_layers)
+        self.layers = [DecoderLayer(args, idx) if start <= idx < end else None
+                       for idx in range(args.num_hidden_layers)]
+        self.pipeline_group = None
+        self.pipeline_stage = None
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.layer_types = args.layer_types
         self.sliding_window = args.sliding_window
@@ -246,22 +256,7 @@ class TextModel(nn.Module):
         hidden_states = inputs_embeds
         if hidden_states is None:
             hidden_states = self.embed_norm(self.embed_tokens(inputs))
-        if cache is None:
-            cache = [None] * len(self.layers)
-
-        full_mask = create_attention_mask(hidden_states, cache[self.full_attention_idx])
-        sliding_mask = None
-        if self.sliding_attention_idx is not None:
-            sliding_mask = create_attention_mask(
-                hidden_states,
-                cache[self.sliding_attention_idx],
-                window_size=self.sliding_window,
-            )
-
-        for layer, layer_cache in zip(self.layers, cache):
-            mask = sliding_mask if layer.is_sliding else full_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
-        return self.norm(hidden_states)
+        return self.forward_pipeline(hidden_states, cache)
 
 
 class LanguageModel(nn.Module):
@@ -292,7 +287,7 @@ class LanguageModel(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     @property
     def head_dim(self):

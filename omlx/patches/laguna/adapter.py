@@ -19,7 +19,7 @@ class LagunaAdapter(PipelineModelAdapter):
 
     def boundary_bytes_per_token(self, config):
         hidden = config.get("hidden_size")
-        return hidden * 2 if type(hidden) is int and hidden > 0 else None
+        return hidden * 4 if type(hidden) is int and hidden > 0 else None
 
     def cache_budget(self, model_path, options):
         import json
