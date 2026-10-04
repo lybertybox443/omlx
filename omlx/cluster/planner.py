@@ -1202,7 +1202,7 @@ import re as _re
 _ROUTED_EXPERT_RE = _re.compile(
     r"\.(mlp\.switch_mlp|experts\.switch_glu)\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias)$"
 )
-_SHARED_EXPERT_RE = _re.compile(r"\.mlp\.shared_expert\.[^.]+(\.[^.]+)*$")
+_SHARED_EXPERT_RE = _re.compile(r"\.mlp\.shared_experts?\.[^.]+(\.[^.]+)*$")
 
 
 _SUPPLEMENTAL_DTYPE_BYTES = {
