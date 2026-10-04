@@ -343,7 +343,7 @@ def test_glm5_nonowner_shared_experts_zero(n):
 # NemotronH EP tests
 # ---------------------------------------------------------------------------
 
-def _make_nemotron_moe(num_experts=4, num_experts_per_tok=2, hidden=16, inter=8):
+def _make_nemotron_moe(num_experts=4, num_experts_per_tok=2, hidden=16, inter=8, n_shared_experts=1):
     """Build a tiny NemotronHMoE using its native ModelArgs."""
     try:
         from mlx_lm.models.nemotron_h import NemotronHMoE, ModelArgs
@@ -373,7 +373,7 @@ def _make_nemotron_moe(num_experts=4, num_experts_per_tok=2, hidden=16, inter=8)
         moe_latent_size=hidden // 2,
         n_group=1,
         n_routed_experts=num_experts,
-        n_shared_experts=1,
+        n_shared_experts=n_shared_experts,
         topk_group=1,
         num_experts_per_tok=num_experts_per_tok,
         norm_topk_prob=True,
@@ -397,10 +397,11 @@ class _MixerModel(nn.Module):
         self.layers = [_MixerLayer(m) for m in mixers]
 
 
+@pytest.mark.parametrize("n_shared_experts", [None, 1])
 @pytest.mark.parametrize("n", [2, 3])
-def test_nemotron_ep_sum_matches_reference(n):
+def test_nemotron_ep_sum_matches_reference(n, n_shared_experts):
     """Sum of per-rank EP outputs must equal single-rank native NemotronHMoE forward."""
-    ref, args = _make_nemotron_moe()
+    ref, args = _make_nemotron_moe(n_shared_experts=n_shared_experts)
     mx.eval(ref.parameters())
     x = mx.random.normal((1, 2, args.hidden_size))
     expected = ref(x)
