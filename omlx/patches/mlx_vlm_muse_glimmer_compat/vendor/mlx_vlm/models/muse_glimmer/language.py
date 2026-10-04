@@ -252,11 +252,14 @@ class TextModel(NativeTextPipelineMixin, nn.Module):
         inputs: Optional[mx.array],
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
+        return_raw_hidden=False,
     ) -> mx.array:
         hidden_states = inputs_embeds
         if hidden_states is None:
             hidden_states = self.embed_norm(self.embed_tokens(inputs))
-        return self.forward_pipeline(hidden_states, cache)
+        return self.forward_pipeline(hidden_states, cache, capture_layer_ids, hidden_sink, return_raw_hidden)
 
 
 class LanguageModel(nn.Module):
@@ -270,6 +273,11 @@ class LanguageModel(nn.Module):
         self.final_logit_softcapping = args.final_logit_softcapping
         self.output_multiplier = args.output_multiplier
 
+    def logits_tail(self, hidden_states):
+        logits = self.lm_head(hidden_states) * self.output_multiplier
+        softcap = self.final_logit_softcapping
+        return mx.tanh(logits / softcap) * softcap
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
@@ -279,11 +287,35 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        hidden_states = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        logits = self.lm_head(hidden_states) * self.output_multiplier
-        softcap = self.final_logit_softcapping
-        logits = mx.tanh(logits / softcap) * softcap
-        return LanguageModelOutput(logits=logits)
+        return_hidden = bool(kwargs.get("return_hidden", False))
+        ids = kwargs.get("capture_layer_ids")
+        if ids is not None and any(type(i) is not int or not 0 <= i < self.args.num_hidden_layers for i in ids):
+            raise ValueError("Muse capture layer exceeds decoder layers")
+        captured = [] if ids is not None else None
+        result = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds,
+            capture_layer_ids=[i + 1 for i in ids] if ids is not None else None,
+            hidden_sink=captured, return_raw_hidden=return_hidden)
+        normalized, raw = result if return_hidden else (result, None)
+        logits = self.logits_tail(normalized)
+        return LanguageModelOutput(logits=logits,
+            hidden_states=[*(captured or []), raw] if return_hidden else None)
+
+    def make_mtp_cache(self):
+        return []
+
+    def mtp_forward(self, *args, **kwargs):
+        raise RuntimeError("Muse has no native MTP head; use its DFlash drafter")
+
+    def mtp_partial_rollback(self, cache, accepted, num_drafts):
+        rejected = num_drafts - accepted
+        if rejected <= 0:
+            return True
+        if not all(c.is_trimmable() for c in cache):
+            return False
+        for c in cache:
+            if c.trim(rejected) != rejected:
+                raise RuntimeError("Muse speculative cache rollback was incomplete")
+        return True
 
     @property
     def layers(self):

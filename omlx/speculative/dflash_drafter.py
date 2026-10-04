@@ -167,7 +167,10 @@ def _draft_project_kv(attention, hidden):
     project = getattr(attention, "_project_kv", None)
     if callable(project):
         return project(hidden)
-    qkv = attention.qkv_proj(hidden)
+    fused = getattr(attention, "qkv_proj", None)
+    if fused is None:
+        return attention.k_proj(hidden), attention.v_proj(hidden)
+    qkv = fused(hidden)
     q_width = attention.n_heads * attention.head_dim
     kv_width = attention.n_kv_heads * attention.head_dim
     return qkv[..., q_width:q_width + kv_width], qkv[..., q_width + kv_width:]
@@ -904,6 +907,20 @@ class DFlashDrafter:
                 context_mask = mx.broadcast_to(mask[..., :-block], (batch, 1, block, keys.shape[2] - block))
                 proposal_mask = mx.broadcast_to(mx.tril(mx.ones((block, block), mx.bool_)), (batch, 1, block, block))
                 layer_mask = mx.concatenate([context_mask, proposal_mask], axis=-1)
+            context_window = getattr(attn, "_omlx_dflash_context_window", None)
+            if context_window:
+                context_positions = pos
+                if sink_width:
+                    prefix_positions = mx.broadcast_to(mx.arange(sink_width, dtype=mx.int32), (batch, sink_width))
+                    context_positions = mx.concatenate([prefix_positions, pos], axis=1)
+                query_positions = query_offsets[:, None] + mx.arange(block, dtype=mx.int32)[None, :]
+                context_allowed = query_positions[:, :, None] - context_positions[:, None, :] < context_window
+                if sink_width:
+                    context_allowed |= context_positions[:, None, :] < mx.array(sink_lengths)[:, None, None]
+                context_allowed = context_allowed[:, None, :, :] & mask[..., :-block]
+                proposal_allowed = mx.tril(mx.ones((block, block), mx.bool_)) if getattr(attn, "causal", False) else mx.ones((block, block), mx.bool_)
+                proposal_allowed = mx.broadcast_to(proposal_allowed, (batch, 1, block, block))
+                layer_mask = mx.concatenate([context_allowed, proposal_allowed], axis=-1)
             attended = mx.fast.scaled_dot_product_attention(
                 queries,
                 keys,
@@ -1328,7 +1345,9 @@ def load_dflash_drafter(
         raise ValueError("DFlash draft window must be an integer of at least 2")
     if isinstance(draft_sink_size, bool) or not isinstance(draft_sink_size, int) or draft_sink_size < 0:
         raise ValueError("DFlash sink size must be a nonnegative integer")
-    model, kind = load_drafter(path, kind="dflash")
+    from .dflash_native_bridge import load_native_draft
+    loaded = load_native_draft(path)
+    model, kind = loaded if loaded is not None else load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
     if quant_enabled and not getattr(model.config, "quantization", None):

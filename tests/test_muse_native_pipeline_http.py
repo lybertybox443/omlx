@@ -29,7 +29,7 @@ def checkpoint(tmp_path_factory):
     _write_tokenizer(root)
     return root
 
-def oracle(root,prompt):
+def oracle(root,prompt,token_count=12):
     from mlx_vlm.models.muse_glimmer.config import ModelConfig
     from mlx_vlm.models.muse_glimmer.muse_glimmer import Model
     model=Model(ModelConfig.from_dict(json.loads((root/"config.json").read_text())))
@@ -39,7 +39,7 @@ def oracle(root,prompt):
     cache=model.make_cache()
     logits=model(mx.array([ids]),cache=cache).logits
     out=[]
-    for _ in range(12):
+    for _ in range(token_count):
         nxt=int(mx.argmax(logits[0,-1]).item())
         if nxt==1:break
         out.append(nxt)

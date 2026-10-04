@@ -168,17 +168,20 @@ def _wrap_rotating(cls, fields) -> None:
     cls._omlx_mtp_undo_attached = True
 
 
-def _attach_rotating_undo() -> bool:
+def _attach_rotating_undo(cache_module="mlx_lm.models.cache", batch_extra_fields=()) -> bool:
     try:
-        from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+        from importlib import import_module
+        module = import_module(cache_module)
+        RotatingKVCache = module.RotatingKVCache
+        BatchRotatingKVCache = module.BatchRotatingKVCache
     except ImportError:
-        logger.debug("mlx_lm.models.cache not importable; skipping rotating undo")
+        logger.debug("%s not importable; skipping rotating undo", cache_module)
         return False
 
     _wrap_rotating(RotatingKVCache, ("keys", "values", "offset", "_idx"))
     _wrap_rotating(
         BatchRotatingKVCache,
-        ("keys", "values", "offset", "_offset", "_idx", "rotated", "left_padding"),
+        ("keys", "values", "offset", "_offset", "_idx", "rotated", "left_padding") + tuple(batch_extra_fields),
     )
     return True
 
