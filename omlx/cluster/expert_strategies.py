@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import mlx.nn as nn
 
-from .tensor_strategies import _common_layer_owner, _wrap_sharded_moe
+from .tensor_strategies import _common_layer_owner, _wrap_sharded_moe, _wrap_sharded_moe_laguna
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 _ARRAYS = ("weight", "scales", "biases", "bias")
@@ -45,17 +45,29 @@ class LocalExperts(nn.Module):
         self.hi = hi
         self.hidden = hidden
 
-    # Only (x, indices): extra weights/shared/residual args raise TypeError
-    # instead of being silently dropped. Weighting stays in the MoE block.
-    def __call__(self, x, indices):
+    # Only (x, indices) positional; extra positional args raise TypeError.
+    # scores/weighted_sum support native GLM contract (SwitchGLU kwargs).
+    def __call__(self, x, indices, *, scores=None, weighted_sum=False):
         import mlx.core as mx
 
         if self.hi <= self.lo:
+            if weighted_sum:
+                if scores is None:
+                    raise ValueError("scores required when weighted_sum=True")
+                return mx.zeros((*indices.shape[:-1], self.hidden), dtype=x.dtype)
             return mx.zeros((*indices.shape, self.hidden), dtype=x.dtype)
         local = (indices >= self.lo) & (indices < self.hi)
         safe = mx.where(local, indices - self.lo, 0)
-        y = self.inner(x, safe)
-        return mx.where(local[..., None], y, mx.zeros_like(y))
+        y = self.inner(x, safe)  # (..., k, hidden) — never pass weighted_sum here
+        y = mx.where(local[..., None], y, mx.zeros_like(y))
+        if scores is not None:
+            if weighted_sum:
+                y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+            else:
+                y = (y * scores[..., None]).astype(x.dtype)
+        elif weighted_sum:
+            raise ValueError("scores required when weighted_sum=True")
+        return y
 
 
 def _inspect(mlp, *, _switch_attr=None):
@@ -81,8 +93,15 @@ def _inspect(mlp, *, _switch_attr=None):
         if p is None or getattr(p, "weight", None) is None:
             raise ValueError(f"unsupported MoE layout: missing {attr}.{name}")
         projs.append(p)
-    if not gemma_style and getattr(mlp, "shared_expert", None) is None:
-        raise ValueError("unsupported MoE layout: missing shared_expert")
+    if not gemma_style:
+        _se_sing = getattr(mlp, "shared_expert", None)
+        _se_plur = getattr(mlp, "shared_experts", None)
+        if _se_sing is not None and _se_plur is not None:
+            raise ValueError(
+                "unsupported MoE layout: ambiguous — both shared_expert and shared_experts are set"
+            )
+        if _se_sing is None and _se_plur is None:
+            raise ValueError("unsupported MoE layout: missing shared_expert")
     experts = projs[0].weight.shape[0]
     if experts < 1:
         raise ValueError("unsupported MoE layout: zero experts")
@@ -216,9 +235,32 @@ def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
         layer.experts = _wrap_sharded_moe(layer.experts, group, mx_module)
         shared_owner = False
     else:
-        # Qwen: shared_expert on rank 0 only.
+        # Qwen/GLM: shared expert on rank 0 only.
+        # Support both 'shared_expert' (Qwen) and 'shared_experts' (GLM plural).
+        _se_sing = getattr(mlp, "shared_expert", None)
+        _se_plur = getattr(mlp, "shared_experts", None)
         if rank != 0:
-            mlp.shared_expert = _ZeroShared()
-        layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
+            if _se_plur is not None:
+                mlp.shared_experts = _ZeroShared()
+            elif _se_sing is not None:
+                mlp.shared_expert = _ZeroShared()
+        # Laguna-native: disable per-instance gate/up fusion after expert slicing
+        # (switch_mlp is now LocalExperts, so _prepare_fused_gate_up would crash).
+        # Also use a residual-aware wrapper so the decoder residual is added only
+        # once across EP ranks (after all_sum), not once per rank.
+        if _is_laguna_sparse_block(mlp):
+            mlp._fusion_ready = False
+            layer.mlp = _wrap_sharded_moe_laguna(layer.mlp, group, mx_module)
+        else:
+            layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
         shared_owner = rank == 0
     return {"experts": experts, "lo": lo, "hi": hi, "shared_owner": shared_owner}
+
+
+def _is_laguna_sparse_block(mlp) -> bool:
+    """True iff mlp is a native LagunaSparseMoeBlock instance."""
+    try:
+        from omlx.patches.laguna.laguna_model import LagunaSparseMoeBlock
+        return isinstance(mlp, LagunaSparseMoeBlock)
+    except Exception:
+        return False
