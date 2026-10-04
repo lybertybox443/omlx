@@ -45,6 +45,12 @@ def _supports_coordinator_sampling(
         return False, "pipeline model has no callable forward path"
     try:
         source = inspect.getsource(call)
+        if (source.count("self.forward_pipeline(") == 1
+                and "distributed." not in source):
+            from .native_text_pipeline import NativeTextPipelineMixin
+            forward = getattr(pipeline_model, "forward_pipeline", None)
+            if getattr(forward, "__func__", None) is NativeTextPipelineMixin.forward_pipeline:
+                source = inspect.getsource(NativeTextPipelineMixin.forward_pipeline)
     except (OSError, TypeError):
         return False, "pipeline forward source is unavailable for validation"
     required = (
