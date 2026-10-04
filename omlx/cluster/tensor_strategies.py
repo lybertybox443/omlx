@@ -62,6 +62,11 @@ GEMMA4 = TensorStrategy(
     model_types=("gemma4", "gemma4_text"),
     source="oMLX adapter: Gemma4 GQA/MQA/SharedKV/MoE sharding",
 )
+MUSE_GLIMMER = TensorStrategy(
+    name="muse_glimmer",
+    model_types=("muse_glimmer",),
+    source="oMLX adapter: Muse/Glimmer GQA separate q/k/v/o/gate_proj + dense MLP sharding",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -798,6 +803,125 @@ def _shard_nemotron_h(
             strategy=NEMOTRON_H.name,
             layer=index,
             loaded=index + 1,
+            total=total,
+        )
+
+
+@_register(MUSE_GLIMMER)
+def _shard_muse_glimmer(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+    *,
+    finalize_layer: Callable[[Any], None] | None = None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_linear
+
+    size = int(group.size())
+    _, layers = _common_layer_owner(model)
+    layers = list(layers)
+
+    # --- preflight: validate ALL owned layers before ANY mutation ---
+    for layer in layers:
+        if layer is None:
+            continue
+        attn = layer.self_attn
+        n_heads: int = int(attn.n_heads)
+        n_kv_heads: int = int(attn.n_kv_heads)
+        head_dim: int = int(attn.head_dim)
+        _require_divisible(n_heads, size, "Muse/Glimmer q heads")
+        _require_divisible(n_kv_heads, size, "Muse/Glimmer KV heads")
+        # Verify projection output widths match expected head counts * head_dim
+        q_out = int(attn.q_proj.weight.shape[0])
+        k_out = int(attn.k_proj.weight.shape[0])
+        v_out = int(attn.v_proj.weight.shape[0])
+        o_in = int(attn.o_proj.scales.shape[-1]) * int(attn.o_proj.group_size) if hasattr(attn.o_proj, "scales") else int(attn.o_proj.weight.shape[1])
+        gate_out = int(attn.gate_proj.weight.shape[0])
+        expected_q = n_heads * head_dim
+        expected_kv = n_kv_heads * head_dim
+        if q_out != expected_q:
+            raise ValueError(
+                f"Muse/Glimmer q_proj output width {q_out} != n_heads*head_dim={expected_q}"
+            )
+        if k_out != expected_kv:
+            raise ValueError(
+                f"Muse/Glimmer k_proj output width {k_out} != n_kv_heads*head_dim={expected_kv}"
+            )
+        if v_out != expected_kv:
+            raise ValueError(
+                f"Muse/Glimmer v_proj output width {v_out} != n_kv_heads*head_dim={expected_kv}"
+            )
+        if o_in != expected_q:
+            raise ValueError(
+                f"Muse/Glimmer o_proj input width {o_in} != n_heads*head_dim={expected_q}"
+            )
+        if gate_out != expected_q:
+            raise ValueError(
+                f"Muse/Glimmer gate_proj output width {gate_out} != n_heads*head_dim={expected_q}"
+            )
+        # gate_proj row divisibility (column-parallel slices rows)
+        _require_divisible(gate_out, size, "Muse/Glimmer attn gate_proj rows")
+        mlp = layer.mlp
+        gate_mlp_rows = int(mlp.gate_proj.weight.shape[0])
+        up_mlp_rows = int(mlp.up_proj.weight.shape[0])
+        down_mlp_cols = int(mlp.down_proj.scales.shape[-1]) * int(mlp.down_proj.group_size) if hasattr(mlp.down_proj, "scales") else int(mlp.down_proj.weight.shape[1])
+        _require_divisible(gate_mlp_rows, size, "Muse/Glimmer MLP intermediate (gate_proj rows)")
+        if gate_mlp_rows != up_mlp_rows:
+            raise ValueError(
+                f"Muse/Glimmer MLP gate_proj rows {gate_mlp_rows} != up_proj rows {up_mlp_rows}"
+            )
+        if down_mlp_cols != gate_mlp_rows:
+            raise ValueError(
+                f"Muse/Glimmer MLP down_proj input width {down_mlp_cols} != intermediate {gate_mlp_rows}"
+            )
+        # quant row-parallel: down_proj and o_proj slice input cols →
+        # group count (scales last dim) must be divisible by size
+        if hasattr(mlp.down_proj, "scales"):
+            scales = mlp.down_proj.scales
+            _require_divisible(int(scales.shape[-1]), size, "Muse/Glimmer MLP down_proj quant group count")
+        if hasattr(attn.o_proj, "scales"):
+            _require_divisible(int(attn.o_proj.scales.shape[-1]), size, "Muse/Glimmer o_proj quant group count")
+
+    local = [(i, layer) for i, layer in enumerate(layers) if layer is not None]
+    total = len(local)
+
+    for done, (index, layer) in enumerate(local):
+        attn = layer.self_attn
+        n_heads: int = int(attn.n_heads)
+        n_kv_heads: int = int(attn.n_kv_heads)
+
+        # Q, K, V: all-to-sharded (column-parallel)
+        attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+        attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+        attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+        # gate_proj (attention gating): column-parallel same as q_proj
+        attn.gate_proj = shard_linear(attn.gate_proj, "all-to-sharded", group=group)
+        # O: sharded-to-all (row-parallel)
+        attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+
+        # update local head counts
+        attn.n_heads = n_heads // size
+        attn.n_kv_heads = n_kv_heads // size
+
+        # MLP: gate and up column-parallel, down row-parallel
+        mlp = layer.mlp
+        mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
+        mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+        mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
+
+        # norm, rope, masks, qk_norm: untouched (native)
+
+        if finalize_layer is not None:
+            finalize_layer(layer)
+
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=MUSE_GLIMMER.name,
+            layer=index,
+            loaded=done + 1,
             total=total,
         )
 
