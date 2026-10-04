@@ -496,6 +496,14 @@ def install_runtime_optimizations(
             local_state.queue_prefill_sends = False
 
     def staggered_pipeline_prompt(instance: Any, tokens: list[list[int]]) -> None:
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+
+        with prompt_priming.prefill_scope(
+            instance.model, instance.uids, tokens, instance.prompt_cache
+        ):
+            return run_staggered_pipeline_prompt(instance, tokens)
+
+    def run_staggered_pipeline_prompt(instance: Any, tokens: list[list[int]]) -> None:
         """Pinned PromptProcessingBatch.prompt with pipeline fill/drain."""
         capturing = callable(getattr(instance.model, "_omlx_dflash_prefill_capture", None))
         if capturing and not async_capture:

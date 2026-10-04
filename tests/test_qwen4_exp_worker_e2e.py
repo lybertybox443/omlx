@@ -127,6 +127,7 @@ def served(
     trace_dflash_draft=False,
     expert_parallel_size=1,
     tensor_parallel_size=1,
+    model_layout=None,
 ):
     import os
     state = tmp_path / "state"
@@ -143,6 +144,7 @@ def served(
         extra_runtime_options=extra_runtime_options,
         expert_parallel_size=expert_parallel_size,
         tensor_parallel_size=tensor_parallel_size,
+        model_layout=model_layout,
     )
     if prefill_step_size is not None:
         argv.extend(["--prefill-step-size", str(prefill_step_size)])

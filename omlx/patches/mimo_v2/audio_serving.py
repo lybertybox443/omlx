@@ -149,6 +149,13 @@ class DistributedAudioModel(MiMoOmnimodalModel):
     def __init__(self, native, bridge, config):
         super().__init__(native, None, bridge, config)
         self._omlx_adapter = native._omlx_adapter
+        object.__setattr__(self, "_omlx_mtp_priming_host", native)
+        for name in ("_omlx_mtp_decode_enabled", "_omlx_mtp_chain",
+                     "_omlx_mtp_depth", "_omlx_mtp_depth_fixed",
+                     "_omlx_mtp_head_clone", "_omlx_mtp_head_prenorm",
+                     "_omlx_mtp_multi_request", "_omlx_mtp_coordinator"):
+            if hasattr(native, name):
+                object.__setattr__(self, name, getattr(native, name))
 
     @property
     def model(self):
@@ -164,6 +171,28 @@ class DistributedAudioModel(MiMoOmnimodalModel):
 
     def make_cache(self):
         return self.language_model.target.make_cache()
+
+    def get_mtp_module(self):
+        return self.language_model.get_mtp_module()
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    def mtp_begin_cycle(self, *args, **kwargs):
+        return self.language_model.mtp_begin_cycle(*args, **kwargs)
+
+    def mtp_forward(self, *args, **kwargs):
+        return self.language_model.mtp_forward(*args, **kwargs)
+
+    def mtp_partial_rollback(self, cache, accepted, num_drafts):
+        # Media identity metadata has no speculative token rows to trim.
+        target_cache = cache[:-1] if (
+            getattr(self, "_omlx_vision_cache_enabled", False)
+            and len(cache) == len(self.layers) + 1
+        ) else cache
+        return self.language_model.mtp_partial_rollback(
+            target_cache, accepted, num_drafts
+        )
 
     def _omlx_media_request_factory(self, payload):
         return AudioRequest(self, payload)

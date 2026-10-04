@@ -519,6 +519,7 @@ def make_deployment(
     extra_runtime_options: dict | None = None,
     expert_parallel_size: int = 1,
     tensor_parallel_size: int = 1,
+    model_layout=None,
 ):
     """A signed-style ``ClusterDeployment`` for local ranks, ranks in reverse order."""
 
@@ -544,8 +545,10 @@ def make_deployment(
             rank=rank,
             start_layer=start,
             end_layer=end,
-            layer_weight_bytes=(end - start) * 1_000_000,
-            fixed_weight_bytes=1_000_000,
+            layer_weight_bytes=(sum(model_layout.layer_weight_bytes[start:end])
+                                if model_layout is not None else (end - start) * 1_000_000),
+            fixed_weight_bytes=(model_layout.fixed_weight_bytes
+                                if model_layout is not None else 1_000_000),
             reserve_bytes=gib,
             capacity_bytes=64 * gib,
             tensor_parallel_rank=rank % tp,
@@ -564,6 +567,8 @@ def make_deployment(
     if tp > 1:
         plan_payload = {"ranges": list(map(list, ranges)),
                         "tensor_parallel_size": tp, "expert_parallel_size": ep}
+    if model_layout is not None:
+        plan_payload = {"topology": plan_payload, "model_layout": model_layout.to_dict()}
     plan_hash = hashlib.sha256(json.dumps(plan_payload).encode()).hexdigest()
     return ClusterDeployment(
         **({"expert_parallel_size": ep} if ep > 1 else {}),
@@ -604,6 +609,7 @@ def worker_argv_and_state(
     expert_parallel_size: int = 1,
     tensor_parallel_size: int = 1,
     load_timeout: float = 120.0,
+    model_layout=None,
 ) -> list[str]:
     """Worker argv a real launch would run on every rank, built by the launcher.
 
@@ -624,6 +630,7 @@ def worker_argv_and_state(
         extra_runtime_options=extra_runtime_options,
         expert_parallel_size=expert_parallel_size,
         tensor_parallel_size=tensor_parallel_size,
+        model_layout=model_layout,
     )
     state = Path(state_dir)
     state.mkdir(parents=True, exist_ok=True)

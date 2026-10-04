@@ -563,16 +563,18 @@ class Model(nn.Module):
         n_confirmed: int = 0,
     ):
         from omlx.patches.mlx_lm_mtp import prompt_priming
-        prime = (not return_hidden and n_confirmed == 0
-                 and input_embeddings is None
-                 and prompt_priming.capture_eligible(self, cache))
+        prime_eligible = (not return_hidden and n_confirmed == 0
+                          and prompt_priming.capture_eligible(self, cache))
+        # Only the first pipeline stage receives media embeddings. Keep the
+        # hidden gather contract uniform before excluding token-only capture.
+        prime = prime_eligible and input_embeddings is None
         result = self.model(
             inputs,
             cache,
             input_embeddings,
-            return_hidden=return_hidden or prime,
+            return_hidden=return_hidden or prime_eligible,
         )
-        if return_hidden or prime:
+        if return_hidden or prime_eligible:
             out, hidden = result
         else:
             out = result

@@ -50,13 +50,11 @@ def _write_tokenizer(root):
     (root / "preprocessor_config.json").write_text(json.dumps(IMAGE_PROCESSOR_CONFIG))
 
 
-def write_audio_checkpoint(path):
+def write_audio_checkpoint(path, *, mtp=False):
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     from omlx.patches.mimo_v2.adapter import ADAPTER
 
-    ADAPTER.prepare_worker(root, {})
-    import mlx_lm.models.mimo_v2 as module
     from omlx.patches.mimo_v2.audio import MiMoAudioBridge, MiMoAudioTokenizer
     from test_mimo_v2_patch import _minimal_config
 
@@ -65,6 +63,11 @@ def write_audio_checkpoint(path):
         moe_layer_freq=[0, 0, 0, 0], audio_token_id=63,
         eos_token_id=[1], pad_token_id=0,
     )
+    if mtp:
+        config["num_nextn_predict_layers"] = 1
+    (root / "config.json").write_text(json.dumps(config))
+    ADAPTER.prepare_worker(root, {"mtp_enabled": True, "mtp_depth": 1} if mtp else {})
+    import mlx_lm.models.mimo_v2 as module
     mx.random.seed(19)
     native = module.Model(module.ModelArgs.from_dict(config))
     mx.eval(native.parameters())

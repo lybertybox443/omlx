@@ -270,6 +270,9 @@ def _host_candidates(model: Any):
     carries the slot is the patched language-model instance — the outer
     adapter / VLM wrapper for qwen paths, the Model itself for DeepSeek/GLM.
     """
+    canonical = getattr(model, "_omlx_mtp_priming_host", None)
+    if canonical is not None and canonical is not model:
+        yield canonical
     yield model
     for attr in ("language_model", "_language_model"):
         inner = getattr(model, attr, None)
