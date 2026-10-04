@@ -3175,6 +3175,9 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
+    refresh = getattr(model, "refresh_mtp_cache_context", None)
+    if callable(refresh):
+        refresh(gen_batch.prompt_cache)
     if _dspark_host(model) is not None:
         return _dspark_next_drafts(
             gen_batch,

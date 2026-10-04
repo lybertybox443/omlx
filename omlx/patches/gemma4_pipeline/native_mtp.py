@@ -49,6 +49,7 @@ def verify_native(model, group):
     from omlx.cluster.mtp_coordination import MTPRankCoordinator
     object.__setattr__(model, "_omlx_mtp_coordinator", MTPRankCoordinator(group))
     object.__setattr__(model, "_omlx_mtp_remote_head", group.rank() != 0)
+    object.__setattr__(model, "_omlx_mtp_multi_request", True)
     inner._omlx_mtp_decode_enabled = True
     inner._omlx_mtp_chain = True
     inner._omlx_mtp_depth = get_mtp_depth()

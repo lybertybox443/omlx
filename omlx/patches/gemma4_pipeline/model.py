@@ -139,9 +139,13 @@ class Model(nn.Module):
         return self.language_model.model
 
     def make_cache(self):
-        # MLX-LM requires a cache object at every producer slot; empty unowned
-        # native caches allocate no tensors and are excluded from execution.
-        return self.language_model.make_cache()
+        # Native zero-slot containers support merge, split and evaluation
+        # without allocating KV tensors for unowned producer positions.
+        from mlx_vlm.models.cache import ArraysCache
+        caches = self.language_model.make_cache()
+        dependencies = set(self.model.cache_dependencies)
+        return [cache if index in dependencies else ArraysCache(0)
+                for index, cache in enumerate(caches)]
 
     def _cache_view(self, caches):
         if caches is None:
@@ -172,6 +176,10 @@ class Model(nn.Module):
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
+
+    def refresh_mtp_cache_context(self, caches):
+        from omlx.patches.gemma4_pipeline.native_mtp import refresh_after_rollback
+        refresh_after_rollback(self, self._cache_view(caches))
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
         caches = self._cache_view(caches)
