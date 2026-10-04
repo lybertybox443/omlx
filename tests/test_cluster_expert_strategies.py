@@ -412,62 +412,75 @@ def test_laguna_ep_sum_matches_reference(n, T, quantized):
     )
 
 
-@pytest.mark.parametrize("n", [3, 6])
-@pytest.mark.parametrize("T", [1, 2])
-def test_laguna_ep_residual_added_once(n, T):
-    """Residual must be added exactly once across EP ranks, not once per rank."""
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("residual_style", ["keyword", "positional"])
+@pytest.mark.parametrize("n,T", [(3, 1), (3, 2), (6, 1), (6, 2)])
+def test_laguna_ep_residual_added_once(n, T, residual_style, quantized):
+    """Residual must be forwarded to all_sum and added exactly once, not once per rank."""
     ref, args = _laguna_sparse_block()
+    if quantized:
+        nn.quantize(
+            ref.switch_mlp,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda p, m: hasattr(m, "to_quantized"),
+        )
     mx.eval(ref.parameters())
 
     mx.random.seed(1)
     x = mx.random.normal((1, T, args.hidden_size))
     residual = mx.random.normal((1, T, args.hidden_size))
-    expected = ref(x, residual=residual)
-    mx.eval(expected)
 
-    # EP sum without residual + residual == EP sum with residual (via wrapper)
-    total_no_res = None
+    # Pass (x, residual) to native ref; used as ground truth for each rank.
+    if residual_style == "keyword":
+        expected_with_res = ref(x, residual=residual)
+    else:
+        expected_with_res = ref(x, residual)
+    mx.eval(expected_with_res)
+
+    # --- Phase 1: collect per-rank local outputs (identity all_sum, no residual) ---
+    local_outputs = {}
+    collective_total = None
     for r in range(n):
         blk = copy.deepcopy(ref)
         blk._fusion_ready = None
-        apply_expert_strategy(_Model([blk]), _group(n, r), mx_module=_FakeMx())
-        # Extract the layer object with the wrapped mlp
-        # We need the layer that was modified — _Model wraps in _Layer
-        # Reconstruct: apply_expert_strategy takes the model, which has layer[0].mlp
-        # Since we passed _Model([blk]) we need to get that model's layer
-        model = _Model([copy.deepcopy(ref)])
-        model.layers[0].mlp._fusion_ready = None if hasattr(model.layers[0].mlp, '_fusion_ready') else None
-        blk2 = copy.deepcopy(ref)
-        blk2._fusion_ready = None
-        m2 = _Model([blk2])
-        apply_expert_strategy(m2, _group(n, r), mx_module=_FakeMx())
-        y = m2.layers[0].mlp(x)
-        total_no_res = y if total_no_res is None else total_no_res + y
+        m = _Model([blk])
+        apply_expert_strategy(m, _group(n, r), mx_module=_FakeMx())
+        y = m.layers[0].mlp(x)
+        mx.eval(y)
+        local_outputs[r] = y
+        collective_total = y if collective_total is None else collective_total + y
+    mx.eval(collective_total)
 
-    mx.eval(total_no_res)
-    result_with_res = total_no_res + residual
-    assert mx.allclose(result_with_res, expected, atol=1e-4, rtol=1e-4).item(), (
-        f"Laguna residual not added once: n={n} T={T} "
-        f"maxerr={mx.abs(result_with_res - expected).max().item():.4f}"
-    )
-
-    # Also verify wrapper correctly adds residual once
-    total_with_res = None
+    # --- Phase 2: fake all_sum asserts input == local output, returns collective total ---
     for r in range(n):
-        blk3 = copy.deepcopy(ref)
-        blk3._fusion_ready = None
-        m3 = _Model([blk3])
-        apply_expert_strategy(m3, _group(n, r), mx_module=_FakeMx())
-        y = m3.layers[0].mlp(x, residual=residual)
-        total_with_res = y if total_with_res is None else total_with_res + y
 
-    mx.eval(total_with_res)
-    # With fake all_sum=identity and residual added per rank: total = sum(partial) + n*residual
-    # But the wrapper adds residual AFTER all_sum, so each rank's output = partial + residual
-    # Summing: sum(partial) + n*residual — NOT equal to expected (sum(partial) + residual)
-    # This is intentional: the test above (without residual + add once) is the correct usage.
-    # Here we just verify the no-residual path matches the with-residual-added-externally path.
-    assert mx.allclose(total_no_res + residual, expected, atol=1e-4, rtol=1e-4).item()
+        class _AssertSumMx(_FakeMx):
+            _rank = r
+            _expected_input = local_outputs[r]
+            _total = collective_total
+
+            class distributed:
+                @staticmethod
+                def all_sum(val, *a, **k):
+                    assert mx.allclose(val, _AssertSumMx._expected_input, atol=1e-6, rtol=0).item(), (
+                        f"all_sum input mismatch at rank {_AssertSumMx._rank}"
+                    )
+                    return _AssertSumMx._total
+
+        blk = copy.deepcopy(ref)
+        blk._fusion_ready = None
+        m = _Model([blk])
+        apply_expert_strategy(m, _group(n, r), mx_module=_AssertSumMx())
+        if residual_style == "keyword":
+            result = m.layers[0].mlp(x, residual=residual)
+        else:
+            result = m.layers[0].mlp(x, residual)
+        mx.eval(result)
+        assert mx.allclose(result, expected_with_res, atol=1e-4, rtol=1e-4).item(), (
+            f"Laguna residual added wrong: n={n} T={T} r={r} quantized={quantized} "
+            f"style={residual_style} maxerr={mx.abs(result - expected_with_res).max().item():.4f}"
+        )
 
 
 @pytest.mark.parametrize("n", [3, 6])
