@@ -82,6 +82,7 @@ class Model(nn.Module):
     """Pipeline-capable Gemma 4 VLM model (no VisionTower)."""
 
     _omlx_adapter = _OMLX_ADAPTER
+    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: Any):
         super().__init__()
@@ -158,13 +159,17 @@ class Model(nn.Module):
     # ------------------------------------------------------------------
 
     def mtp_forward(self, *args, **kwargs):
-        return self.language_model.mtp_forward(*args, **kwargs)
+        from omlx.patches.gemma4_pipeline.native_mtp import head_forward
+        return head_forward(self, *args, **kwargs)
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
 
-    def rollback_speculative_cache(self, *args, **kwargs):
-        return self.language_model.rollback_speculative_cache(*args, **kwargs)
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        value = self.language_model.rollback_speculative_cache(caches, gdn_states, accepted, block_size)
+        from omlx.patches.gemma4_pipeline.native_mtp import refresh_after_rollback
+        refresh_after_rollback(self, caches)
+        return value
 
     # ------------------------------------------------------------------
     # Weight sanitization

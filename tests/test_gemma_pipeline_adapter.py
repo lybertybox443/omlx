@@ -44,7 +44,11 @@ def test_budget_delegation(tmp_path):
     assert actual["kv_cache_step"] == 256
 
 
-def test_native_mtp_not_yet_advertised(tmp_path):
-    assert "mtp_enabled" not in ADAPTER.optimizations
-    with pytest.raises(ValueError):
-        ADAPTER.prepare_worker(tmp_path, {"mtp_enabled": True})
+def test_native_mtp_options_and_missing_head(tmp_path):
+    from types import SimpleNamespace
+    settings = SimpleNamespace(mtp_enabled=True, mtp_fixed_depth=2, dflash_enabled=False)
+    assert ADAPTER.runtime_options(config(), settings) == {"mtp_enabled": True, "mtp_depth": 2}
+    assert "mtp_enabled" in ADAPTER.optimizations
+    (tmp_path / "config.json").write_text(json.dumps(config()))
+    with pytest.raises(ValueError, match="no native Gemma MTP head"):
+        ADAPTER.prepare_worker(tmp_path, {"mtp_enabled": True, "mtp_depth": 2})

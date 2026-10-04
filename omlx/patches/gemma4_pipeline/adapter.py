@@ -9,6 +9,7 @@ class Gemma4Adapter(PipelineModelAdapter):
     model_type = "gemma4"
     media = ("text",)
     required_imports = ("mlx_vlm",)
+    optimizations = ("mtp_enabled",)
 
     def supports_pipeline(self, config):
         text = config.get("text_config", config)
@@ -38,13 +39,19 @@ class Gemma4Adapter(PipelineModelAdapter):
         from omlx.cluster.gemma_attention_cache import gemma_attention_cache_budget
         return gemma_attention_cache_budget(model_path, options)
 
+    def runtime_options(self, config, model_settings):
+        from omlx.cluster.native_mtp_options import native_settings
+        if getattr(model_settings, "dflash_enabled", False):
+            raise ValueError("Distributed Gemma DFlash runtime is not installed")
+        return native_settings(model_settings)
+
+    def serving(self, model, provider, mlx_server, options):
+        from .native_mtp import serving
+        return serving(model, provider, mlx_server, options)
+
     def prepare_worker(self, model_path, options):
-        if options:
-            raise ValueError("Gemma native MTP worker integration is not yet installed")
-        from omlx.patches.mlx_lm_mtp import set_mtp_active
-        from omlx.patches.mlx_vlm_mtp import set_mtp_attach_enabled
-        set_mtp_active(False)
-        set_mtp_attach_enabled(False)
+        from .native_mtp import prepare_runtime
+        prepare_runtime(model_path, options)
         from omlx.patches.qwen4_exp_mlx_lm import _register_module
         for kind in ("gemma4", "gemma4_text"):
             _register_module("mlx_lm.models." + kind, "../gemma4_pipeline/model.py")
@@ -60,9 +67,11 @@ class Gemma4Adapter(PipelineModelAdapter):
         if stage is None:
             if group.size() > 1:
                 raise RuntimeError("Gemma has no configured pipeline stage")
-            return
-        from omlx.cluster.native_capture_pipeline import capture_wire
-        capture_wire().verify_contract(group, stage)
+        else:
+            from omlx.cluster.native_capture_pipeline import capture_wire
+            capture_wire().verify_contract(group, stage)
+        from .native_mtp import verify_native
+        verify_native(model, group)
 
 
 ADAPTER = Gemma4Adapter()
