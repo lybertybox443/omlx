@@ -743,8 +743,15 @@ class LagunaModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: mx.array | None = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
+        return_raw_hidden=False,
     ) -> mx.array:
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
+        points = sorted(set(capture_layer_ids or []))
+        if any(type(i) is not int or not 0 <= i <= self.num_hidden_layers for i in points):
+            raise ValueError("Laguna capture point exceeds decoder layers")
+        captured = {0: h} if 0 in points and self.start_idx == 0 else {}
         layers = self.pipeline_layers
         if cache is None:
             cache = [None] * len(layers)
@@ -759,16 +766,29 @@ class LagunaModel(PipelineMixin, nn.Module):
         full_mask = create_attention_mask(h, full)
         sliding_mask = (create_attention_mask(h, sliding, window_size=self.args.sliding_window)
                         if any(layer.attention_type == "sliding_attention" for layer in layers) else None)
-        for layer, c in zip(layers, cache):
+        for i, (layer, c) in enumerate(zip(layers, cache), self.start_idx):
             mask = sliding_mask if layer.attention_type == "sliding_attention" else full_mask
             h = layer(h, mask, c)
+            if i + 1 in points:
+                captured[i + 1] = h
         if self.pipeline_rank != 0:
             h = mx.distributed.send(h, self.pipeline_rank - 1, group=self.pipeline_group)
             if cache and cache[-1] is not None:
                 cache[-1].keys = mx.depends(cache[-1].keys, h)
         if self.pipeline_size > 1:
             h = mx.distributed.all_gather(h, group=self.pipeline_group)[:h.shape[0]]
-        return self.norm(h)
+        raw = h
+        out = self.norm(raw)
+        if hidden_sink is not None:
+            if self.pipeline_size > 1 and points:
+                # Drain boundary sends before every rank enters capture collectives.
+                mx.eval(out)
+                packed = mx.stack([captured.get(i, mx.zeros_like(raw)) for i in points])
+                shared = mx.distributed.all_sum(packed, group=self.pipeline_group)
+                mx.eval(shared)
+                captured = dict(zip(points, shared))
+            hidden_sink.extend(captured[i] for i in capture_layer_ids or [])
+        return (out, raw) if return_raw_hidden else out
 
 
 class Model(nn.Module):
@@ -780,16 +800,72 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-        input_embeddings: mx.array | None = None,
-    ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings)
-        if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+    _omlx_dflash_prefill_capture_required = True
+
+    @property
+    def language_model(self):
+        return self
+
+    @property
+    def config(self):
+        return self.args
+
+    def rollback_speculative_cache(self, cache, states, accepted, block_size):
+        if states is not None:
+            raise ValueError("Laguna KV target has no recurrent rollback state")
+        if isinstance(accepted, (list, tuple)):
+            if not accepted or len(set(accepted)) != 1:
+                raise ValueError("Per-row Laguna commits require the shared batch controller")
+            accepted = accepted[0]
+        if not self.mtp_partial_rollback(cache, accepted, block_size - 1):
+            raise RuntimeError("Laguna cache cannot roll back speculative tokens")
+
+    def __call__(self, inputs, cache=None, input_embeddings=None,
+                 return_hidden=False, n_confirmed=0, capture_layer_ids=None):
+        from types import SimpleNamespace
+        del n_confirmed
+        drafter = getattr(self, "_omlx_drafter", None)
+        capture = getattr(self, "_omlx_dflash_prefill_capture", None)
+        scope = getattr(drafter, "scope_uids", None)
+        observe = bool(scope and not return_hidden and capture is None
+                       and inputs.shape[0] == len(scope) and inputs.shape[1] == 1)
+        ids = capture_layer_ids
+        if capture is not None or observe:
+            ids = list(drafter.target_layer_ids)
+        if ids is not None and any(type(i) is not int or not 0 <= i < self.args.num_hidden_layers for i in ids):
+            raise ValueError("Laguna draft capture layer exceeds decoder layers")
+        hidden = [] if ids is not None else None
+        result = self.model(inputs, cache, input_embeddings,
+            capture_layer_ids=[i + 1 for i in ids] if ids is not None else None,
+            hidden_sink=hidden, return_raw_hidden=return_hidden)
+        out, raw = result if return_hidden else (result, None)
+        logits = self.model.embed_tokens.as_linear(out) if self.args.tie_word_embeddings else self.lm_head(out)
+        if capture is not None and not return_hidden:
+            capture(hidden, int(inputs.shape[1]))
+        elif observe:
+            drafter.observe(scope, hidden)
+        if return_hidden:
+            if hidden is not None:
+                return SimpleNamespace(logits=logits, hidden_states=[*hidden, raw], gdn_states=None)
+            return logits, raw
+        return logits
+
+    def make_mtp_cache(self):
+        return []
+
+    def mtp_forward(self, *args, **kwargs):
+        raise RuntimeError("Laguna has no native MTP head; use the attached DFlash drafter")
+
+    def mtp_partial_rollback(self, cache, accepted, num_drafts):
+        rejected = num_drafts - accepted
+        if rejected <= 0:
+            return True
+        if not all(c.is_trimmable() for c in cache):
+            return False
+        for c in cache:
+            if c.trim(rejected) != rejected:
+                raise RuntimeError("Laguna speculative cache rollback was incomplete")
+        return True
 
     def make_cache(self) -> list[KVCache | RotatingKVCache]:
         """Bound sliding-attention KV state while retaining global history."""

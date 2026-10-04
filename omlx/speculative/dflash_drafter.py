@@ -158,6 +158,42 @@ def _mlp(mlp, x: mx.array) -> mx.array:
     return mlp(x)
 
 
+def _draft_context(model, hidden):
+    combine = getattr(model, "_combine_hidden", None)
+    return combine(hidden) if callable(combine) else model.hidden_norm(model.fc(hidden))
+
+
+def _draft_project_kv(attention, hidden):
+    project = getattr(attention, "_project_kv", None)
+    if callable(project):
+        return project(hidden)
+    qkv = attention.qkv_proj(hidden)
+    q_width = attention.n_heads * attention.head_dim
+    kv_width = attention.n_kv_heads * attention.head_dim
+    return qkv[..., q_width:q_width + kv_width], qkv[..., q_width + kv_width:]
+
+
+def _draft_project_qkv(attention, hidden):
+    fused = getattr(attention, "qkv_proj", None)
+    if fused is not None:
+        qkv = fused(hidden)
+        q_width = attention.n_heads * attention.head_dim
+        kv_width = attention.n_kv_heads * attention.head_dim
+        return qkv[..., :q_width], qkv[..., q_width:q_width + kv_width], qkv[..., q_width + kv_width:]
+    keys, values = _draft_project_kv(attention, hidden)
+    return attention.q_proj(hidden), keys, values
+
+
+def _draft_attention_output(attention, hidden, attended):
+    batch, length = hidden.shape[:2]
+    attended = attended.transpose(0, 2, 1, 3)
+    gate = getattr(attention, "g_proj", None)
+    if gate is not None:
+        weights = nn.softplus(gate(hidden).astype(mx.float32)).astype(attended.dtype)
+        attended = attended * weights[..., None]
+    return attention.o_proj(attended.reshape(batch, length, -1))
+
+
 def _greedy_proposals(logits: mx.array) -> mx.array:
     # DFlash v1 samples proposals from this callable; the DFlash2 selector
     # only looks for ``sample_proposal`` on it and otherwise takes argmax.
@@ -743,7 +779,7 @@ class DFlashDrafter:
             ],
             axis=0,
         )
-        h_ctx = model.hidden_norm(model.fc(padded))
+        h_ctx = _draft_context(model, padded)
         sink_lengths = [0 if row.sinks is None else int(row.sinks.shape[1]) for _, row, *_ in rows]
         sink_width = max(sink_lengths) if self.sink_size else 0
         cohort = self._assemble_cohort(uids, dtype)
@@ -761,7 +797,7 @@ class DFlashDrafter:
                 mx.pad(row.sinks, [(0, 0), (0, sink_width - length), (0, 0)])
                 for (_, row, *_), length in zip(rows, sink_lengths)
             ]
-            sink_hidden = model.hidden_norm(model.fc(mx.concatenate(prefixes, axis=0)))
+            sink_hidden = _draft_context(model, mx.concatenate(prefixes, axis=0))
 
 
         anchors = mx.concatenate([anchor for _, _, _, anchor, _ in rows]).astype(
@@ -816,7 +852,7 @@ class DFlashDrafter:
             if attention_conv is not None:
                 x, kernel = _conv_prepare(attention_conv, x)
 
-            ctx_keys, ctx_values = attn._project_kv(h_ctx)
+            ctx_keys, ctx_values = _draft_project_kv(attn, h_ctx)
             ctx_keys = attn.k_norm(
                 ctx_keys.reshape(batch, width, attn.n_kv_heads, -1)
             ).transpose(0, 2, 1, 3)
@@ -833,8 +869,7 @@ class DFlashDrafter:
             new_keys.append(ring_keys)
             new_values.append(ring_values)
 
-            queries = attn.q_proj(x)
-            prop_keys, prop_values = attn._project_kv(x)
+            queries, prop_keys, prop_values = _draft_project_qkv(attn, x)
             queries = attn.q_norm(
                 queries.reshape(batch, block, attn.n_heads, -1)
             ).transpose(0, 2, 1, 3)
@@ -849,7 +884,7 @@ class DFlashDrafter:
             keys = mx.concatenate([ring_keys, prop_keys], axis=2)
             values = mx.concatenate([ring_values, prop_values], axis=2)
             if sink_hidden is not None:
-                sink_keys, sink_values = attn._project_kv(sink_hidden)
+                sink_keys, sink_values = _draft_project_kv(attn, sink_hidden)
                 sink_keys = attn.k_norm(
                     sink_keys.reshape(batch, sink_width, attn.n_kv_heads, -1)
                 ).transpose(0, 2, 1, 3)
@@ -864,17 +899,20 @@ class DFlashDrafter:
                 )
                 keys = mx.concatenate([sink_keys, keys], axis=2)
                 values = mx.concatenate([sink_values, values], axis=2)
+            layer_mask = mask
+            if getattr(attn, "causal", False):
+                context_mask = mx.broadcast_to(mask[..., :-block], (batch, 1, block, keys.shape[2] - block))
+                proposal_mask = mx.broadcast_to(mx.tril(mx.ones((block, block), mx.bool_)), (batch, 1, block, block))
+                layer_mask = mx.concatenate([context_mask, proposal_mask], axis=-1)
             attended = mx.fast.scaled_dot_product_attention(
                 queries,
                 keys,
                 values,
                 scale=attn.scale,
-                mask=mask,
-                sinks=attn.attention_sink_bias,
+                mask=layer_mask,
+                sinks=getattr(attn, "attention_sink_bias", None),
             )
-            attended = attn.o_proj(
-                attended.transpose(0, 2, 1, 3).reshape(batch, block, -1)
-            )
+            attended = _draft_attention_output(attn, x, attended)
             if attention_conv is not None:
                 attended = _conv_finish(attention_conv, attended, kernel)
             h = residual + attended
