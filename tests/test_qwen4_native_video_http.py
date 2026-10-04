@@ -61,10 +61,45 @@ def reference(path, content):
     return tokenizer.decode(tokens)
 
 
+def dflash_options(tmp_path, ddtree):
+    import dataclasses
+    from mlx.utils import tree_flatten
+    from test_dflash_batched import _tiny_config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+    from omlx.cluster.specprefill import DraftReservation
+    from omlx.cluster.planner import inspect_safetensors_layout
+    from omlx.cluster.dflash import runtime_settings
+    config = _tiny_config(num_target_layers=8)
+    config.target_layer_ids = [0, 3, 7]
+    model = DFlash2DraftModel(config)
+    mx.eval(model.parameters())
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    mx.save_safetensors(str(draft / "model.safetensors"), dict(tree_flatten(model.parameters())))
+    params = dataclasses.asdict(config)
+    (draft / "config.json").write_text(json.dumps(
+        dict(params, dflash_config=dict(params), architectures=["DFlash2DraftModel"])))
+    options = runtime_settings(SimpleNamespace(
+        dflash_enabled=True, dflash_draft_model=str(draft), dflash_block_size=3,
+        dflash_draft_sink_size=3, dflash_capture_cache=True,
+        dflash_verify_mode="ddtree" if ddtree else None,
+        dflash_ddtree_max_branches=3, dflash_ddtree_max_nodes=7,
+        dflash_ddtree_memory_bytes=64 * 1024**2))
+    reservation = DraftReservation.from_layout(
+        inspect_safetensors_layout(draft), max_prompt_tokens=1024, workspace_bytes=1024**3)
+    options.update(dflash_reserved_bytes=reservation.total_bytes,
+                   dflash_max_prompt_tokens=1024)
+    return options
+
+
+@pytest.mark.parametrize("draft", ["ordinary", "native", "dflash", "ddtree"])
 @pytest.mark.parametrize("ranges", [TWO_RANKS, THREE_RANKS])
-def test_native_video_http_uses_temporal_grid_and_isolated_cache(tmp_path, ranges):
+def test_native_video_http_uses_temporal_grid_and_isolated_cache(tmp_path, ranges, draft):
     path = tmp_path / "model"
-    write_checkpoint(path)
+    native = draft == "native"
+    dflash = draft in ("dflash", "ddtree")
+    write_checkpoint(path, mtp=native)
+    options = dflash_options(tmp_path, draft == "ddtree") if dflash else None
     template_path = path / "chat_template.jinja"
     template_path.write_text(template_path.read_text().replace(
         "{% else %}{{ p['text'] }}",
@@ -77,7 +112,9 @@ def test_native_video_http_uses_temporal_grid_and_isolated_cache(tmp_path, range
     expected = [reference(path, content) for content in (red, blue)]
     active = tmp_path / "active"
     active.mkdir()
-    with served(path, ranges, active, prefill_step_size=3) as server:
+    with served(path, ranges, active, prefill_step_size=3,
+                mtp_depth=2 if native else None, extra_runtime_options=options or None,
+                trace_native_mtp=native, trace_dflash_draft=dflash) as server:
         first = server.chat(red, timeout=60)
         assert _content(first) == expected[0]
         repeated = server.chat(red, timeout=60)
@@ -91,3 +128,8 @@ def test_native_video_http_uses_temporal_grid_and_isolated_cache(tmp_path, range
             assert [_content(job.result()) for job in jobs] == expected
         assert server.chat(red, stream=True, timeout=60) == expected[0]
         assert server.chat(PROMPTS[0], timeout=30)["choices"]
+        trace = server.processes.output(0)[0]
+        if dflash:
+            assert "EP_DFLASH_DRAFT" in trace
+        if native:
+            assert "EP_MTP_STEP" in trace
