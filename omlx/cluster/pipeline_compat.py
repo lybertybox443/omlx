@@ -197,6 +197,11 @@ def _cache_dependency(cache_entry: Any, value: Any, mx: Any) -> None:
     if callable(anchor):
         anchor(value)
         return
+    children = getattr(cache_entry, "caches", None)
+    if children is not None:
+        for child in children:
+            _cache_dependency(child, value, mx)
+        return
     if hasattr(cache_entry, "keys"):
         keys = cache_entry.keys
         if keys is not None:

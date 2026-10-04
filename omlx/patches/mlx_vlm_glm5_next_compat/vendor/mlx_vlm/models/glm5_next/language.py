@@ -1926,12 +1926,35 @@ class Glm5NextModel(nn.Module):
         self.hc_mult = config.hc_mult
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        from . import pipeline as stage_pipeline
+        start, end = stage_pipeline.planned_range(config.num_hidden_layers) or (0, config.num_hidden_layers)
         self.layers = [
-            Glm5NextDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+            Glm5NextDecoderLayer(config, idx) if start <= idx < end else None
+            for idx in range(config.num_hidden_layers)
         ]
+        self.start_idx = 0
+        self.end_idx = None
+        self.pipeline_rank = 0
+        self.pipeline_size = 1
+        self.pipeline_stage = None
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ssm_idx = next((i for i, l in enumerate(self.layers) if l.is_linear), 0)
-        self.fa_idx = next((i for i, l in enumerate(self.layers) if not l.is_linear), 0)
+        held = [layer for layer in self.layers if layer is not None]
+        self.ssm_idx = next((i for i, l in enumerate(held) if l.is_linear), None)
+        self.fa_idx = next((i for i, l in enumerate(held) if not l.is_linear), None)
+
+    @property
+    def pipeline_layers(self):
+        return self.layers[self.start_idx:self.end_idx]
+
+    def pipeline(self, group, split=None):
+        from . import pipeline as stage_pipeline
+        stage_pipeline.configure(self, group)
+
+    pipeline._omlx_honors_pipeline_assignment = True
+
+    def verify_pipeline_contract(self, group):
+        from . import pipeline as stage_pipeline
+        stage_pipeline.verify(self, group)
 
     def __call__(
         self,
@@ -1941,18 +1964,23 @@ class Glm5NextModel(nn.Module):
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
+        layers = self.pipeline_layers
         if cache is None:
-            cache = [None] * len(self.layers)
-
-        fa_cache = cache[self.fa_idx]
-        fa_mask = create_attention_mask(
+            cache = [None] * len(layers)
+        if len(cache) != len(layers):
+            raise ValueError("GLM cache count does not match resident layers")
+        fa_cache = cache[self.fa_idx] if self.fa_idx is not None else None
+        fa_mask = (create_attention_mask(
             h, fa_cache[0] if fa_cache else None, return_array=True
-        )
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        ) if self.fa_idx is not None else None)
+        ssm_mask = (create_ssm_mask(h, cache[self.ssm_idx])
+                    if self.ssm_idx is not None else None)
 
-        h = mx.broadcast_to(
+        from . import pipeline as stage_pipeline
+        received = stage_pipeline.receive(self, h)
+        h = (mx.broadcast_to(
             h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
-        )
+        ) if received is None else received)
         h = mx.contiguous(h)
 
         # Evaluate layer by layer to bound prefill memory, but pipelined: the
@@ -1972,12 +2000,12 @@ class Glm5NextModel(nn.Module):
         # rest of the graph is still being built (scheduling only, see
         # _DECODE_EVAL_EVERY).
         eval_every = _DECODE_EVAL_EVERY if h.shape[1] == 1 else 0
-        n_layers = len(self.layers)
+        n_layers = len(layers)
         # One token: each layer's last HC expand runs inside the next layer's
         # first HC pre (see _decode_hc_pre_deferred); the last one here.
         defer = h.shape[:2] == (1, 1)
 
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for i, (layer, c) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             if defer:
                 h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
@@ -1990,8 +2018,7 @@ class Glm5NextModel(nn.Module):
         if pipeline is not None:
             pipeline.drain()
 
-        h = h.mean(axis=2)
-        return self.norm(h)
+        return stage_pipeline.finish(self, h, cache)
 
 
 class LanguageModel(nn.Module):
@@ -2115,7 +2142,7 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         caches = []
-        for layer in self.layers:
+        for layer in self.model.pipeline_layers:
             if layer.is_linear:
                 caches.append(ArraysCache(size=2))
             else:

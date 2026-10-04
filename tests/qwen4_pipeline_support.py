@@ -575,7 +575,7 @@ def make_deployment(
         assignments=assignments,
         plan_hash=plan_hash,
         runtime_options={
-            "ple_mode": ple_mode,
+            **({"ple_mode": ple_mode} if ple_mode is not None else {}),
             **(extra_runtime_options or {}),
             **(
                 {

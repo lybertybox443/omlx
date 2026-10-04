@@ -30,6 +30,8 @@ from typing import Any
 # config ``model_type`` -> module exposing ``ADAPTER``.
 _ADAPTER_MODULES: dict[str, str] = {
     "qwen4_exp": "omlx.patches.qwen4_exp_mlx_lm.adapter",
+    "glm5_next": "omlx.patches.glm5_next_mlx_lm.adapter",
+    "glm5_next_text": "omlx.patches.glm5_next_mlx_lm.adapter",
 }
 
 
