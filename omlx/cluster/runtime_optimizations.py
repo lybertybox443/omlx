@@ -651,10 +651,16 @@ def install_runtime_optimizations(
                 all_samples = []
                 for index in range(len(instance.uids)):
                     sampler = instance.samplers[index] or instance.fallback_sampler
+                    # This step already broadcasts the owner choice once.
+                    if getattr(sampler, "_omlx_distributed", False):
+                        sampler = sampler.sampler
                     all_samples.append(sampler(logprobs[index : index + 1]))
                 sampled = mx.concatenate(all_samples, axis=0)
             else:
-                sampled = instance.fallback_sampler(logprobs)
+                sampler = instance.fallback_sampler
+                if getattr(sampler, "_omlx_distributed", False):
+                    sampler = sampler.sampler
+                sampled = sampler(logprobs)
         else:
             sampled = mx.zeros((len(instance.uids),), dtype=mx.uint32)
 

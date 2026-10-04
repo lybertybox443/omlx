@@ -18,6 +18,11 @@ def install_mtp_sampling(model, server, options=None):
     for name in names:
         setattr(model, f"_omlx_mtp_{name}", bool((options or {}).get(f"mtp_{name}", False)))
     original = server._make_sampler
+    original_factory = getattr(server, "make_sampler", None)
+    if callable(original_factory):
+        # Keep temperature/filter metadata and exact acceptance densities.
+        from omlx.utils.sampling import make_sampler as metadata_sampler
+        server.make_sampler = metadata_sampler
 
     def make_sampler(*args, **kwargs):
         return coordinator.sampler(original(*args, **kwargs))
@@ -27,6 +32,8 @@ def install_mtp_sampling(model, server, options=None):
         yield
     finally:
         server._make_sampler = original
+        if callable(original_factory):
+            server.make_sampler = original_factory
         for name, value in previous.items():
             setattr(model, f"_omlx_mtp_{name}", value)
 

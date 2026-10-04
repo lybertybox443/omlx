@@ -1605,13 +1605,12 @@ def run_worker(args: argparse.Namespace) -> int:
             # A model that builds its own stage proves, with one collective
             # issued after the load, that every rank agrees on the wire
             # layout and that the ranges chain from layer 0 to the last.
-            if (
-                getattr(getattr(provider.model, "model", None), "pipeline_stage", None)
-                is not None
-            ):
-                model_adapter(provider.model).verify_contract(
-                    provider.model, wiring.pipeline_group
-                )
+            # Each adapter owns its stage contract. Native PipelineMixin
+            # adapters expose start/end indices rather than pipeline_stage;
+            # the base adapter intentionally leaves legacy models unchanged.
+            model_adapter(provider.model).verify_contract(
+                provider.model, wiring.pipeline_group
+            )
             # Pure TP was applied layer-by-layer by the progressive loader.
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)

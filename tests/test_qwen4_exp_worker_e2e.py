@@ -176,6 +176,12 @@ def served(
             "            print('EP_MTP_STEP', len(batch.uids), flush=True)\n"
             "        return result\n"
             "    setattr(bg, name, traced)\n"
+            "original_stochastic = bg._stochastic_verify_tokens\n"
+            "def traced_stochastic(*args, **kwargs):\n"
+            "    result = original_stochastic(*args, **kwargs)\n"
+            "    if mx.distributed.init().rank() == 0: print('EP_MTP_STOCHASTIC', flush=True)\n"
+            "    return result\n"
+            "bg._stochastic_verify_tokens = traced_stochastic\n"
         )
         environment["PYTHONPATH"] = str(injection) + os.pathsep + os.environ.get("PYTHONPATH", "")
     if simulate_cutoff:
