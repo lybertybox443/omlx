@@ -338,6 +338,196 @@ def test_native_layer_loop_sees_only_owned_and_shards_once():
     assert model.model.layers is original and original[0] is None
 
 
+# ---------------------------------------------------------------------------
+# Muse/Glimmer TP tests
+# ---------------------------------------------------------------------------
+
+def _muse_layers(hidden_size=16, intermediate_size=32, head_dim=4,
+                 num_attention_heads=4, num_key_value_heads=2):
+    """Muse/Glimmer model with configurable tiny dimensions."""
+    from mlx_vlm.models.muse_glimmer.config import TextConfig
+    from mlx_vlm.models.muse_glimmer.language import LanguageModel
+
+    args = TextConfig(
+        vocab_size=64,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=2,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        max_position_embeddings=128,
+        sliding_window=8,
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[10000.0, 0],
+    )
+    model = LanguageModel(args)
+    # model_type is set from args.model_type in the constructor; ensure registered key
+    model.model_type = "muse_glimmer"
+    return model, list(model.model.layers)
+
+
+def test_muse_glimmer_registered():
+    from omlx.cluster import tensor_strategies as ts
+
+    assert "muse_glimmer" in ts.registered_model_types()
+    assert ts.supports_model_type("muse_glimmer")
+
+
+def test_muse_glimmer_attention_tp2_sum_equals_native(monkeypatch):
+    """Sum of TP-2 attention outputs equals native output (NoPE and RoPE layers)."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model_r0, layers_r0 = _muse_layers()
+    model_r1 = copy.deepcopy(model_r0)
+    layers_r1 = list(model_r1.model.layers)
+
+    x = mx.random.normal((1, 3, 16))
+    # native forward on layer 0 (sliding/RoPE) and layer 1 (full/NoPE)
+    native_outs = [layer.self_attn(x) for layer in layers_r0]
+    for out in native_outs:
+        mx.eval(out)
+
+    ts._shard_muse_glimmer(model_r0, _FakeGroup(2, 0), mx, None)
+    ts._shard_muse_glimmer(model_r1, _FakeGroup(2, 1), mx, None)
+
+    for i, (l0, l1, native_out) in enumerate(zip(
+        model_r0.model.layers, model_r1.model.layers, native_outs
+    )):
+        out0 = l0.self_attn(x)
+        out1 = l1.self_attn(x)
+        combined = out0 + out1  # fake all_sum: identity per rank, sum recovers full
+        mx.eval(combined)
+        err = mx.abs(combined - native_out).max().item()
+        ref = max(mx.abs(native_out).max().item(), 1.0)
+        assert err < 1e-4 * ref, f"layer {i}: TP2 attention sum diverged: {err} vs {ref}"
+
+
+def test_muse_glimmer_mlp_tp2_sum_equals_native(monkeypatch):
+    """Sum of TP-2 MLP outputs equals native MLP output."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model_r0, layers_r0 = _muse_layers()
+    model_r1 = copy.deepcopy(model_r0)
+    layers_r1 = list(model_r1.model.layers)
+
+    x = mx.random.normal((1, 3, 16))
+    native_outs = [layer.mlp(x) for layer in layers_r0]
+    for out in native_outs:
+        mx.eval(out)
+
+    ts._shard_muse_glimmer(model_r0, _FakeGroup(2, 0), mx, None)
+    ts._shard_muse_glimmer(model_r1, _FakeGroup(2, 1), mx, None)
+
+    for i, (l0, l1, native_out) in enumerate(zip(
+        model_r0.model.layers, model_r1.model.layers, native_outs
+    )):
+        out0 = l0.mlp(x)
+        out1 = l1.mlp(x)
+        combined = out0 + out1
+        mx.eval(combined)
+        err = mx.abs(combined - native_out).max().item()
+        ref = max(mx.abs(native_out).max().item(), 1.0)
+        assert err < 1e-4 * ref, f"layer {i}: TP2 MLP sum diverged: {err} vs {ref}"
+
+
+def test_muse_glimmer_gate_proj_head_counts(monkeypatch):
+    """After TP-2 sharding: n_heads halved, gate_proj output rows halved."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model, layers = _muse_layers()
+    # tiny config: n_heads=4, n_kv_heads=2, head_dim=4
+    # gate_proj: (n_heads * head_dim, hidden) = (16, 16) before sharding
+    before_gate_rows = layers[0].self_attn.gate_proj.weight.shape[0]
+    assert before_gate_rows == 16  # 4 heads * 4 head_dim
+
+    ts._shard_muse_glimmer(model, _FakeGroup(2, 0), mx, None)
+
+    attn = model.model.layers[0].self_attn
+    assert attn.n_heads == 2           # 4 // 2
+    assert attn.n_kv_heads == 1        # 2 // 2
+    assert attn.gate_proj.weight.shape[0] == 8   # 16 // 2
+    assert attn.q_proj.weight.shape[0] == 8      # n_heads_local * head_dim
+    assert attn.k_proj.weight.shape[0] == 4      # n_kv_heads_local * head_dim
+
+
+def test_muse_glimmer_late_bad_layer_refuses_before_mutation(monkeypatch):
+    """preflight rejects layer 1 projection mismatch before layer 0 is mutated."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    # hidden=16, n_heads=4, head_dim=4 → q_proj out=16, n_kv_heads=2 → k_proj out=8
+    model, layers = _muse_layers()
+
+    # Corrupt layer 1 q_proj output width to be inconsistent with n_heads*head_dim
+    # (n_heads=4, head_dim=4 → expected 16; give 15 which also fails divisibility)
+    import mlx.core as mx_core
+    layers[1].self_attn.q_proj.weight = mx_core.zeros((15, 16))  # 15 != 16 and not div by 2
+
+    before_q0_rows = layers[0].self_attn.q_proj.weight.shape[0]
+    before_n_heads = layers[0].self_attn.n_heads
+    with pytest.raises((ValueError, RuntimeError)):
+        ts._shard_muse_glimmer(model, _FakeGroup(2, 0), mx, None)
+
+    # layer 0 must remain completely unmodified
+    assert layers[0].self_attn.q_proj.weight.shape[0] == before_q0_rows
+    assert layers[0].self_attn.n_heads == before_n_heads
+
+
+def test_muse_glimmer_quant_bits4_group32_tp2(monkeypatch):
+    """TP-2 on quantized (bits=4, group_size=32) Muse model: preflight passes and attention+MLP sums match."""
+    import mlx.nn as nn
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    # hidden=64, intermediate=64, head_dim=16, heads=4, kv_heads=2
+    # intermediate=64, group_size=32 → 2 groups → divisible by 2 ✓
+    # hidden=64, group_size=32 → 2 groups → divisible by 2 ✓
+    model_r0, layers_r0 = _muse_layers(
+        hidden_size=64, intermediate_size=64, head_dim=16,
+        num_attention_heads=4, num_key_value_heads=2,
+    )
+    # Quantize the whole model in-place on r0, then deepcopy for r1
+    nn.quantize(model_r0, group_size=32, bits=4)
+    mx.eval(model_r0.parameters())
+    model_r1 = copy.deepcopy(model_r0)
+    layers_r0 = list(model_r0.model.layers)
+    layers_r1 = list(model_r1.model.layers)
+
+    x = mx.random.normal((1, 3, 64))
+    native_attn_outs = [layer.self_attn(x) for layer in layers_r0]
+    native_mlp_outs = [layer.mlp(x) for layer in layers_r0]
+    for out in native_attn_outs + native_mlp_outs:
+        mx.eval(out)
+
+    ts._shard_muse_glimmer(model_r0, _FakeGroup(2, 0), mx, None)
+    ts._shard_muse_glimmer(model_r1, _FakeGroup(2, 1), mx, None)
+
+    for i, (l0, l1, nat_attn, nat_mlp) in enumerate(zip(
+        model_r0.model.layers, model_r1.model.layers,
+        native_attn_outs, native_mlp_outs,
+    )):
+        # attention sum
+        out0 = l0.self_attn(x)
+        out1 = l1.self_attn(x)
+        combined = out0 + out1
+        mx.eval(combined)
+        err = mx.abs(combined - nat_attn).max().item()
+        ref = max(mx.abs(nat_attn).max().item(), 1.0)
+        assert err < 1e-3 * ref, f"layer {i}: quant TP2 attention sum diverged: {err} vs {ref}"
+        # MLP sum
+        out0m = l0.mlp(x)
+        out1m = l1.mlp(x)
+        combinedm = out0m + out1m
+        mx.eval(combinedm)
+        errm = mx.abs(combinedm - nat_mlp).max().item()
+        refm = max(mx.abs(nat_mlp).max().item(), 1.0)
+        assert errm < 1e-3 * refm, f"layer {i}: quant TP2 MLP sum diverged: {errm} vs {refm}"
+
+
 @pytest.mark.parametrize("shape", ["empty", "hole"])
 def test_invalid_owned_range_rejected_before_mutation(shape):
     from omlx.cluster.tensor_strategies import apply_tensor_strategy
