@@ -21,6 +21,8 @@ def _extract_text_config(cfg: Any):
     from mlx_vlm.models.gemma4.config import TextConfig, ModelConfig
     if isinstance(cfg, TextConfig):
         return cfg
+    if isinstance(cfg, ModelArgs):
+        return cfg.text_config
     if isinstance(cfg, ModelConfig):
         return cfg.text_config
     if isinstance(cfg, dict):
