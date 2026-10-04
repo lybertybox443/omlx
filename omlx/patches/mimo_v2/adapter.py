@@ -13,6 +13,22 @@ class MiMoAdapter(PipelineModelAdapter):
     media = ("text",)
     required_imports = ("mlx_lm",)
 
+    def supplemental_files(self, model_path):
+        root = Path(model_path).expanduser().resolve()
+        names = set()
+        for sub in ("omnimodal", "audio_tokenizer"):
+            base = root / sub
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*"):
+                try:
+                    resolved = path.resolve()
+                    if path.is_file() and resolved.is_file() and resolved.is_relative_to(root):
+                        names.add(path.relative_to(root).as_posix())
+                except (OSError, ValueError):
+                    continue
+        return tuple(sorted(names))
+
     def supports_pipeline(self, config):
         count = config.get("num_hidden_layers")
         return type(count) is int and count >= 2

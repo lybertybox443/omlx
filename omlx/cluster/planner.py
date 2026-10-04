@@ -1195,6 +1195,83 @@ _ROUTED_EXPERT_RE = _re.compile(
 _SHARED_EXPERT_RE = _re.compile(r"\.mlp\.shared_expert\.[^.]+(\.[^.]+)*$")
 
 
+_SUPPLEMENTAL_DTYPE_BYTES = {
+    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
+    "I64": 8, "I32": 4, "I16": 2, "I8": 1,
+    "U64": 8, "U32": 4, "U16": 2, "U8": 1, "BOOL": 1,
+}
+
+
+def _supplemental_weight_reserve(root: Path, adapter: Any) -> int:
+    """Conservative fixed bytes for supplemental neural sidecar weights."""
+
+    if adapter is None:
+        return 0
+    from omlx.cluster.staging import _local_staging_path
+
+    total = 0
+    for name in adapter.supplemental_files(str(root)):
+        if not str(name).endswith(".safetensors"):
+            continue
+        try:
+            path = _local_staging_path(root, str(name))
+            header, payload_bytes = _safetensors_header(path)
+        except (ValueError, OSError) as exc:
+            raise PlanningError(
+                f"invalid supplemental weight file {name}: {exc}"
+            ) from exc
+        intervals: list[tuple[int, int, str]] = []
+        init_bytes = 0
+        loaded = 0
+        for tensor, spec in header.items():
+            if tensor == "__metadata__":
+                continue
+            if not isinstance(spec, dict):
+                raise PlanningError(f"invalid tensor metadata for {tensor}")
+            shape = spec.get("shape")
+            if not isinstance(shape, list) or not all(
+                isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                for v in shape
+            ):
+                raise PlanningError(f"invalid shape for tensor {tensor}")
+            offsets = spec.get("data_offsets")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(
+                    isinstance(v, int) and not isinstance(v, bool)
+                    for v in offsets
+                )
+                or offsets[0] < 0
+                or offsets[1] < offsets[0]
+                or offsets[1] > payload_bytes
+            ):
+                raise PlanningError(f"invalid data offsets for tensor {tensor}")
+            width = _SUPPLEMENTAL_DTYPE_BYTES.get(spec.get("dtype"))
+            if width is None:
+                raise PlanningError(
+                    f"unsupported dtype for supplemental tensor {tensor}"
+                )
+            elements = 1
+            for dim in shape:
+                elements *= dim
+            size = offsets[1] - offsets[0]
+            if elements * width != size:
+                raise PlanningError(f"shape/offset mismatch for tensor {tensor}")
+            if size:
+                intervals.append((offsets[0], offsets[1], tensor))
+            init_bytes += 4 * elements
+            loaded += size
+        intervals.sort()
+        for prev, cur in zip(intervals, intervals[1:]):
+            if cur[0] < prev[1]:
+                raise PlanningError(
+                    f"overlapping tensors {prev[2]} and {cur[2]}"
+                )
+        total += max(init_bytes, loaded) + 2 * loaded
+    return total
+
+
 def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     """Read only safetensors headers and total weights by transformer layer."""
 
@@ -1331,6 +1408,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         shared_bytes.append(shared_total)
     if not any(expert_counts):
         expert_counts, routed_bytes, shared_bytes = [], [], []
+    fixed_bytes += _supplemental_weight_reserve(root, adapter)
     return ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,

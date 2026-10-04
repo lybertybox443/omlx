@@ -186,6 +186,16 @@ def sidecar_files(model_path: str | Path) -> tuple[str, ...]:
         for path in root.glob(pattern):
             if path.is_file() and not path.name.endswith(".safetensors"):
                 names.add(path.name)
+    config_path = root / "config.json"
+    if config_path.is_file():
+        from omlx.cluster.model_adapters import adapter_for_config
+
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        adapter = adapter_for_config(config)
+        for name in adapter.supplemental_files(str(root)) if adapter else ():
+            if _local_staging_path(root, name).is_file():
+                names.add(name)
     return tuple(sorted(names))
 
 
@@ -203,11 +213,12 @@ def _model_identity_digest(model_path: str | Path) -> str:
     for name in sidecar_files(root):
         path = root / name
         encoded = name.encode()
-        payload = path.read_bytes()
         hasher.update(struct.pack("<Q", len(encoded)))
         hasher.update(encoded)
-        hasher.update(struct.pack("<Q", len(payload)))
-        hasher.update(payload)
+        hasher.update(struct.pack("<Q", path.stat().st_size))
+        with open(path, "rb") as handle:
+            while chunk := handle.read(1 << 20):
+                hasher.update(chunk)
     return hasher.hexdigest()
 
 
@@ -414,7 +425,7 @@ def remote_model_staging_inventory(
     for name, size in raw_sidecars.items():
         if (
             not isinstance(name, str)
-            or Path(name).name != name
+            or not safe_relative_filename(name)
             or not isinstance(size, int)
             or isinstance(size, bool)
             or size < 0
@@ -537,11 +548,7 @@ def stage_manifest(
             destination = Path(
                 (path_map or {}).get(assignment.node_id, remote_dir)
             ).expanduser()
-            present_by_node[assignment.node_id] = {
-                path.name: path.stat().st_size
-                for path in (destination.iterdir() if destination.is_dir() else ())
-                if path.is_file()
-            }
+            present_by_node[assignment.node_id] = _local_file_sizes(destination)
         else:
             peer_dir = remote_model_dir(
                 ssh_target, (path_map or {}).get(assignment.node_id, portable)
@@ -607,10 +614,15 @@ _REMOTE_INSTALL_SNIPPET = (
     "import os,sys;"
     "temporary,final=sys.argv[1:3];"
     "expected=int(sys.argv[3]);"
-    "actual=os.path.getsize(temporary);"
+    "parent=os.path.realpath(os.path.dirname(os.path.abspath(temporary)));"
+    "target=os.path.realpath(final);"
+    "\nif os.path.commonpath([parent,target])!=parent or target==parent:"
+    "\n raise SystemExit('final path escapes staging directory')"
+    "\nactual=os.path.getsize(temporary)"
     "\nif expected >= 0 and actual != expected:"
     "\n raise SystemExit(f'transferred size {actual} != expected {expected}')"
-    "\nos.replace(temporary,final)"
+    "\nos.makedirs(os.path.dirname(target),exist_ok=True)"
+    "\nos.replace(temporary,target)"
 )
 _REMOTE_DISCARD_SNIPPET = (
     "import os,sys;\ntry: os.unlink(sys.argv[1])\nexcept FileNotFoundError: pass"
@@ -739,6 +751,24 @@ def stage_complete_model(
     )
 
 
+def safe_relative_filename(name: str) -> bool:
+    return (
+        isinstance(name, str) and bool(name) and "\0" not in name
+        and not Path(name).is_absolute()
+        and all(part not in ("", ".", "..") for part in name.split("/"))
+    )
+
+
+def _local_staging_path(root: str | Path, name: str) -> Path:
+    if not safe_relative_filename(name):
+        raise ValueError(f"unsafe staging filename: {name!r}")
+    directory = Path(root).expanduser().resolve()
+    path = (directory / name).resolve()
+    if not path.is_relative_to(directory):
+        raise ValueError(f"staging filename escapes model directory: {name!r}")
+    return path
+
+
 def scp_push(
     *,
     destination_host: str,
@@ -750,9 +780,9 @@ def scp_push(
 ) -> None:
     """Push one local model file to the Mac that needs it."""
 
-    if Path(filename).name != filename:
+    if not safe_relative_filename(filename):
         raise ValueError(f"staging filename must be a basename: {filename!r}")
-    source = Path(source_dir).expanduser() / filename
+    source = _local_staging_path(source_dir, filename)
     if not source.is_file():
         raise RuntimeError(f"source model file is missing: {source}")
     remote_dir = shlex.quote(str(Path(destination_dir).expanduser()))
@@ -817,7 +847,16 @@ def _local_file_sizes(model_dir: str | Path) -> dict[str, int]:
     root = Path(model_dir).expanduser()
     if not root.is_dir():
         return {}
-    return {path.name: path.stat().st_size for path in root.iterdir() if path.is_file()}
+    root = root.resolve()
+    sizes: dict[str, int] = {}
+    for path in root.rglob("*"):
+        try:
+            resolved = path.resolve()
+            if resolved.is_file() and resolved.is_relative_to(root):
+                sizes[path.relative_to(root).as_posix()] = resolved.stat().st_size
+        except OSError:
+            continue
+    return sizes
 
 
 def scp_copy(
@@ -832,13 +871,13 @@ def scp_copy(
 ) -> None:
     """Copy one model file between any two enrolled cluster nodes."""
 
-    if Path(filename).name != filename:
+    if not safe_relative_filename(filename):
         raise ValueError(f"staging filename must be a basename: {filename!r}")
     source_local = is_local_host(source_host)
     destination_local = is_local_host(destination_host)
     if source_local and destination_local:
-        source = Path(source_dir).expanduser() / filename
-        destination = Path(destination_dir).expanduser() / filename
+        source = _local_staging_path(source_dir, filename)
+        destination = _local_staging_path(destination_dir, filename)
         if source.resolve() != destination.resolve():
             raise RuntimeError("local-to-local cluster staging is not supported")
         if not source.is_file():
@@ -884,7 +923,9 @@ def scp_copy(
                 timeout=timeout,
             )
             if result.returncode == 0:
-                os.replace(temporary, destination / filename)
+                final = _local_staging_path(destination, filename)
+                final.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary, final)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -986,7 +1027,7 @@ def stage_files_from_source(
     # The caller supplies only this rank's required shards plus common
     # sidecars. Validate that contract here before any disk or network action.
     if any(
-        Path(name).name != name
+        not safe_relative_filename(name)
         or not isinstance(size, int)
         or isinstance(size, bool)
         or size < 0
@@ -1141,8 +1182,15 @@ _REMOTE_FILE_SIZES_SNIPPET = (
     "import json,sys;"
     "from pathlib import Path;"
     "p=Path(sys.argv[1]).expanduser();"
-    "files=p.iterdir() if p.is_dir() else ();"
-    "print(json.dumps({f.name:f.stat().st_size for f in files if f.is_file()}))"
+    "out={}\n"
+    "if p.is_dir():\n"
+    " p=p.resolve()\n"
+    " for f in p.rglob('*'):\n"
+    "  try:\n"
+    "   r=f.resolve()\n"
+    "   if r.is_file() and r.is_relative_to(p): out[f.relative_to(p).as_posix()]=r.stat().st_size\n"
+    "  except OSError: pass\n"
+    "print(json.dumps(out))"
 )
 
 
@@ -1255,9 +1303,8 @@ def stage_remote_files(
     source = Path(model_path).expanduser()
     destination_dir = destination_dir or str(source)
     expected = {
-        path.name: path.stat().st_size
-        for path in source.iterdir()
-        if path.is_file() and (path.name in plan.required or path.name in sidecars)
+        name: _local_staging_path(source, name).stat().st_size
+        for name in set(plan.required) | set(sidecars)
     }
     present = present_reader(destination_host, destination_dir)
     missing = tuple(

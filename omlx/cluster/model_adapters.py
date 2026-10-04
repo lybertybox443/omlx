@@ -92,6 +92,10 @@ class PipelineModelAdapter:
         """Architecture-specific external head geometry; called without MLX."""
         raise ValueError(f"{self.model_type} has no external MTP head contract")
 
+    def supplemental_files(self, model_path: str) -> tuple[str, ...]:
+        """Extra relative files to stage beside root sidecars; pure CPU."""
+        return ()
+
     # -- deployment -------------------------------------------------------
 
     def runtime_options(
