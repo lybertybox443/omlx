@@ -355,3 +355,171 @@ def test_glm5_alias_inspect_before_mutation():
     model = _Model([copy.deepcopy(ref)])
     meta = apply_expert_strategy(model, _group(3, 0), mx_module=_FakeMx())
     assert meta.has_moe
+
+
+# ---------------------------------------------------------------------------
+# Native Laguna LagunaSparseMoeBlock EP tests
+# ---------------------------------------------------------------------------
+
+def _laguna_sparse_block():
+    """Return a pristine LagunaSparseMoeBlock from _s21_shaped_config."""
+    from omlx.patches.laguna.laguna_model import LagunaSparseMoeBlock, ModelArgs
+    from tests.test_laguna_patch import _s21_shaped_config
+    args = ModelArgs(**_s21_shaped_config())
+    return LagunaSparseMoeBlock(args), args
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("n", [3, 6])
+@pytest.mark.parametrize("T", [1, 2])
+def test_laguna_ep_sum_matches_reference(n, T, quantized):
+    """Sum of per-rank EP outputs (no residual) equals native reference."""
+    from mlx_lm.models.switch_layers import SwitchGLU
+    from omlx.cluster.expert_strategies import LocalExperts
+
+    ref, args = _laguna_sparse_block()
+    if quantized:
+        nn.quantize(
+            ref.switch_mlp,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda p, m: hasattr(m, "to_quantized"),
+        )
+    mx.eval(ref.parameters())
+
+    mx.random.seed(0)
+    x = mx.random.normal((1, T, args.hidden_size))
+    expected = ref(x)  # no residual
+    mx.eval(expected)
+
+    total = None
+    for r in range(n):
+        blk = copy.deepcopy(ref)
+        # Reset _fusion_ready so each clone starts pristine (not cached from ref call)
+        blk._fusion_ready = None
+        layer = _Layer(blk)
+        apply_expert_strategy(_Model([blk]), _group(n, r), mx_module=_FakeMx())
+        # After EP, layer.mlp is ShardedMoELaguna wrapping the block.
+        # Call without residual: wrapper returns all_sum(inner(x)) which with
+        # fake identity all_sum is just inner(x). Summing over ranks gives correct EP.
+        y = layer.mlp(x)
+        total = y if total is None else total + y
+
+    mx.eval(total)
+    assert mx.allclose(total, expected, atol=1e-4, rtol=1e-4).item(), (
+        f"Laguna EP sum mismatch n={n} T={T} quantized={quantized} "
+        f"maxerr={mx.abs(total - expected).max().item():.4f}"
+    )
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("residual_style", ["keyword", "positional"])
+@pytest.mark.parametrize("n,T", [(3, 1), (3, 2), (6, 1), (6, 2)])
+def test_laguna_ep_residual_added_once(n, T, residual_style, quantized):
+    """Residual must be forwarded to all_sum and added exactly once, not once per rank."""
+    ref, args = _laguna_sparse_block()
+    if quantized:
+        nn.quantize(
+            ref.switch_mlp,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda p, m: hasattr(m, "to_quantized"),
+        )
+    mx.eval(ref.parameters())
+
+    mx.random.seed(1)
+    x = mx.random.normal((1, T, args.hidden_size))
+    residual = mx.random.normal((1, T, args.hidden_size))
+
+    # Pass (x, residual) to native ref; used as ground truth for each rank.
+    if residual_style == "keyword":
+        expected_with_res = ref(x, residual=residual)
+    else:
+        expected_with_res = ref(x, residual)
+    mx.eval(expected_with_res)
+
+    # --- Phase 1: collect per-rank local outputs (identity all_sum, no residual) ---
+    local_outputs = {}
+    collective_total = None
+    for r in range(n):
+        blk = copy.deepcopy(ref)
+        blk._fusion_ready = None
+        m = _Model([blk])
+        apply_expert_strategy(m, _group(n, r), mx_module=_FakeMx())
+        y = m.layers[0].mlp(x)
+        mx.eval(y)
+        local_outputs[r] = y
+        collective_total = y if collective_total is None else collective_total + y
+    mx.eval(collective_total)
+
+    # --- Phase 2: fake all_sum asserts input == local output, returns collective total ---
+    for r in range(n):
+
+        class _AssertSumMx(_FakeMx):
+            _rank = r
+            _expected_input = local_outputs[r]
+            _total = collective_total
+
+            class distributed:
+                @staticmethod
+                def all_sum(val, *a, **k):
+                    assert mx.allclose(val, _AssertSumMx._expected_input, atol=1e-6, rtol=0).item(), (
+                        f"all_sum input mismatch at rank {_AssertSumMx._rank}"
+                    )
+                    return _AssertSumMx._total
+
+        blk = copy.deepcopy(ref)
+        blk._fusion_ready = None
+        m = _Model([blk])
+        apply_expert_strategy(m, _group(n, r), mx_module=_AssertSumMx())
+        if residual_style == "keyword":
+            result = m.layers[0].mlp(x, residual=residual)
+        else:
+            result = m.layers[0].mlp(x, residual)
+        mx.eval(result)
+        assert mx.allclose(result, expected_with_res, atol=1e-4, rtol=1e-4).item(), (
+            f"Laguna residual added wrong: n={n} T={T} r={r} quantized={quantized} "
+            f"style={residual_style} maxerr={mx.abs(result - expected_with_res).max().item():.4f}"
+        )
+
+
+@pytest.mark.parametrize("n", [3, 6])
+def test_laguna_ep_fusion_disabled_after_slicing(n):
+    """After EP, _fusion_ready must be False on the Laguna block (not None)."""
+    ref, args = _laguna_sparse_block()
+    mx.eval(ref.parameters())
+
+    blk = copy.deepcopy(ref)
+    blk._fusion_ready = None  # pristine
+    m = _Model([blk])
+    apply_expert_strategy(m, _group(n, 0), mx_module=_FakeMx())
+    # blk._fusion_ready must be False (disabled), not None (unchecked)
+    assert blk._fusion_ready is False, (
+        f"Expected _fusion_ready=False after EP slicing, got {blk._fusion_ready!r}"
+    )
+
+
+@pytest.mark.parametrize("n", [3, 6])
+def test_laguna_ep_empty_rank_no_crash(n):
+    """Empty-expert ranks (E < N) must not crash and contribute zero to the sum."""
+    ref, args = _laguna_sparse_block()
+    mx.eval(ref.parameters())
+
+    mx.random.seed(2)
+    x = mx.random.normal((1, 1, args.hidden_size))
+    expected = ref(x)
+    mx.eval(expected)
+
+    total = None
+    for r in range(n):
+        blk = copy.deepcopy(ref)
+        blk._fusion_ready = None
+        m = _Model([blk])
+        apply_expert_strategy(m, _group(n, r), mx_module=_FakeMx())
+        y = m.layers[0].mlp(x)
+        total = y if total is None else total + y
+
+    mx.eval(total)
+    assert mx.allclose(total, expected, atol=1e-4, rtol=1e-4).item(), (
+        f"Laguna EP empty rank mismatch n={n} maxerr={mx.abs(total - expected).max().item():.4f}"
+    )

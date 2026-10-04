@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import mlx.nn as nn
 
-from .tensor_strategies import _common_layer_owner, _wrap_sharded_moe
+from .tensor_strategies import _common_layer_owner, _wrap_sharded_moe, _wrap_sharded_moe_laguna
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 _ARRAYS = ("weight", "scales", "biases", "bias")
@@ -244,6 +244,23 @@ def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
                 mlp.shared_experts = _ZeroShared()
             elif _se_sing is not None:
                 mlp.shared_expert = _ZeroShared()
-        layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
+        # Laguna-native: disable per-instance gate/up fusion after expert slicing
+        # (switch_mlp is now LocalExperts, so _prepare_fused_gate_up would crash).
+        # Also use a residual-aware wrapper so the decoder residual is added only
+        # once across EP ranks (after all_sum), not once per rank.
+        if _is_laguna_sparse_block(mlp):
+            mlp._fusion_ready = False
+            layer.mlp = _wrap_sharded_moe_laguna(layer.mlp, group, mx_module)
+        else:
+            layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
         shared_owner = rank == 0
     return {"experts": experts, "lo": lo, "hi": hi, "shared_owner": shared_owner}
+
+
+def _is_laguna_sparse_block(mlp) -> bool:
+    """True iff mlp is a native LagunaSparseMoeBlock instance."""
+    try:
+        from omlx.patches.laguna.laguna_model import LagunaSparseMoeBlock
+        return isinstance(mlp, LagunaSparseMoeBlock)
+    except Exception:
+        return False
