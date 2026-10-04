@@ -21,6 +21,8 @@ from mlx_lm.models import base as mlx_lm_base
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.pipeline import PipelineMixin
+from omlx.cluster.pipeline_compat import planned_layer_range
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import (
     QuantizedSwitchLinear,
@@ -705,16 +707,20 @@ class DecoderLayer(nn.Module):
         return h + self.mlp(mlp_input)
 
 
-class LagunaModel(nn.Module):
+class LagunaModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        owned = planned_layer_range(args.num_hidden_layers)
+        start, end = owned or (0, args.num_hidden_layers)
         self.layers = [
-            DecoderLayer(args, layer_idx) for layer_idx in range(args.num_hidden_layers)
+            DecoderLayer(args, i) if start <= i < end else None
+            for i in range(args.num_hidden_layers)
         ]
+        self.pipeline_group = None
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         layer_types = args.layer_types
         if layer_types is None:
@@ -728,33 +734,40 @@ class LagunaModel(nn.Module):
             else None
         )
 
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split)
+        self.pipeline_group = group
+
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
         input_embeddings: mx.array | None = None,
     ) -> mx.array:
-        if input_embeddings is not None:
-            h = input_embeddings
-        else:
-            h = self.embed_tokens(inputs)
-
+        h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
+        layers = self.pipeline_layers
         if cache is None:
-            cache = [None] * len(self.layers)
-
-        full_mask = create_attention_mask(h, cache[self.fa_idx])
-        if self.swa_idx is not None:
-            sliding_mask = create_attention_mask(
-                h, cache[self.swa_idx], window_size=self.args.sliding_window
-            )
-
-        for layer, c in zip(self.layers, cache):
-            mask = (
-                sliding_mask
-                if layer.attention_type == "sliding_attention"
-                else full_mask
-            )
+            cache = [None] * len(layers)
+        if len(cache) != len(layers):
+            raise ValueError("Laguna stage cache does not match its local layers")
+        if self.pipeline_rank < self.pipeline_size - 1:
+            h = mx.distributed.recv_like(h, self.pipeline_rank + 1, group=self.pipeline_group)
+        full = next((c for layer, c in zip(layers, cache)
+                     if layer.attention_type == "full_attention"), None)
+        sliding = next((c for layer, c in zip(layers, cache)
+                        if layer.attention_type == "sliding_attention"), None)
+        full_mask = create_attention_mask(h, full)
+        sliding_mask = (create_attention_mask(h, sliding, window_size=self.args.sliding_window)
+                        if any(layer.attention_type == "sliding_attention" for layer in layers) else None)
+        for layer, c in zip(layers, cache):
+            mask = sliding_mask if layer.attention_type == "sliding_attention" else full_mask
             h = layer(h, mask, c)
+        if self.pipeline_rank != 0:
+            h = mx.distributed.send(h, self.pipeline_rank - 1, group=self.pipeline_group)
+            if cache and cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+        if self.pipeline_size > 1:
+            h = mx.distributed.all_gather(h, group=self.pipeline_group)[:h.shape[0]]
         return self.norm(h)
 
 
@@ -785,7 +798,7 @@ class Model(nn.Module):
             raise ValueError("Laguna caches require normalized layer types.")
 
         caches: list[KVCache | RotatingKVCache] = []
-        for attention_type in layer_types:
+        for attention_type in layer_types[self.model.start_idx:self.model.end_idx]:
             if attention_type == "sliding_attention" and self.args.sliding_window:
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
             else:
@@ -796,6 +809,10 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         weights = self._strip_language_model_prefix(weights)
+        owned = planned_layer_range(self.args.num_hidden_layers)
+        if owned is not None:
+            from .adapter import ADAPTER
+            weights = ADAPTER.filter_stage_weights(weights, self.args.num_hidden_layers)
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
@@ -992,4 +1009,9 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
+
+    @property
+    def _omlx_adapter(self):
+        from .adapter import ADAPTER
+        return ADAPTER

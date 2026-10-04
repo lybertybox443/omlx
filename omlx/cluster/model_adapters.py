@@ -32,6 +32,7 @@ _ADAPTER_MODULES: dict[str, str] = {
     "qwen4_exp": "omlx.patches.qwen4_exp_mlx_lm.adapter",
     "glm5_next": "omlx.patches.glm5_next_mlx_lm.adapter",
     "mimo_v2": "omlx.patches.mimo_v2.adapter",
+    "laguna": "omlx.patches.laguna.adapter",
     "mimo_v2_flash": "omlx.patches.mimo_v2.adapter",
     "glm5_next_text": "omlx.patches.glm5_next_mlx_lm.adapter",
 }
