@@ -101,7 +101,16 @@ def _inspect(mlp, *, _switch_attr=None):
                 "unsupported MoE layout: ambiguous — both shared_expert and shared_experts are set"
             )
         if _se_sing is None and _se_plur is None:
-            raise ValueError("unsupported MoE layout: missing shared_expert")
+            # Allow the exact registered MiMo class: switch_mlp present, gate present,
+            # no shared_expert by design (all experts are routed, none shared).
+            _cls = type(mlp)
+            _is_mimo_moe = (
+                _cls.__qualname__ == "MoE"
+                and getattr(_cls, "__module__", "") == "mlx_lm.models.mimo_v2"
+                and getattr(mlp, "gate", None) is not None
+            )
+            if not _is_mimo_moe:
+                raise ValueError("unsupported MoE layout: missing shared_expert")
     experts = projs[0].weight.shape[0]
     if experts < 1:
         raise ValueError("unsupported MoE layout: zero experts")
@@ -237,13 +246,15 @@ def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
     else:
         # Qwen/GLM: shared expert on rank 0 only.
         # Support both 'shared_expert' (Qwen) and 'shared_experts' (GLM plural).
+        # MiMo (mlx_lm.models.mimo_v2.MoE): no shared_expert at all; ranks have no shared owner.
         _se_sing = getattr(mlp, "shared_expert", None)
         _se_plur = getattr(mlp, "shared_experts", None)
+        has_shared = _se_sing is not None or _se_plur is not None
         if rank != 0:
             if _se_plur is not None:
                 mlp.shared_experts = _ZeroShared()
             elif _se_sing is not None:
                 mlp.shared_expert = _ZeroShared()
         layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
-        shared_owner = rank == 0
+        shared_owner = rank == 0 if has_shared else False
     return {"experts": experts, "lo": lo, "hi": hi, "shared_owner": shared_owner}

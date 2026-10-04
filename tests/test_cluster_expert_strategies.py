@@ -12,6 +12,7 @@ from omlx.cluster.expert_strategies import (
     expert_range,
 )
 from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+from tests.test_mimo_v2_patch import _minimal_config as _mimo_minimal_config
 
 try:
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -355,3 +356,72 @@ def test_glm5_alias_inspect_before_mutation():
     model = _Model([copy.deepcopy(ref)])
     meta = apply_expert_strategy(model, _group(3, 0), mx_module=_FakeMx())
     assert meta.has_moe
+
+
+# ---------------------------------------------------------------------------
+# MiMo V2 native MoE (registered via apply_mimo_v2_patch)
+# ---------------------------------------------------------------------------
+
+def _mimo_moe(n_routed_experts=8, num_experts_per_tok=2):
+    from omlx.patches.mimo_v2 import apply_mimo_v2_patch
+    apply_mimo_v2_patch()
+    import mlx_lm.models.mimo_v2 as m
+    cfg = m.ModelArgs.from_dict(
+        _mimo_minimal_config(
+            n_routed_experts=n_routed_experts,
+            num_experts_per_tok=num_experts_per_tok,
+        )
+    )
+    moe = m.MoE(cfg)
+    mx.random.seed(42)
+    moe.gate.weight = mx.random.normal(moe.gate.weight.shape) * 0.1
+    moe.gate.e_score_correction_bias = mx.zeros_like(moe.gate.e_score_correction_bias)
+    mx.eval(moe.parameters())
+    return moe, cfg
+
+
+@pytest.mark.parametrize(
+    "ep,top_k",
+    [(2, 2), (4, 8)],
+    ids=["EP2_topk2", "EP4_topk8"],
+)
+def test_mimo_moe_ep_matches_reference(ep, top_k):
+    moe, cfg = _mimo_moe(n_routed_experts=8, num_experts_per_tok=top_k)
+    x = mx.random.normal((1, 3, cfg.hidden_size))
+    mx.eval(x)
+    expected = moe(x)
+    mx.eval(expected)
+
+    total = None
+    for r in range(ep):
+        rank_moe = copy.deepcopy(moe)
+        rank_model = _Model([rank_moe])
+        apply_expert_strategy(rank_model, _group(ep, r), mx_module=_FakeMx())
+        y = rank_model.layers[0].mlp(x)
+        total = y if total is None else total + y
+
+    mx.eval(total)
+    assert mx.allclose(
+        total.astype(mx.float32), expected.astype(mx.float32), atol=1e-4, rtol=1e-4
+    ).item()
+
+
+def test_unknown_no_shared_moe_raises_unsupported():
+    """A custom switch_mlp MoE without shared_expert and not the MiMo class raises."""
+
+    class _FakeMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.switch_mlp = nn.Linear(4, 4)
+            self.switch_mlp.gate_proj = nn.Linear(4, 4)
+            self.switch_mlp.up_proj = nn.Linear(4, 4)
+            self.switch_mlp.down_proj = nn.Linear(4, 4)
+            # weight must be 2-D with expert axis so shape[0] > 0
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                getattr(self.switch_mlp, proj).weight = mx.ones((2, 4))
+            # no shared_expert, not registered as mimo_v2.MoE
+
+    fake = _FakeMoE()
+    model = _Model([fake])
+    with pytest.raises(ValueError, match="unsupported MoE layout"):
+        apply_expert_strategy(model, _group(2, 0), mx_module=_FakeMx())
