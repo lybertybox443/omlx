@@ -158,6 +158,59 @@ def test_kv_updates_relay_shadow():
         assert not any("update_and_fetch" in vars(c) for c in sc)
 
 
+def test_pp3_independent_mirror_caches():
+    mx.random.seed(0)
+    config = make_config(4)
+    lm = LanguageModel(config)
+    ref = Gemma4TextModel(config)
+    mx.eval(ref.parameters())
+    stages = _stages(config, ref, [0, 2, 5, 6])
+    assert [s.cache_dependencies for s in stages] == [[0, 1], [2, 3], [3]]
+    caches = [s.make_cache() for s in stages]
+    rc = lm.make_cache()
+    for c, s in zip(caches, stages):
+        assert len(c) == 4
+        deps = s.cache_dependencies
+        assert [i for i, x in enumerate(c) if x is not None] == deps
+        for i in deps:
+            assert type(c[i]) is type(rc[i])
+    assert all(stages[2].layers[i] is None for i in range(5))
+    for n in [11] + [1] * 12 + [3]:
+        ids = mx.random.randint(0, 64, (1, n))
+        rs, rk, ss, sk = [], {}, [], {}
+        want = ref(
+            ids, cache=rc, capture_layer_ids=[1, 4], hidden_sink=rs,
+            shared_kv_sink=rk,
+        )
+        frame = stages[0].prepare_frame(
+            ids, cache=caches[0], capture_layer_ids=[1, 4], hidden_sink=ss,
+            shared_kv_sink=sk,
+        )
+        for i, st in enumerate(stages):
+            if i:
+                before = {j: frame.intermediates[j][1] for j in st.cache_dependencies}
+                st.ingest_kv_updates(frame, caches[i])
+                for j, off in before.items():
+                    assert frame.intermediates[j][1] == off
+            frame = st.forward_frame(frame, caches[i])
+        for idx, (k, v) in frame.kv_updates.items():
+            assert k.shape[2] == n and v.shape[2] == n
+        _close(frame.hidden, want)
+        assert len(ss) == len(rs)
+        for a, b in zip(ss, rs):
+            _close(a, b)
+        assert rk.keys() == sk.keys()
+        for t in rk:
+            for a, b in zip(rk[t], sk[t]):
+                _close(a, b)
+        assert caches[2][3].offset == caches[1][3].offset == rc[3].offset
+    missing = stages[0].prepare_frame(mx.zeros((1, 2), dtype=mx.int32))
+    with pytest.raises(ValueError):
+        stages[2].ingest_kv_updates(missing, caches[2])
+    with pytest.raises(ValueError):
+        stages[2].ingest_kv_updates(missing, [None] * 4)
+
+
 def test_call_layer_cleanup_on_failure():
     cache = lm_cache = LanguageModel(make_config(0)).make_cache()[0]
     sink = {}

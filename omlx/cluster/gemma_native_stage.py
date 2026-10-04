@@ -1,4 +1,9 @@
-"""Owned-layers-only Gemma4 native stage (constructor only)."""
+"""Owned-layers-only Gemma4 native stage foundation.
+
+Provides frame preparation, per-stage forward, native cache dependencies
+(make_cache) and remote-producer KV mirror ingestion. No serialization or
+network transport.
+"""
 
 import types
 from dataclasses import dataclass, field
@@ -9,6 +14,8 @@ import mlx.nn as nn
 from mlx_vlm.models.gemma4.language import (
     DecoderLayer,
     Gemma4TextModel,
+    KVCache,
+    RotatingKVCache,
     RMSNorm,
     RMSNormZeroShift,
 )
@@ -216,7 +223,51 @@ class GemmaNativeStage(nn.Module):
             else:
                 del cache.update_and_fetch
 
-    def forward_frame(self,frame: GemmaStageFrame, cache=None) -> GemmaStageFrame:
+    @property
+    def cache_dependencies(self):
+        """Sorted producer layer indices this stage reads or writes."""
+        deps = {i for i in range(self.start, self.end) if i < self.first_kv_shared_layer_idx}
+        deps.update(
+            self.previous_kvs[i]
+            for i in range(self.start, self.end)
+            if i >= self.first_kv_shared_layer_idx
+        )
+        return sorted(deps)
+
+    def make_cache(self):
+        """Producer-length native cache list; None outside dependencies.
+
+        Dependencies outside the owned range are deliberate remote-producer
+        mirrors, not model copies.
+        """
+        deps = set(self.cache_dependencies)
+        return [
+            (
+                KVCache()
+                if self.config.layer_types[i] == "full_attention"
+                else RotatingKVCache(max_size=self.config.sliding_window, keep=0)
+            )
+            if i in deps
+            else None
+            for i in range(self.first_kv_shared_layer_idx)
+        ]
+
+    def ingest_kv_updates(self, frame: GemmaStageFrame, cache) -> GemmaStageFrame:
+        """Feed remote producer deltas to native mirrors; keep source offsets."""
+        for idx in self.cache_dependencies:
+            if self.start <= idx < self.end:
+                continue
+            if idx >= len(cache) or cache[idx] is None:
+                raise ValueError(f"missing mirror cache for remote producer {idx}")
+            if idx not in frame.kv_updates:
+                raise ValueError(f"missing kv update for remote producer {idx}")
+            k, v = frame.kv_updates[idx]
+            fk, fv = cache[idx].update_and_fetch(k, v)
+            _, offset = frame.intermediates[idx]
+            frame.intermediates[idx] = ((fk, fv), offset)
+        return frame
+
+    def forward_frame(self, frame: GemmaStageFrame, cache=None) -> GemmaStageFrame:
         n = self.num_hidden_layers
         if frame.next_layer != self.start:
             raise ValueError(
