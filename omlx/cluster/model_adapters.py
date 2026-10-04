@@ -36,6 +36,8 @@ _ADAPTER_MODULES: dict[str, str] = {
     "muse_glimmer": "omlx.patches.muse_glimmer_mlx_lm.adapter",
     "mimo_v2_flash": "omlx.patches.mimo_v2.adapter",
     "glm5_next_text": "omlx.patches.glm5_next_mlx_lm.adapter",
+    "gemma4": "omlx.patches.gemma4_pipeline.adapter",
+    "gemma4_text": "omlx.patches.gemma4_pipeline.adapter",
 }
 
 

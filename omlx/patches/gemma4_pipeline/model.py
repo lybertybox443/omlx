@@ -73,8 +73,13 @@ _MTP_RE = re.compile(r"^mtp\.")
 # Model
 # ---------------------------------------------------------------------------
 
+from omlx.patches.gemma4_pipeline.adapter import ADAPTER as _OMLX_ADAPTER  # noqa: E402
+
+
 class Model(nn.Module):
     """Pipeline-capable Gemma 4 VLM model (no VisionTower)."""
+
+    _omlx_adapter = _OMLX_ADAPTER
 
     def __init__(self, config: Any):
         super().__init__()
