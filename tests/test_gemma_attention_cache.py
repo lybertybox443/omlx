@@ -1,7 +1,8 @@
 """Check the planner contract using native Gemma configuration names."""
 import json
 import pytest
-from omlx.cluster.gemma_attention_cache import gemma_attention_cache_budget
+from types import SimpleNamespace
+from omlx.cluster.gemma_attention_cache import gemma_attention_cache_budget, gemma_kv_widths
 
 
 @pytest.fixture
@@ -10,7 +11,7 @@ def config():
                 layer_types=["sliding_attention", "full_attention"] * 3,
                 num_key_value_heads=2, num_global_key_value_heads=3,
                 head_dim=8, global_head_dim=16, sliding_window=8,
-                sliding_window_pattern=2)
+                sliding_window_pattern=2, attention_k_eq_v=True)
 
 
 def budget(tmp_path, config, options=None):

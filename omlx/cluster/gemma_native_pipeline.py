@@ -85,12 +85,9 @@ class GemmaPipelineTextModel(PipelineMixin, GemmaNativeStage):
         n, H = config.num_hidden_layers, config.hidden_size
         P = config.hidden_size_per_layer_input or 0
         cap_count = max(len(set(capture_ids or [])), 1 if hidden_sink is not None else 0)
-        kv_size = 0
-        for idx in self._last_producers.values():
-            full = config.layer_types[idx] == "full_attention"
-            dim = (getattr(config, "global_head_dim", None) or config.head_dim) if full else config.head_dim
-            nkv = (getattr(config, "num_global_key_value_heads", None) or config.num_key_value_heads) if full else config.num_key_value_heads
-            kv_size += 2 * nkv * dim
+        from omlx.cluster.gemma_attention_cache import gemma_kv_widths
+        widths = gemma_kv_widths(config)
+        kv_size = sum(widths[config.layer_types[idx]] // 4 for idx in self._last_producers.values())
         return 4 * B * T * (H * (1 + cap_count) + n * P + kv_size) + 8 * B * n
 
     # ------------------------------------------------------------------

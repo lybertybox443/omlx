@@ -22,18 +22,20 @@ class Gemma4Adapter(PipelineModelAdapter):
         return int(match.group(1)) if match else None
 
     def boundary_bytes_per_token(self, config):
+        from omlx.cluster.gemma_attention_cache import gemma_kv_widths
         text = config.get("text_config", config)
-        hidden, count = text.get("hidden_size"), text.get("num_hidden_layers")
+        hidden = text.get("hidden_size")
+        count = text.get("num_hidden_layers")
         ple = text.get("hidden_size_per_layer_input", 256)
-        heads = text.get("num_key_value_heads", 1)
-        global_heads = text.get("num_global_key_value_heads")
-        global_heads = heads if global_heads is None else global_heads
-        head_dim = text.get("head_dim", 256)
-        global_dim = text.get("global_head_dim", 512)
-        if (any(type(v) is not int or v <= 0 for v in (hidden, count, heads, global_heads, head_dim, global_dim))
+        if (type(hidden) is not int or hidden <= 0
+                or type(count) is not int or count <= 0
                 or type(ple) is not int or ple < 0):
             return None
-        return 4 * (2 * hidden + count * ple + 2 * (heads * head_dim + global_heads * global_dim)) + 8 * count
+        try:
+            widths = gemma_kv_widths(text)
+        except ValueError:
+            return None
+        return 4 * (2 * hidden + count * ple) + sum(widths.values()) + 8 * count
 
     def cache_budget(self, model_path, options):
         from omlx.cluster.gemma_attention_cache import gemma_attention_cache_budget

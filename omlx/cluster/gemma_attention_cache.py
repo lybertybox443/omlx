@@ -3,6 +3,48 @@ import json
 from pathlib import Path
 
 
+def gemma_kv_widths(config):
+    """Return {full_attention: bytes, sliding_attention: bytes} per token (K+V float32).
+
+    Bytes = 8 * effective_heads * dim.
+    Accepts dict, nested dict with text_config, or native config object via vars().
+    """
+    if not isinstance(config, dict):
+        config = vars(config)
+    config = config.get("text_config", config)
+
+    def pos_int(key, default):
+        v = config.get(key, default)
+        if type(v) is not int or v <= 0:
+            raise ValueError("gemma_kv_widths: " + key + " must be positive int")
+        return v
+
+    heads = pos_int("num_key_value_heads", 1)
+    global_heads = config.get("num_global_key_value_heads")
+    if global_heads is not None:
+        if type(global_heads) is not int or global_heads <= 0:
+            raise ValueError("gemma_kv_widths: num_global_key_value_heads must be positive int")
+
+    head_dim = pos_int("head_dim", 256)
+    raw_global_dim = config.get("global_head_dim", 512)
+    if raw_global_dim is not None and type(raw_global_dim) is not int:
+        raise ValueError("gemma_kv_widths: global_head_dim must be int or None")
+    global_dim = raw_global_dim if raw_global_dim else head_dim
+    if type(global_dim) is not int or global_dim <= 0:
+        raise ValueError("gemma_kv_widths: global_head_dim must be positive int")
+
+    k_eq_v = config.get("attention_k_eq_v", False)
+    if not isinstance(k_eq_v, bool):
+        raise ValueError("gemma_kv_widths: attention_k_eq_v must be bool")
+
+    full_heads = global_heads if (k_eq_v and global_heads is not None) else heads
+
+    return {
+        "full_attention": 8 * full_heads * global_dim,
+        "sliding_attention": 8 * heads * head_dim,
+    }
+
+
 def gemma_attention_cache_budget(model_path, options):
     config = json.loads((Path(model_path) / "config.json").read_text())
     config = config.get("text_config", config)
@@ -29,14 +71,9 @@ def gemma_attention_cache_budget(model_path, options):
     source_types = set(types[:producers])
     if not set(types[producers:]).issubset(source_types):
         raise ValueError("Gemma shared cache type has no producer")
-    heads = positive("num_key_value_heads", 1)
-    global_heads = config.get("num_global_key_value_heads")
-    if global_heads is None:
-        global_heads = heads
-    if type(global_heads) is not int or global_heads <= 0:
-        raise ValueError("Invalid Gemma global KV head count")
-    full = 8 * global_heads * positive("global_head_dim", 512)
-    sliding = 8 * heads * positive("head_dim", 256)
+    widths = gemma_kv_widths(config)
+    full = widths["full_attention"]
+    sliding = widths["sliding_attention"]
     fixed = sliding * (positive("sliding_window", 512) + 256)
     copies = 2 if options.get("dflash_enabled") or options.get("mtp_enabled") else 1
     return dict(

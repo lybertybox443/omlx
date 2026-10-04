@@ -16,7 +16,7 @@ def test_real_registry():
     assert adapter_for_type("gemma4") is ADAPTER
     assert adapter_for_type("gemma4_text") is ADAPTER
     assert ADAPTER.supports_pipeline({"text_config": config()})
-    assert ADAPTER.boundary_bytes_per_token({"text_config": config()}) == 528
+    assert ADAPTER.boundary_bytes_per_token({"text_config": config()}) == 592
 
 
 @pytest.mark.parametrize("name", ["layers.3.x", "model.layers.3.x", "language_model.model.layers.3.x", "model.language_model.model.layers.3.x"])
@@ -39,7 +39,7 @@ def test_invalid_pipeline_config(changes):
 def test_budget_delegation(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config()))
     actual = ADAPTER.cache_budget(tmp_path, {})
-    assert actual["layer_kv_bytes_per_token"] == (0, 64, 0, 64, 0, 0)
+    assert actual["layer_kv_bytes_per_token"] == (0, 128, 0, 128, 0, 0)
     assert actual["replicated_kv_fixed_bytes"] == 33792
     assert actual["kv_cache_step"] == 256
 

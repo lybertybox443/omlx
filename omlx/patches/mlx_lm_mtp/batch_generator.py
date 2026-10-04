@@ -378,6 +378,9 @@ def _model_has_mtp_module(model: Any) -> bool:
     ``mtp_forward`` call would AttributeError, so we gate eligibility on
     the actual module's presence.
     """
+    if (getattr(model, "_omlx_mtp_remote_head", False) is True
+            and getattr(model, "_omlx_mtp_coordinator", None) is not None):
+        return True
     inner = getattr(model, "language_model", model)
     get_head = getattr(inner, "get_mtp_module", None)
     if callable(get_head):

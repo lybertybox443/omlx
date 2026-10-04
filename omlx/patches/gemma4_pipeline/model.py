@@ -139,7 +139,15 @@ class Model(nn.Module):
         return self.language_model.model
 
     def make_cache(self):
-        return self.model.make_cache()
+        # MLX-LM requires a cache object at every producer slot; empty unowned
+        # native caches allocate no tensors and are excluded from execution.
+        return self.language_model.make_cache()
+
+    def _cache_view(self, caches):
+        if caches is None:
+            return None
+        dependencies = set(self.model.cache_dependencies)
+        return [cache if index in dependencies else None for index, cache in enumerate(caches)]
 
     # ------------------------------------------------------------------
     # Forward
@@ -147,7 +155,7 @@ class Model(nn.Module):
 
     def __call__(self, inputs: mx.array, cache=None, **kwargs):
         return_hidden = kwargs.get("return_hidden", False)
-        out = self.language_model(inputs, cache=cache, **kwargs)
+        out = self.language_model(inputs, cache=self._cache_view(cache), **kwargs)
         if return_hidden:
             return out
         if hasattr(out, "logits"):
@@ -166,6 +174,7 @@ class Model(nn.Module):
         return self.language_model.make_mtp_cache()
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        caches = self._cache_view(caches)
         value = self.language_model.rollback_speculative_cache(caches, gdn_states, accepted, block_size)
         from omlx.patches.gemma4_pipeline.native_mtp import refresh_after_rollback
         refresh_after_rollback(self, caches)
