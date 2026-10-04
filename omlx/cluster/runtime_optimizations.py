@@ -424,7 +424,12 @@ def install_runtime_optimizations(
         **kwargs: Any,
     ) -> Any:
         previous = getattr(local_state, "skip_final_gather", False)
-        local_state.skip_final_gather = True
+        # Speculative verification and head priming need the same hidden
+        # rows on every rank; ordinary logits-only steps stay owner-local.
+        local_state.skip_final_gather = (
+            getattr(local_state, "queue_prefill_sends", False)
+            or not kwargs.get("return_hidden", False)
+        )
         try:
             return original_pipeline_call(instance, *args, **kwargs)
         finally:

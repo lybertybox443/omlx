@@ -343,7 +343,17 @@ def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
                 setattr(clone, attr, list(value))
         return clone
 
-    return [clone_one(entry) for entry in cache]
+    cloned = copy.copy(cache)
+    cloned[:] = [clone_one(entry) for entry in cache]
+    # Retained snapshots preserve committed container history, even when
+    # speculative __copy__ marks the new container as a draft clone.
+    for attr, value in getattr(cache, "__dict__", {}).items():
+        if isinstance(value, mx.array):
+            value = value + 0
+        elif isinstance(value, list):
+            value = list(value)
+        setattr(cloned, attr, value)
+    return cloned
 
 
 def _flat_cache_entries(cache: List[Any]):

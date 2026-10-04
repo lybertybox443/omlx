@@ -562,14 +562,17 @@ class Model(nn.Module):
         return_hidden: bool = False,
         n_confirmed: int = 0,
     ):
-        del n_confirmed
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+        prime = (not return_hidden and n_confirmed == 0
+                 and input_embeddings is None
+                 and prompt_priming.capture_eligible(self, cache))
         result = self.model(
             inputs,
             cache,
             input_embeddings,
-            return_hidden=return_hidden,
+            return_hidden=return_hidden or prime,
         )
-        if return_hidden:
+        if return_hidden or prime:
             out, hidden = result
         else:
             out = result
@@ -577,6 +580,8 @@ class Model(nn.Module):
             logits = self.model.embed_tokens.as_linear(out)
         else:
             logits = self.lm_head(out)
+        if prime:
+            prompt_priming.maybe_capture(self, inputs, hidden, cache)
         if return_hidden:
             return logits, hidden
         return logits

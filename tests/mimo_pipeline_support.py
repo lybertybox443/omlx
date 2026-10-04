@@ -7,17 +7,20 @@ def tiny_config():
     return _minimal_config(vocab_size=64, moe_layer_freq=[0, 0, 0, 0])
 
 
-def write_checkpoint(path):
+def write_checkpoint(path, *, mtp=False):
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from omlx.patches.mimo_v2.adapter import ADAPTER
     from qwen4_pipeline_support import _write_tokenizer
-    ADAPTER.prepare_worker(path, {})
-    import mlx_lm.models.mimo_v2 as module
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     config = tiny_config()
     config.update(eos_token_id=[1], pad_token_id=0)
+    if mtp:
+        config["num_nextn_predict_layers"] = 3
+    (root / "config.json").write_text(json.dumps(config))
+    ADAPTER.prepare_worker(root, {"mtp_enabled": True, "mtp_depth": 3} if mtp else {})
+    import mlx_lm.models.mimo_v2 as module
     mx.random.seed(19)
     model = module.Model(module.ModelArgs.from_dict(config))
     mx.eval(model.parameters())
