@@ -11,25 +11,50 @@ from contextlib import contextmanager
 def has_images(request):
     return request.request_type == "chat" and any(
         isinstance(part, dict)
-        and part.get("type") in {"image_url", "input_image", "image"}
+        and part.get("type")
+        in {"image_url", "input_image", "image", "video", "video_url", "input_video"}
         for message in request.messages
         if isinstance(message.get("content"), list)
         for part in message["content"]
     )
 
 
-def prepare_request(processor, request, args, template_defaults):
-    """Run CPU image processing once on rank zero, before the existing broadcast."""
+_VIDEO_TYPES = {"video", "video_url", "input_video"}
+_PAYLOAD_KEYS = (
+    "input_ids",
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_values_videos",
+    "video_grid_thw",
+)
+
+
+def prepare_request(processor, request, args, template_defaults, *, model_path=None):
+    """Run CPU image/video processing once on rank zero, before the existing broadcast."""
+    import os
+
     import numpy as np
     from mlx_vlm.utils import prepare_inputs
+    from omlx.utils.video import (
+        _video_url,
+        attach_native_video_processor,
+        native_video_token_count,
+        probe_video,
+        write_video_data_uri,
+    )
 
     messages = copy.deepcopy(request.messages)
     images = []
+    video_uris = []
     for message in messages:
         if not isinstance(message.get("content"), list):
             continue
         for part in message["content"]:
-            if part.get("type") in {"image_url", "input_image", "image"}:
+            if part.get("type") in _VIDEO_TYPES:
+                video_uris.append(_video_url(part))
+                part.clear()
+                part["type"] = "video"
+            elif part.get("type") in {"image_url", "input_image", "image"}:
                 value = part.get("image_url", part.get("image", part.get("url")))
                 url = value.get("url") if isinstance(value, dict) else value
                 if not isinstance(url, str) or not url:
@@ -37,26 +62,53 @@ def prepare_request(processor, request, args, template_defaults):
                 images.append(url)
                 part.clear()
                 part["type"] = "image"
-    kwargs = dict(template_defaults)
-    kwargs.update(args.chat_template_kwargs or {})
-    kwargs.pop("tokenize", None)
-    kwargs.pop("add_generation_prompt", None)
-    prompt = processor.apply_chat_template(
-        messages,
-        tools=request.tools,
-        tokenize=False,
-        add_generation_prompt=True,
-        **kwargs,
-    )
-    values = prepare_inputs(processor, images=images, prompts=[prompt])
-    payload = {
-        key: np.asarray(values[key])
-        for key in ("input_ids", "pixel_values", "image_grid_thw")
-    }
+    if images and video_uris:
+        raise ValueError("mixing images and videos in one request is not supported")
+    paths = []
+    digests = []
+    try:
+        if video_uris:
+            if not attach_native_video_processor(processor, model_path):
+                raise ValueError("native video processor unavailable for this model")
+            for uri in video_uris:
+                path, video_digest = write_video_data_uri(uri)
+                paths.append(path)
+                digests.append(video_digest)
+                native_video_token_count(probe_video(path), processor.video_processor)
+        kwargs = dict(template_defaults)
+        kwargs.update(args.chat_template_kwargs or {})
+        kwargs.pop("tokenize", None)
+        kwargs.pop("add_generation_prompt", None)
+        prompt = processor.apply_chat_template(
+            messages,
+            tools=request.tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        )
+        values = prepare_inputs(
+            processor,
+            images=images or None,
+            videos=[str(p) for p in paths] or None,
+            prompts=[prompt],
+        )
+        payload = {
+            key: np.asarray(values[key])
+            for key in _PAYLOAD_KEYS
+            if values.get(key) is not None
+        }
+    finally:
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     digest = hashlib.sha256()
     for key, value in sorted(payload.items()):
         digest.update(repr((key, value.shape, value.dtype.str)).encode())
         digest.update(value.tobytes())
+    for video_digest in digests:
+        digest.update(str(video_digest).encode())
     payload["identity"] = digest.hexdigest()
     return payload
 
@@ -137,14 +189,25 @@ class VisionRequest:
 
         self.capture_identity = payload.get("identity")
         self.ids = mx.array(payload["input_ids"])
-        grid = mx.array(payload["image_grid_thw"])
+        grid = payload.get("image_grid_thw")
+        grid = None if grid is None else mx.array(grid)
+        vgrid = payload.get("video_grid_thw")
+        vgrid = None if vgrid is None else mx.array(vgrid)
+        if grid is None and vgrid is None:
+            raise ValueError("vision payload has no image or video grid")
         self.positions, self.deltas = model.language_model.get_rope_index(
-            self.ids, grid, None, None
+            self.ids, grid, vgrid, None
         )
         self.embeddings = None
         if model.model.pipeline_stage.is_first:
+            pixels = payload.get("pixel_values")
+            vpixels = payload.get("pixel_values_videos")
             features = model.get_input_embeddings(
-                self.ids, mx.array(payload["pixel_values"]), image_grid_thw=grid
+                self.ids,
+                None if pixels is None else mx.array(pixels),
+                image_grid_thw=grid,
+                video_grid_thw=vgrid,
+                pixel_values_videos=None if vpixels is None else mx.array(vpixels),
             )
             self.embeddings = features.inputs_embeds
             mx.eval(self.embeddings)
@@ -418,7 +481,8 @@ def install_vision_serving(model, provider, server):
                             trust_remote_code=provider.cli_args.trust_remote_code,
                         )
                     args._omlx_image = prepare_request(
-                        processor, body, args, provider.cli_args.chat_template_args
+                        processor, body, args, provider.cli_args.chat_template_args,
+                        model_path=provider.cli_args.model,
                     )
                 except Exception as exc:
                     # Broadcast the error too, so peers do not wait on a missing request.

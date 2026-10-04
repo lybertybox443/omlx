@@ -37,7 +37,7 @@ _PEER_SKIP_OPTIONS = ("mtp_peer_projection_skip", "mtp_peer_verify_projection_sk
 class Qwen4ExpAdapter(PipelineModelAdapter):
     model_type = "qwen4_exp"
     # Publish only modalities carried by the complete worker serving path.
-    media = ("text", "image")
+    media = ("text", "image", "video")
     optimizations = (
         "mtp_enabled",
         "specprefill_enabled",
