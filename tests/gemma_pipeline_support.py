@@ -5,7 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 
-def write_checkpoint(path):
+def write_checkpoint(path, *, text_config=None, quantized=False):
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from tests.qwen4_pipeline_support import _write_tokenizer
@@ -16,8 +16,9 @@ def write_checkpoint(path):
     from omlx.patches import mlx_vlm_mtp as vlm
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
-    config = asdict(make_config(4))
-    config.update(model_type="gemma4_text", eos_token_id=[1], pad_token_id=0, mtp_assistant_config=ASSISTANT)
+    config = asdict(make_config(4)) if text_config is None else dict(text_config)
+    config.update(model_type="gemma4_text", eos_token_id=[1], pad_token_id=0)
+    config.setdefault("mtp_assistant_config", ASSISTANT)
     (root / "config.json").write_text(json.dumps(config))
     previous = lm.is_mtp_active(), lm.get_mtp_depth(), lm.is_mtp_depth_fixed(), vlm.is_mtp_attach_enabled()
     try:
@@ -25,6 +26,10 @@ def write_checkpoint(path):
         module = importlib.import_module("mlx_lm.models.gemma4_text")
         mx.random.seed(9)
         model = module.Model(module.ModelArgs.from_dict(config))
+        if quantized:
+            from mlx_lm.utils import quantize_model
+            model, config = quantize_model(model, config, group_size=32, bits=4)
+            (root / "config.json").write_text(json.dumps(config))
         mx.eval(model.parameters())
         mx.save_safetensors(str(root / "model.safetensors"), dict(tree_flatten(model.parameters())))
     finally:

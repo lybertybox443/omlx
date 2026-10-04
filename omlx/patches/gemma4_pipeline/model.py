@@ -138,6 +138,10 @@ class Model(nn.Module):
     def model(self):
         return self.language_model.model
 
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
+
     def make_cache(self):
         # Native zero-slot containers support merge, split and evaluation
         # without allocating KV tensors for unowned producer positions.
@@ -216,6 +220,10 @@ class Model(nn.Module):
         # 2. Split MTP keys.
         mtp_keys = {k: v for k, v in normalized.items() if k.startswith("language_model.mtp.")}
         backbone = {k: v for k, v in normalized.items() if k not in mtp_keys}
+        from types import SimpleNamespace
+        from mlx_vlm.models.gemma4 import Model as NativeModel
+        native_context = SimpleNamespace(config=self.config, audio_tower=None)
+        backbone = NativeModel.sanitize(native_context, backbone)
 
         # 3. Ownership filter.
         n_layers = self.args.num_hidden_layers
@@ -268,18 +276,5 @@ class Model(nn.Module):
         if owned is None or owned[1] == n_layers:
             backbone.update(mtp_keys)
 
-        # 5. Strip "language_model." prefix for native sanitizer.
-        lm_prefix = "language_model."
-        lm_keys = {k[len(lm_prefix):]: v for k, v in backbone.items() if k.startswith(lm_prefix)}
-        other_keys = {k: v for k, v in backbone.items() if not k.startswith(lm_prefix)}
-
-        # 6. Delegate to native LanguageModel sanitizer.
-        if not hasattr(self.language_model, "sanitize"):
-            raise NotImplementedError(
-                "Native LanguageModel has no sanitize method; MoE checkpoint conversion unsupported."
-            )
-        lm_keys = self.language_model.sanitize(lm_keys)
-
-        result = {lm_prefix + k: v for k, v in lm_keys.items()}
-        result.update(other_keys)
-        return result
+        # Native shared-KV filtering expects full canonical language paths.
+        return self.language_model.sanitize(backbone)
