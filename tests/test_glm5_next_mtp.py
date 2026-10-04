@@ -450,9 +450,7 @@ def test_clamp_accept_ignores_recurrent_caches(applied, config):
 
 
 def test_chain_depth_stays_inside_the_pooling_undo_window(applied, config):
-    """PoolingCache stashes its undo log only for updates of 8 rows or fewer,
-    and a depth-k chain verifies k+1 rows.
-    """
+    """The maintained pooling window covers the admin maximum depth."""
     from omlx.patches import mlx_lm_mtp
 
     prev_depth, prev_active = mlx_lm_mtp.get_mtp_depth(), mlx_lm_mtp.is_mtp_active()
@@ -464,7 +462,7 @@ def test_chain_depth_stays_inside_the_pooling_undo_window(applied, config):
         mlx_lm_mtp.set_mtp_depth(prev_depth)
         mlx_lm_mtp.set_mtp_active(prev_active)
 
-    assert model._omlx_mtp_depth == 7
+    assert model._omlx_mtp_depth == 8
 
 
 def test_head_cache_is_committed_only(applied, config):
@@ -732,7 +730,7 @@ def make_host(dtype=mx.float32, *, mtp_layers=0):
 
 
 @pytest.mark.parametrize("size", [2, 4])
-@pytest.mark.parametrize("depth", [1, 3, 7])
+@pytest.mark.parametrize("depth", [1, 3, 7, 8])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
     mx.random.seed(349)

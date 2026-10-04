@@ -528,7 +528,7 @@ class BatchPoolingCache(_BaseCache):
         # tensor needs no snapshot: update_and_fetch only writes beyond the
         # old _pool_lengths.  trim() drops that speculative physical tail
         # after restoring the logical lengths.
-        if L <= 8:
+        if L <= POOLING_UNDO_MAX_TOKENS:
             try:
                 from omlx.patches.mlx_lm_mtp import cache_rollback
 

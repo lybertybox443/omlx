@@ -47,9 +47,11 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
-# A depth-k chain verifies k+1 rows and PoolingCache only stashes an undo
-# log for updates of 8 rows or fewer.
-_MAX_CHAIN_DEPTH = 7
+# A depth-k chain verifies k+1 rows; use the maintained pooling contract.
+from ..deepseek_v4.cache_extras import POOLING_UNDO_MAX_TOKENS
+_MAX_CHAIN_DEPTH = POOLING_UNDO_MAX_TOKENS - 1
+# Fused verify kernels independently implement up to eight rows.
+_FUSED_VERIFY_MAX_ROWS = 8
 
 # Source-side prefixes for the nextn MTP layer. glm5_next checkpoints use the
 # VLM-nested form; the other two are accepted so a text-only re-export or a
@@ -396,7 +398,7 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
         if (
             self.compile_ffn
             and x.shape[0] == 1
-            and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
+            and 1 <= x.shape[1] <= _FUSED_VERIFY_MAX_ROWS
         ):
             _check_verify_router(g5_lang, self, x)
             if self._ffn_c is None:
@@ -427,7 +429,7 @@ def _check_verify_router(g5_lang: Any, layer: Any, x: mx.array) -> None:
     """
     gate = getattr(getattr(layer, "mlp", None), "gate", None)
     width, dim = x.shape[1], x.shape[-1]
-    if gate is None or not g5_lang._DECODE_FUSION or not 2 <= width <= _MAX_CHAIN_DEPTH + 1:
+    if gate is None or not g5_lang._DECODE_FUSION or not 2 <= width <= _FUSED_VERIFY_MAX_ROWS:
         return
     key = (width, x.dtype, tuple(gate.weight.shape), gate.top_k)
     if key in _ROUTER_CHECKED:
@@ -500,7 +502,7 @@ def _patch_model_call(g5_lang: Any) -> None:
         # One-token steps and verify blocks (as dispatch-bound) start
         # evaluating every few layers (scheduling only, same values).
         eval_every = (
-            g5_lang._DECODE_EVAL_EVERY if h.shape[1] <= _MAX_CHAIN_DEPTH + 1 else 0
+            g5_lang._DECODE_EVAL_EVERY if h.shape[1] <= _FUSED_VERIFY_MAX_ROWS else 0
         )
         n_layers = len(self.layers)
         # One-token decode defers each layer's last HC expand into the next
@@ -574,10 +576,8 @@ def _patch_language_model(g5_lang: Any) -> None:
             self.mtp = [g5_lang.Glm5NextMTPBlock(args) for _ in range(n_mtp)]
         if self._omlx_mtp_decode_enabled:
             self._omlx_mtp_chain = True
-            # PoolingCache stashes its undo log only for updates of 8 rows or
-            # fewer, and a depth-k chain verifies k+1 rows, so at the admin
-            # setting's maximum of 8 the indexer pool holds no log at all and
-            # a full rejection cannot be undone. Cap the chain one below it.
+            # Keep the verify block inside the maintained undo window;
+            # the admin maximum depth is now covered without a stale cap.
             requested_depth = get_mtp_depth()
             self._omlx_mtp_depth = min(_MAX_CHAIN_DEPTH, requested_depth)
             self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()

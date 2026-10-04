@@ -21,7 +21,8 @@ def test_glm_pipeline_http_batch_stream(tmp_path, ranges):
 
 @pytest.mark.parametrize("ranges", [[(2, 4), (0, 2)], [(2, 4), (1, 2), (0, 1)]])
 @pytest.mark.parametrize("capture_cache", [False, True])
-def test_glm_dflash_http_batch_stream(tmp_path, ranges, capture_cache):
+@pytest.mark.parametrize("block_size", [3, 9])
+def test_glm_dflash_http_batch_stream(tmp_path, ranges, capture_cache, block_size):
     import json
     from dataclasses import asdict
     from types import SimpleNamespace
@@ -50,7 +51,7 @@ def test_glm_dflash_http_batch_stream(tmp_path, ranges, capture_cache):
                        dict(tree_flatten(draft.parameters())))
     options = runtime_settings(SimpleNamespace(
         dflash_enabled=True, dflash_draft_model=str(draft_path),
-        dflash_block_size=3, dflash_capture_cache=capture_cache))
+        dflash_block_size=block_size, dflash_capture_cache=capture_cache))
     reserve = DraftReservation.from_layout(inspect_safetensors_layout(draft_path),
         max_prompt_tokens=1024, workspace_bytes=1024**3)
     options.update(dflash_reserved_bytes=reserve.total_bytes,
