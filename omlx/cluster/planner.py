@@ -1200,7 +1200,7 @@ def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
 import re as _re
 
 _ROUTED_EXPERT_RE = _re.compile(
-    r"\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias)$"
+    r"\.(mlp\.switch_mlp|experts\.switch_glu)\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases|bias)$"
 )
 _SHARED_EXPERT_RE = _re.compile(r"\.mlp\.shared_expert\.[^.]+(\.[^.]+)*$")
 
@@ -1336,7 +1336,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 routed = _ROUTED_EXPERT_RE.search(name)
                 shared = _SHARED_EXPERT_RE.search(name)
                 if routed or shared:
-                    info = expert_info.setdefault(layer_index, [set(), 0, 0, set()])
+                    info = expert_info.setdefault(layer_index, [set(), 0, 0, set(), set()])
                     if routed:
                         shape = spec.get("shape")
                         count = shape[0] if isinstance(shape, list) and shape else None
@@ -1351,8 +1351,9 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                             )
                         info[0].add(count)
                         info[1] += tensor_bytes
-                        if routed.group(2) == "weight":
-                            info[3].add(routed.group(1))
+                        if routed.group(3) == "weight":
+                            info[3].add(routed.group(2))
+                        info[4].add(routed.group(1))
                     else:
                         info[2] += tensor_bytes
                 if classify_tp:
@@ -1404,11 +1405,13 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             routed_bytes.append(0)
             shared_bytes.append(0)
             continue
-        counts, routed_total, shared_total, projections = info
+        counts, routed_total, shared_total, projections, styles = info
+        requires_shared = "mlp.switch_mlp" in styles
         if (
             len(counts) != 1
             or len(projections) != 3
-            or shared_total <= 0
+            or len(styles) != 1
+            or (requires_shared and shared_total <= 0)
         ):
             raise PlanningError(
                 f"inconsistent expert metadata in layer {index}"
