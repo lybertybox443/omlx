@@ -263,6 +263,35 @@ def _wrap_sharded_moe(inner: Any, group: Any, mx: Any) -> Any:
     return ShardedMoE(inner)
 
 
+def _wrap_sharded_moe_laguna(inner: Any, group: Any, mx: Any) -> Any:
+    """Laguna-native EP wrapper: residual is applied once after all_sum.
+
+    LagunaSparseMoeBlock.__call__(x, residual=None) folds the decoder residual
+    add into its compiled combine kernel. Across EP ranks each rank would add
+    a full copy of ``residual`` to its partial output, making all_sum add it N
+    times. This wrapper strips ``residual`` before calling the inner block and
+    re-adds it once to the all_sum result.
+    """
+
+    import mlx.nn as nn
+    from mlx.nn.layers.distributed import sum_gradients
+
+    class ShardedMoELaguna(nn.Module):
+        def __init__(self, module: Any):
+            super().__init__()
+            self.inner = module
+
+        def __call__(self, value: Any, residual: Any = None) -> Any:
+            value = sum_gradients(group)(value)
+            output = self.inner(value)
+            output = mx.distributed.all_sum(output, group=group)
+            if residual is not None:
+                output = residual + output
+            return output
+
+    return ShardedMoELaguna(inner)
+
+
 def _uneven_group_ranges(total_groups: int, size: int) -> list[tuple[int, int]]:
     """Contiguous per-rank ``[lo, hi)`` group ranges covering ``total_groups``.
 
