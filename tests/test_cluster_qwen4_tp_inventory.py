@@ -9,6 +9,10 @@ SHARDED = {
     "linear_attn.in_proj_qkv.weight": 64,
     "linear_attn.conv1d.weight": 16,
     "mlp.switch_mlp.gate_proj.scales": 8,
+    "mlp.switch_mlp.gate_proj.weight": 8,
+    "mlp.switch_mlp.up_proj.weight": 8,
+    "mlp.switch_mlp.down_proj.weight": 8,
+    "mlp.shared_expert.gate_proj.weight": 8,
 }
 REPLICATED = {
     "ple.ple_embedding.ngram_embedding.shards.0.weight": 128,
@@ -66,7 +70,7 @@ def test_inventory_totals(tmp_path, prefix):
     layout = inspect_safetensors_layout(tmp_path)
     rep = sum(REPLICATED.values())
     shd = sum(SHARDED.values())
-    assert rep == 184 and shd == 88 and rep + shd == 272
+    assert rep == 184 and shd == 120 and rep + shd == 304
     assert sum(sizes.values()) == 2 * (rep + shd)
     assert tuple(_get(layout, "layer_tp_replicated_bytes")) == (rep, rep)
 
