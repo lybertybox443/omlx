@@ -38,6 +38,25 @@ def active_assignments() -> tuple[PipelineAssignment, ...] | None:
     return _ACTIVE_ASSIGNMENTS
 
 
+def planned_layer_range(total_layers: int, group: Any = None) -> tuple[int, int] | None:
+    """Approved construction range for any adapter-backed decoder."""
+    plan = active_assignments()
+    if plan is None:
+        return None
+    if group is None:
+        group = active_pipeline_group()
+    if group is None:
+        import mlx.core as mx
+        group = mx.distributed.init()
+    ranks = [item.rank for item in plan]
+    if sorted(ranks) != list(range(group.size())):
+        raise ValueError("runtime distributed group does not match the shard plan")
+    item = next(item for item in plan if item.rank == group.rank())
+    if not 0 <= item.start_layer < item.end_layer <= total_layers:
+        raise ValueError("planned layer range exceeds the model layer count")
+    return item.start_layer, item.end_layer
+
+
 @contextmanager
 def _record_active_assignments(
     assignments: Sequence[PipelineAssignment],

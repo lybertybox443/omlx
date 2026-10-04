@@ -411,12 +411,14 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         pattern = config.hybrid_layer_pattern
         moe_freq = config.moe_layer_freq
+        from omlx.cluster.pipeline_compat import planned_layer_range
+        owned = planned_layer_range(config.num_hidden_layers)
         self.layers = [
             DecoderLayer(
                 config,
                 is_moe=bool(moe_freq[idx]),
                 is_sliding_window=bool(pattern[idx]),
-            )
+            ) if owned is None or owned[0] <= idx < owned[1] else None
             for idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
@@ -596,6 +598,8 @@ class Model(nn.Module):
         return True
 
     def sanitize(self, weights):
+        from omlx.patches.mimo_v2.adapter import ADAPTER
+        weights = ADAPTER.filter_stage_weights(weights, self.args.num_hidden_layers)
         if hasattr(self.model, "mtp") and self.args.omlx_mtp_sidecar:
             weights = {**weights, **mx.load(self.args.omlx_mtp_sidecar)}
 

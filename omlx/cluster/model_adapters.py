@@ -31,6 +31,8 @@ from typing import Any
 _ADAPTER_MODULES: dict[str, str] = {
     "qwen4_exp": "omlx.patches.qwen4_exp_mlx_lm.adapter",
     "glm5_next": "omlx.patches.glm5_next_mlx_lm.adapter",
+    "mimo_v2": "omlx.patches.mimo_v2.adapter",
+    "mimo_v2_flash": "omlx.patches.mimo_v2.adapter",
     "glm5_next_text": "omlx.patches.glm5_next_mlx_lm.adapter",
 }
 
@@ -109,6 +111,16 @@ class PipelineModelAdapter:
         """Register the model with mlx-lm and pin its runtime before loading."""
 
         return False
+
+    def filter_stage_weights(self, weights: dict, total_layers: int) -> dict:
+        """Keep global parameter names while excluding other decoder stages."""
+        from .pipeline_compat import planned_layer_range
+        owned = planned_layer_range(total_layers)
+        if owned is None:
+            return weights
+        start, end = owned
+        return {key: value for key, value in weights.items()
+                if (index := self.trunk_layer_index(key)) is None or start <= index < end}
 
     def resident_layers(self, model: Any) -> set[int]:
         """Decoder layers whose parameters a loaded stage really holds."""
