@@ -460,10 +460,16 @@ def _patch_model_call(g5_lang: Any) -> None:
 
     create_attention_mask = g5_lang.create_attention_mask
     create_ssm_mask = g5_lang.create_ssm_mask
+    original_call = cls.__call__
 
     def __call__(self, inputs, cache=None, inputs_embeds=None,
                  return_raw_hidden: bool = False, gdn_sink=None,
-                 hidden_sink=None):
+                 hidden_sink=None, capture_layer_ids=None, capture_only=False):
+        if getattr(self, "pipeline_stage", None) is not None or capture_layer_ids is not None or capture_only:
+            return original_call(self, inputs, cache=cache, inputs_embeds=inputs_embeds,
+                                 return_raw_hidden=return_raw_hidden, gdn_sink=gdn_sink,
+                                 hidden_sink=hidden_sink, capture_layer_ids=capture_layer_ids,
+                                 capture_only=capture_only)
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
         if cache is None:
@@ -610,6 +616,8 @@ def _patch_language_model(g5_lang: Any) -> None:
         from mlx_vlm.models.base import LanguageModelOutput
 
         return_hidden = kwargs.pop("return_hidden", False)
+        capture_only = kwargs.pop("_omlx_capture_only", False)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         # Post-hoc rollback: the split-at-n_confirmed contract is not used on
         # this path (see _patch_linear_attention). Accept and discard, as the
         # Qwen VLM runtime does.
@@ -634,11 +642,12 @@ def _patch_language_model(g5_lang: Any) -> None:
         # batch_generator._call_backbone onto the mlx-vlm rollback path
         # (rollback_speculative_cache); without it the engine silently takes
         # the mlx-lm path and never rewinds the KDA recurrent state.
-        gdn_sink: list = []
+        gdn_sink = None if capture_only else []
         hidden_sink: list = []
         out = self.model(
             inputs, cache=cache, inputs_embeds=inputs_embeds,
             gdn_sink=gdn_sink, hidden_sink=hidden_sink,
+            capture_layer_ids=capture_layer_ids, capture_only=capture_only,
         )
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(out)

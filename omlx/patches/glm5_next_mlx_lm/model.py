@@ -30,6 +30,7 @@ class ModelArgs(ModelConfig):
 
 class Model(_Model):
     _omlx_adapter = ADAPTER
+    _omlx_dflash_prefill_capture_required = True
 
     @property
     def args(self):
@@ -52,10 +53,35 @@ class Model(_Model):
         return self.config.text_config.vocab_size
 
     def __call__(self, inputs, cache=None, mask=None, inputs_embeds=None, **kwargs):
-        if inputs_embeds is not None:
-            return self.language_model(inputs, cache=cache, mask=mask,
-                                       inputs_embeds=inputs_embeds, **kwargs).logits
-        return super().__call__(inputs, cache=cache, mask=mask, **kwargs).logits
+        capture = getattr(self, "_omlx_dflash_prefill_capture", None)
+        return_hidden = kwargs.get("return_hidden", False)
+        drafter = getattr(self.language_model, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        observe = bool(scope and not return_hidden and capture is None
+                       and inputs.shape[0] == len(scope) and inputs.shape[1] == 1)
+        if (capture is not None or observe) and not return_hidden:
+            kwargs["return_hidden"] = True
+            kwargs["_omlx_capture_only"] = capture is not None
+            kwargs["capture_layer_ids"] = list(drafter.target_layer_ids)
+        ids = kwargs.get("capture_layer_ids")
+        if ids is not None:
+            count = self.config.text_config.num_hidden_layers
+            if any(type(point) is not int or not 0 <= point < count for point in ids):
+                raise ValueError("GLM draft capture layer indices exceed the model")
+            # DFlash IDs index decoder outputs; the maintained GLM target
+            # numbers capture points from zero (embedding), hence +1.
+            kwargs["capture_layer_ids"] = [point + 1 for point in ids]
+        out = self.language_model(inputs, cache=cache, mask=mask,
+                                  inputs_embeds=inputs_embeds, **kwargs)
+        if capture is not None and not return_hidden:
+            capture(out.hidden_states[:-1], int(inputs.shape[1]))
+        elif observe:
+            drafter.observe(scope, out.hidden_states[:-1])
+        return out if return_hidden else out.logits
+
+    def rollback_speculative_cache(self, cache, gdn_states, accepted, block_size):
+        return self.language_model.rollback_speculative_cache(
+            cache, gdn_states, accepted, block_size)
 
     def sanitize(self, weights):
         owned = pipeline.planned_range(self.config.text_config.num_hidden_layers)

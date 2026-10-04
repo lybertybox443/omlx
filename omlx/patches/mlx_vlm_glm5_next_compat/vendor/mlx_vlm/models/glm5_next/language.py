@@ -1956,14 +1956,29 @@ class Glm5NextModel(nn.Module):
         from . import pipeline as stage_pipeline
         stage_pipeline.verify(self, group)
 
+    def boundary_capture_output(self):
+        from . import pipeline as stage_pipeline
+        return stage_pipeline.boundary_capture_output(self)
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        return_raw_hidden=False, hidden_sink=None, gdn_sink=None,
+        capture_layer_ids=None, capture_only=False,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
-
+        ids = list(capture_layer_ids or ())
+        total = self.config.num_hidden_layers
+        if any(type(point) is not int or point < 0 or point > total for point in ids):
+            raise ValueError("GLM capture layer IDs must be within the model")
+        stage = self.pipeline_stage
+        boundary = bool(stage is not None and hidden_sink is not None and gdn_sink is None
+                        and (capture_only or getattr(self, "_omlx_boundary_captures", False)))
+        local_captures = {}
+        if 0 in ids and (stage is None or stage.is_first):
+            local_captures[0] = h
         layers = self.pipeline_layers
         if cache is None:
             cache = [None] * len(layers)
@@ -1977,7 +1992,7 @@ class Glm5NextModel(nn.Module):
                     if self.ssm_idx is not None else None)
 
         from . import pipeline as stage_pipeline
-        received = stage_pipeline.receive(self, h)
+        received, upstream = stage_pipeline.receive_captured(self, h, ids, boundary)
         h = (mx.broadcast_to(
             h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
         ) if received is None else received)
@@ -2003,14 +2018,20 @@ class Glm5NextModel(nn.Module):
         n_layers = len(layers)
         # One token: each layer's last HC expand runs inside the next layer's
         # first HC pre (see _decode_hc_pre_deferred); the last one here.
-        defer = h.shape[:2] == (1, 1)
+        defer = gdn_sink is None and h.shape[:2] == (1, 1)
 
         for i, (layer, c) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            if defer:
+            if gdn_sink is not None:
+                h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
+            elif defer:
                 h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
             else:
                 h = layer(h, mask=mask, cache=c)
+            point = self.start_idx + i + 1
+            if point in ids:
+                value = h.materialize() if isinstance(h, _HCDeferred) else h
+                local_captures[point] = value.mean(axis=2)
             if pipeline is not None:
                 pipeline.push(h)
             elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
@@ -2018,7 +2039,9 @@ class Glm5NextModel(nn.Module):
         if pipeline is not None:
             pipeline.drain()
 
-        return stage_pipeline.finish(self, h, cache)
+        return stage_pipeline.finish(self, h, cache, ids=ids, local=local_captures,
+                                     upstream=upstream, hidden_sink=hidden_sink,
+                                     return_raw_hidden=return_raw_hidden, boundary=boundary)
 
 
 class LanguageModel(nn.Module):

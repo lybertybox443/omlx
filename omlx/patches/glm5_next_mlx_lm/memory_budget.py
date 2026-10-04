@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-def cache_profile(text):
+def cache_profile(text, *, speculative=False):
     kinds = text.get("layer_types")
     count = text.get("num_hidden_layers")
     if type(count) is not int or count < 1 or not isinstance(kinds, list) or len(kinds) != count:
@@ -42,10 +42,29 @@ def cache_profile(text):
             # without relying on pooling compression for admission safety.
             rates.append(4 * (latent + rope + 2 * index))
             fixed.append(4 * index * pool)
+    if speculative:
+        # Maximum approved common DFlash block: nine rows. Bound both the
+        # current state and rollback entry state, including fused/reference
+        # KDA captures and sparse pool snapshots. This is per sequence.
+        block = 9
+        hidden = dimension("hidden_size")
+        streams = dimension("hc_mult", 4)
+        capture_bytes = 4 * block * hidden * (streams + 1)
+        for i, kind in enumerate(kinds):
+            if kind == "linear_attention":
+                heads = dimension("linear_num_heads", 64)
+                width = dimension("linear_head_dim", 128)
+                rows = 7 * heads * width + 2 * width + 2 * heads + 1
+                fixed[i] = 2 * fixed[i] + 4 * block * rows + capture_bytes
+            else:
+                index = dimension("index_head_dim")
+                rates[i] *= 2  # old/new backing allocations during verify
+                fixed[i] = 8 * fixed[i] + 8 * block * index + capture_bytes
     return dict(layer_kv_bytes_per_token=tuple(rates),
                 layer_kv_fixed_bytes=tuple(fixed), kv_cache_step=256)
 
 
 def cache_budget(model_path, options):
     config = json.loads((Path(model_path) / "config.json").read_text())
-    return cache_profile(config.get("text_config", config))
+    return cache_profile(config.get("text_config", config),
+                         speculative=bool(options.get("dflash_enabled")))

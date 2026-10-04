@@ -48,16 +48,74 @@ def receive(model, h):
     return packed.reshape(h.shape[0], h.shape[1], model.hc_mult, model.config.hidden_size)
 
 
-def finish(model, h, cache):
+def receive_captured(model, h, ids, boundary):
     stage = model.pipeline_stage
+    if stage is None or stage.is_first:
+        return None, []
+    if not boundary:
+        return receive(model, h), []
+    count = sum(point <= stage.start for point in set(ids))
+    packed, _, upstream = wire().receive_boundary_captures(stage, h.shape[0], h.shape[1], count)
+    return packed.reshape(h.shape[0], h.shape[1], model.hc_mult, model.config.hidden_size), upstream
+
+
+def finish(model, h, cache, *, ids=(), local=None, upstream=(), hidden_sink=None,
+           return_raw_hidden=False, boundary=False):
+    import mlx.core as mx
+    stage = model.pipeline_stage
+    raw = h.mean(axis=2)
+    captures = local or {}
     if stage is None:
-        return model.norm(h.mean(axis=2))
+        output = model.norm(raw)
+        if hidden_sink is not None:
+            hidden_sink.extend(captures[point] for point in ids)
+            hidden_sink.append(raw)
+        return (output, raw) if return_raw_hidden else output
     transport = wire()
-    if stage.is_last:
-        output = model.norm(h.mean(axis=2))
+    residual = h.reshape(h.shape[0], h.shape[1], -1)
+    carried = [*upstream, *(captures[point] for point in sorted(captures))]
+    if not stage.is_last:
+        output = transport.hand_off(stage, residual, None, cache, captures=carried if boundary else ())
+        if boundary:
+            hidden_sink.append(raw)
+            return (output, raw) if return_raw_hidden else output
     else:
-        output = transport.hand_off(stage, h.reshape(h.shape[0], h.shape[1], -1), None, cache)
-    return transport.gather_output(stage, output)
+        output = model.norm(raw)
+        if boundary:
+            if len(carried) != len(set(ids)):
+                raise transport.PipelineContractError("GLM boundary captures do not cover requested layers")
+            shared = dict(zip(sorted(set(ids)), carried))
+            hidden_sink.extend(shared[point] for point in ids)
+            hidden_sink.append(raw)
+            return (output, raw) if return_raw_hidden else output
+    if hidden_sink is None and not return_raw_hidden:
+        return transport.gather_output(stage, output)
+    output, residual = transport.gather_mtp_output(stage, output, residual)
+    raw = residual.reshape(*residual.shape[:-1], model.hc_mult, model.config.hidden_size).mean(axis=2)
+    positive = sorted({point for point in ids if point > 0})
+    pieces = transport.gather_layer_captures(stage, [point - 1 for point in positive],
+        {point - 1: value for point, value in captures.items() if point > 0}, output)
+    shared = dict(zip(positive, pieces))
+    if 0 in ids:
+        shared[0] = mx.distributed.all_sum(captures.get(0, mx.zeros_like(raw)), group=stage.group)
+        mx.eval(shared[0])
+    if hidden_sink is not None:
+        hidden_sink.extend(shared[point] for point in ids)
+        hidden_sink.append(raw)
+    return (output, raw) if return_raw_hidden else output
+
+
+def boundary_capture_output(model):
+    from contextlib import contextmanager
+    @contextmanager
+    def scope():
+        previous = getattr(model, "_omlx_boundary_captures", False)
+        model._omlx_boundary_captures = True
+        try:
+            yield
+        finally:
+            model._omlx_boundary_captures = previous
+    return scope()
 
 
 def verify(model, group):

@@ -472,7 +472,7 @@ def install_dflash_serving(model, server, options, provider=None):
         from contextlib import nullcontext
 
         from .dflash_prefill import install_dflash_prefill
-        with install_dflash_prefill(model, shared) if shared.sink_size or options.get("dflash_capture_cache") or options.get("specprefill_draft_model") else nullcontext():
+        with install_dflash_prefill(model, shared) if shared.sink_size or options.get("dflash_capture_cache") or options.get("specprefill_draft_model") or getattr(model, "_omlx_dflash_prefill_capture_required", False) else nullcontext():
             yield
     finally:
         shared.clear()

@@ -48,3 +48,14 @@ def test_invalid_glm_cache_geometry(change):
     config.update(change)
     with pytest.raises(ValueError):
         cache_profile(config)
+
+
+def test_speculative_profile_charges_retained_states_on_every_stage(tmp_path):
+    config = text()
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    ordinary = ADAPTER.cache_budget(tmp_path, {})
+    verify = ADAPTER.cache_budget(tmp_path, {"dflash_enabled": True})
+    assert verify["layer_kv_bytes_per_token"] == (0, 640, 0, 640)
+    assert all(a > 2 * b for a, b in zip(verify["layer_kv_fixed_bytes"],
+                                      ordinary["layer_kv_fixed_bytes"]))
+    assert verify["kv_cache_step"] == 256
