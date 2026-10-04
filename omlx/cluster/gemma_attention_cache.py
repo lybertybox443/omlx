@@ -76,6 +76,17 @@ def gemma_attention_cache_budget(model_path, options):
     sliding = widths["sliding_attention"]
     fixed = sliding * (positive("sliding_window", 512) + 256)
     copies = 2 if options.get("dflash_enabled") or options.get("mtp_enabled") else 1
+    quant = options.get("turboquant_kv_enabled", False)
+    if quant:
+        # turboquant_kv: compressed history; context_length sizing uses conservative
+        # float32 upper bound so budget never underestimates pre-dequant footprint.
+        return dict(
+            layer_kv_bytes_per_token=tuple(copies * widths[t] if i < producers else 0 for i, t in enumerate(types)),
+            layer_kv_fixed_bytes=tuple(0 for _ in types),
+            replicated_kv_bytes_per_token=copies * sum(widths[t] for t in source_types),
+            replicated_kv_fixed_bytes=0,
+            kv_cache_step=256,
+        )
     return dict(
         layer_kv_bytes_per_token=tuple(copies * full if i < producers and t == "full_attention" else 0 for i, t in enumerate(types)),
         layer_kv_fixed_bytes=tuple(copies * fixed if i < producers and t == "sliding_attention" else 0 for i, t in enumerate(types)),

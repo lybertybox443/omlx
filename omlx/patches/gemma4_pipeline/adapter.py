@@ -7,9 +7,9 @@ _LAYER = re.compile(r"^(?:model\.)?(?:language_model\.)?(?:model\.)?layers\.(\d+
 
 class Gemma4Adapter(PipelineModelAdapter):
     model_type = "gemma4"
-    media = ("text",)
+    media = ("text", "image", "audio")
     required_imports = ("mlx_vlm",)
-    optimizations = ("mtp_enabled",)
+    optimizations = ("mtp_enabled", "dflash_enabled", "turboquant_kv_enabled")
 
     def supports_pipeline(self, config):
         text = config.get("text_config", config)
@@ -43,9 +43,18 @@ class Gemma4Adapter(PipelineModelAdapter):
 
     def runtime_options(self, config, model_settings):
         from omlx.cluster.native_mtp_options import native_settings
-        if getattr(model_settings, "dflash_enabled", False):
-            raise ValueError("Distributed Gemma DFlash runtime is not installed")
-        return native_settings(model_settings)
+        from omlx.cluster.dflash import runtime_settings as dflash_runtime_settings
+        from omlx.cluster.turboquant import runtime_settings as tq_runtime_settings
+        mtp_on = getattr(model_settings, "mtp_enabled", False)
+        dflash_on = getattr(model_settings, "dflash_enabled", False)
+        if mtp_on and dflash_on:
+            raise ValueError("mtp_enabled and dflash_enabled are mutually exclusive")
+        if dflash_on:
+            base = dflash_runtime_settings(model_settings)
+        else:
+            base = native_settings(model_settings)
+        base.update(tq_runtime_settings(model_settings))
+        return base
 
     def serving(self, model, provider, mlx_server, options):
         from .native_mtp import serving

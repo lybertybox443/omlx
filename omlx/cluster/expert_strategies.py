@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generic expert-parallel primitive for MoE blocks with ``switch_mlp``.
+"""Generic expert-parallel primitive for MoE blocks with ``switch_mlp`` or ``switch_glu``.
 
 Routed experts are partitioned contiguously (uneven, divmod) along axis 0 of
-each projection. The router stays replicated. The shared expert lives on rank
-0 only. The whole MoE block is wrapped so one all_sum reduces the final hidden
-output.
+each projection. The router stays replicated. For Qwen-style (switch_mlp) the
+shared expert lives on rank 0 only. Gemma-style (switch_glu) has no
+shared_expert; the dense branch is replicated. The whole MoE block is wrapped
+so one all_sum reduces the final hidden output.
 """
 
 from types import SimpleNamespace
@@ -57,18 +58,30 @@ class LocalExperts(nn.Module):
         return mx.where(local[..., None], y, mx.zeros_like(y))
 
 
-def _inspect(mlp):
-    """Return num_experts for a supported MoE, None for non-MoE, else raise."""
-    sw = getattr(mlp, "switch_mlp", None)
-    if sw is None:
-        return None
+def _inspect(mlp, *, _switch_attr=None):
+    """Return (num_experts, switch_attr, gemma_style) for a supported MoE.
+
+    Returns (None, None, False) for non-MoE. Raises ValueError on ambiguous
+    or unsupported layouts.
+    - switch_mlp (Qwen): requires shared_expert, shared_owner=True on rank 0.
+    - switch_glu (Gemma): no shared_expert, dense branch replicated.
+    """
+    sw_mlp = getattr(mlp, "switch_mlp", None)
+    sw_glu = getattr(mlp, "switch_glu", None)
+    if sw_mlp is not None and sw_glu is not None:
+        raise ValueError("unsupported MoE layout: both switch_mlp and switch_glu present")
+    if sw_mlp is None and sw_glu is None:
+        return None, None, False
+    gemma_style = sw_glu is not None
+    sw = sw_glu if gemma_style else sw_mlp
+    attr = "switch_glu" if gemma_style else "switch_mlp"
     projs = []
     for name in _PROJS:
         p = getattr(sw, name, None)
         if p is None or getattr(p, "weight", None) is None:
-            raise ValueError(f"unsupported MoE layout: missing switch_mlp.{name}")
+            raise ValueError(f"unsupported MoE layout: missing {attr}.{name}")
         projs.append(p)
-    if getattr(mlp, "shared_expert", None) is None:
+    if not gemma_style and getattr(mlp, "shared_expert", None) is None:
         raise ValueError("unsupported MoE layout: missing shared_expert")
     experts = projs[0].weight.shape[0]
     if experts < 1:
@@ -80,16 +93,17 @@ def _inspect(mlp):
                 continue
             if arr.ndim < 1 or arr.shape[0] != experts:
                 raise ValueError(
-                    f"unsupported MoE layout: {name}.{a} expert axis "
+                    f"unsupported MoE layout: {attr}.{name}.{a} expert axis "
                     f"{arr.shape[:1]} != {experts}"
                 )
-    return experts
+    return experts, attr, gemma_style
 
 
 def inspect_expert_layers(model):
     """Preflight all layers; return (owner, plan). Never mutates.
 
     plan = [(layer_index, layer, mlp, num_experts)] for supported MoE layers.
+    For Gemma-style layers, mlp is layer.experts (the native MoeBlock).
     Raises ValueError on unsupported layout. Empty plan = no MoE.
     """
     owner, layers = _common_layer_owner(model)
@@ -98,11 +112,19 @@ def inspect_expert_layers(model):
         if layer is None:
             continue
         mlp = getattr(layer, "mlp", None)
-        if mlp is None:
-            continue
-        experts = _inspect(mlp)
-        if experts is not None:
-            plan.append((i, layer, mlp, experts))
+        experts_mod = None
+        num_experts = None
+        switch_attr = None
+        if mlp is not None:
+            num_experts, switch_attr, _ = _inspect(mlp)
+        if num_experts is None:
+            # Gemma: routed experts live in layer.experts, not layer.mlp
+            experts_mod = getattr(layer, "experts", None)
+            if experts_mod is not None:
+                num_experts, switch_attr, _ = _inspect(experts_mod)
+        if num_experts is not None:
+            target = experts_mod if experts_mod is not None and switch_attr == "switch_glu" else mlp
+            plan.append((i, layer, target, num_experts))
     return owner, plan
 
 
@@ -161,10 +183,16 @@ def apply_expert_strategy(model, group, *, mx_module, progress=None, plan=None):
 
 
 def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
-    """Lazily slice ``mlp`` experts and wrap CURRENT ``layer.mlp`` (no eval)."""
+    """Lazily slice experts and wrap the MoE block (no eval).
+
+    For Qwen-style (switch_mlp on layer.mlp): wraps layer.mlp.
+    For Gemma-style (switch_glu on layer.experts): wraps layer.experts.
+    """
     size, rank = group.size(), group.rank()
     lo, hi = expert_range(experts, size, rank)
-    sw = mlp.switch_mlp
+    # Detect style: mlp is layer.experts for Gemma, layer.mlp for Qwen.
+    _, switch_attr, gemma_style = _inspect(mlp)
+    sw = getattr(mlp, switch_attr)
     hidden = sw.down_proj.weight.shape[-2]
     for name in _PROJS:
         p = getattr(sw, name)
@@ -180,9 +208,17 @@ def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
             except Exception:
                 pass
         del p
-    mlp.switch_mlp = LocalExperts(sw, lo, hi, hidden)
+    setattr(mlp, switch_attr, LocalExperts(sw, lo, hi, hidden))
     del sw
-    if rank != 0:
-        mlp.shared_expert = _ZeroShared()
-    layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
-    return {"experts": experts, "lo": lo, "hi": hi, "shared_owner": rank == 0}
+    if gemma_style:
+        # Gemma: no shared_expert; dense MLP branch replicated on all ranks.
+        # Wrap layer.experts BEFORE native post-expert norm.
+        layer.experts = _wrap_sharded_moe(layer.experts, group, mx_module)
+        shared_owner = False
+    else:
+        # Qwen: shared_expert on rank 0 only.
+        if rank != 0:
+            mlp.shared_expert = _ZeroShared()
+        layer.mlp = _wrap_sharded_moe(layer.mlp, group, mx_module)
+        shared_owner = rank == 0
+    return {"experts": experts, "lo": lo, "hi": hi, "shared_owner": shared_owner}

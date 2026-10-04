@@ -57,6 +57,11 @@ QWEN4_EXP = TensorStrategy(
     model_types=("qwen4_exp", "qwen4_exp_text"),
     source="oMLX adapter: GDN/QSA/MoE sharding; PLE and QSA indexer replicated",
 )
+GEMMA4 = TensorStrategy(
+    name="gemma4",
+    model_types=("gemma4", "gemma4_text"),
+    source="oMLX adapter: Gemma4 GQA/MQA/SharedKV/MoE sharding",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -474,6 +479,178 @@ def _shard_qwen3_next(
             loaded=index + 1,
             total=total,
         )
+
+
+def _unwrap_gemma4_experts(experts: Any) -> Any:
+    """Unwrap EP-held LocalExperts/ShardedMoE to reach switch_glu projections.
+
+    Only traverses known EP holder attributes (.inner) up to two levels.
+    Returns the object that directly owns switch_glu; raises if not found.
+    """
+    candidate = experts
+    for _ in range(2):
+        if hasattr(candidate, "switch_glu"):
+            return candidate
+        inner = getattr(candidate, "inner", None)
+        if inner is None:
+            break
+        candidate = inner
+    raise RuntimeError(
+        f"_shard_gemma4: cannot locate switch_glu on experts holder "
+        f"{type(experts).__name__}"
+    )
+
+
+@_register(GEMMA4)
+def _shard_gemma4(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_inplace, shard_linear
+
+    size = int(group.size())
+    owner, layers = _common_layer_owner(model)
+
+    # --- preflight: validate ALL layers before ANY mutation ---
+    for layer in layers:
+        if layer is None:
+            continue
+        if getattr(layer, "_gemma_tensor_group", None) is not None:
+            continue
+        attention = layer.self_attn
+        n_heads: int = int(attention.n_heads)
+        n_kv_heads: int = int(attention.n_kv_heads)
+        _require_divisible(n_heads, size, "q heads")
+        # KV policy: divisible → shard; =1 → replicate (MQA); else → reject
+        if n_kv_heads > 1 and n_kv_heads % size != 0:
+            raise ValueError(
+                f"tensor strategy: n_kv_heads={n_kv_heads} is not divisible by "
+                f"group size={size} and >1; unsupported non-divisible KV "
+                f"configuration detected in preflight. No mutation applied."
+            )
+        # dense MLP preflight (present on both dense and MoE layers)
+        mlp_pre = getattr(layer, "mlp", None)
+        if mlp_pre is not None:
+            gate_w = getattr(getattr(mlp_pre, "gate_proj", None), "weight", None)
+            if gate_w is not None:
+                _require_divisible(int(gate_w.shape[0]), size, "mlp intermediate (gate_proj rows)")
+        # MoE experts preflight
+        experts_holder_pre = getattr(layer, "experts", None)
+        if experts_holder_pre is not None:
+            switch_glu_pre = _unwrap_gemma4_experts(experts_holder_pre)
+            gate_proj_pre = getattr(switch_glu_pre, "gate_proj", None)
+            if gate_proj_pre is not None:
+                gate_w2 = getattr(gate_proj_pre, "weight", None)
+                if gate_w2 is not None:
+                    _require_divisible(int(gate_w2.shape[1]), size, "experts gate_proj cols")
+
+    kv_sharded_types: set = set(getattr(owner, "_gemma_kv_sharded_types", ()))
+    total = len(layers)
+
+    for index, layer in enumerate(layers):
+        if layer is None:
+            continue
+        if getattr(layer, "_gemma_tensor_group", None) is not None:
+            # already owned; skip without re-wrapping
+            _emit(
+                progress,
+                strategy=GEMMA4.name,
+                layer=index,
+                loaded=index + 1,
+                total=total,
+            )
+            continue
+
+        mx.eval(layer.parameters())
+
+        attention = layer.self_attn
+        n_heads: int = int(attention.n_heads)
+        n_kv_heads: int = int(attention.n_kv_heads)
+        shard_kv = n_kv_heads > 1  # False → MQA: replicate KV
+
+        # --- Q projection (always present) ---
+        attention.q_proj = shard_linear(
+            attention.q_proj, "all-to-sharded", group=group
+        )
+        attention.n_heads = n_heads // size
+
+        # --- O projection (always present) ---
+        attention.o_proj = shard_linear(
+            attention.o_proj, "sharded-to-all", group=group
+        )
+
+        # --- K projection (absent on SharedKV tail layers) ---
+        has_k_proj = getattr(attention, "k_proj", None) is not None
+        if has_k_proj and shard_kv:
+            attention.k_proj = shard_linear(
+                attention.k_proj, "all-to-sharded", group=group
+            )
+        # full-attention k_eq_v variant: no v_proj; k_proj present but not sharded
+        # separately (K=V path); treat same as has_k_proj for head-count update.
+        has_v_proj = getattr(attention, "v_proj", None) is not None
+        if has_v_proj and shard_kv:
+            attention.v_proj = shard_linear(
+                attention.v_proj, "all-to-sharded", group=group
+            )
+
+        # --- n_kv_heads field update must match producer policy ---
+        if shard_kv:
+            attention.n_kv_heads = n_kv_heads // size
+            kv_sharded_types.add(owner.config.layer_types[index])
+        # MQA (n_kv_heads==1): leave n_kv_heads=1, KV replicated across ranks
+
+        # --- dense MLP (present on both dense and MoE layers) ---
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            mlp.gate_proj = shard_linear(
+                mlp.gate_proj, "all-to-sharded", group=group
+            )
+            mlp.up_proj = shard_linear(
+                mlp.up_proj, "all-to-sharded", group=group
+            )
+            mlp.down_proj = shard_linear(
+                mlp.down_proj, "sharded-to-all", group=group
+            )
+
+        # --- MoE experts (additional to dense MLP above) ---
+        experts_holder = getattr(layer, "experts", None)
+        if experts_holder is not None:
+            # MoE path
+            switch_glu = _unwrap_gemma4_experts(experts_holder)
+            for name, sharding in (
+                ("gate_proj", "all-to-sharded"),
+                ("up_proj", "all-to-sharded"),
+                ("down_proj", "sharded-to-all"),
+            ):
+                proj = getattr(switch_glu, name, None)
+                if proj is not None:
+                    shard_inplace(proj, sharding, group=group)
+            layer.experts = _wrap_sharded_moe(experts_holder, group, mx)
+
+        # --- mark ownership ---
+        object.__setattr__(layer, "_gemma_tensor_group", group)
+
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=GEMMA4.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+    # Include remote producer kinds needed by the final PP stage's head.
+    config = owner.config
+    regular = config.num_key_value_heads
+    full = (getattr(config, "num_global_key_value_heads", None)
+            if getattr(config, "attention_k_eq_v", False) else regular) or regular
+    kv_sharded_types = {kind for kind in set(config.layer_types)
+                       if (full if kind == "full_attention" else regular) > 1}
+    object.__setattr__(owner, "_gemma_kv_sharded_types", frozenset(kv_sharded_types))
+    object.__setattr__(owner, "_gemma_tensor_group", group)
 
 
 @_register(NEMOTRON_H)

@@ -203,9 +203,22 @@ class GemmaNativeStage(nn.Module):
 
     @staticmethod
     def _call_layer(layer, h, mask, cache, sink=None, layer_idx=None, **kwargs):
-        """Call native layer; record (keys, values) fed to cache.update_and_fetch."""
+        """Call native layer; record (keys, values) fed to cache.update_and_fetch.
+
+        Returns (h, kvs, offset). kvs is (keys, values) cast to h.dtype after
+        optional dequantize when cache exposes a callable dequantize; None when
+        cache/sink absent. offset is cache.offset or None.
+        """
+        def finish(result):
+            h_out, kvs, offset = result
+            if kvs is not None and callable(getattr(cache, "dequantize", None)):
+                k, v = cache.dequantize(keys_state=kvs[0], values_state=kvs[1])
+                kvs = (k.astype(h_out.dtype), v.astype(h_out.dtype))
+            return h_out, kvs, offset
+
         if cache is None or sink is None:
-            return layer(h, mask, cache, **kwargs)
+            return finish(layer(h, mask, cache, **kwargs))
+
         had = "update_and_fetch" in vars(cache)
         prior = vars(cache).get("update_and_fetch")
         orig = cache.update_and_fetch
@@ -216,7 +229,7 @@ class GemmaNativeStage(nn.Module):
 
         cache.update_and_fetch = wrapper
         try:
-            return layer(h, mask, cache, **kwargs)
+            return finish(layer(h, mask, cache, **kwargs))
         finally:
             if had:
                 cache.update_and_fetch = prior
@@ -263,6 +276,9 @@ class GemmaNativeStage(nn.Module):
                 raise ValueError(f"missing kv update for remote producer {idx}")
             k, v = frame.kv_updates[idx]
             fk, fv = cache[idx].update_and_fetch(k, v)
+            if callable(getattr(cache[idx], "dequantize", None)):
+                fk, fv = cache[idx].dequantize(keys_state=fk, values_state=fv)
+                fk, fv = fk.astype(k.dtype), fv.astype(v.dtype)
             _, offset = frame.intermediates[idx]
             frame.intermediates[idx] = ((fk, fv), offset)
         return frame

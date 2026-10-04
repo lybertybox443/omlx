@@ -131,6 +131,9 @@ class GemmaPipelineTextModel(PipelineMixin, GemmaNativeStage):
                 skip_final_norm=skip_final_norm,
             )
             frame = self.forward_frame(frame, cache=cache)
+            if shared_kv_sink is not None:
+                from omlx.cluster.gemma_tensor_banks import reconstruct_shared_kv
+                shared_kv_sink.update(reconstruct_shared_kv(self, shared_kv_sink))
             return frame.hidden
 
         # Pipeline path
@@ -233,5 +236,7 @@ class GemmaPipelineTextModel(PipelineMixin, GemmaNativeStage):
                     kvs, _ = frame.intermediates[idx]
                     if kvs is not None:
                         shared_kv_sink[t] = kvs
+                from omlx.cluster.gemma_tensor_banks import reconstruct_shared_kv
+                shared_kv_sink.update(reconstruct_shared_kv(self, shared_kv_sink))
 
         return h

@@ -38,6 +38,9 @@ class ModelArgs:
     """Thin shim holding a TextConfig; delegates attribute access."""
 
     text_config: Any = field(default_factory=lambda: None)
+    vision_config: Any = field(default_factory=lambda: None)
+    audio_config: Any = field(default_factory=lambda: None)
+    root_config: Any = field(default_factory=lambda: None)
 
     def __getattr__(self, name: str):
         tc = object.__getattribute__(self, "text_config")
@@ -46,14 +49,42 @@ class ModelArgs:
         raise AttributeError(name)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ModelArgs":
+    def from_dict(cls, root_config: Any) -> "ModelArgs":
         # Apply MTP wrapper BEFORE any config parsing.
         from omlx.patches.mlx_vlm_mtp import gemma4_vlm_runtime
         gemma4_vlm_runtime.apply()
 
-        from mlx_vlm.models.gemma4.config import TextConfig
-        tc = TextConfig.from_dict(d.get("text_config", d))
-        return cls(text_config=tc)
+        from mlx_vlm.models.gemma4.config import ModelConfig, TextConfig, VisionConfig, AudioConfig
+
+        # Native ModelConfig: extract typed sub-configs directly, no raw dict needed.
+        if isinstance(root_config, ModelConfig):
+            from dataclasses import asdict
+            tc = root_config.text_config
+            if isinstance(tc, dict):
+                tc = TextConfig.from_dict(tc)
+            return cls(
+                text_config=tc,
+                vision_config=root_config.vision_config,
+                audio_config=root_config.audio_config,
+                root_config=asdict(root_config),
+            )
+        elif isinstance(root_config, dict):
+            raw = root_config
+        else:
+            raw = {}
+
+        # Parse TextConfig explicitly from nested key or root.
+        tc = TextConfig.from_dict(raw.get("text_config", raw))
+
+        # Parse VisionConfig only when key present.
+        raw_vision = raw.get("vision_config")
+        vc = VisionConfig.from_dict(raw_vision) if raw_vision is not None else None
+
+        # Parse AudioConfig only when key present.
+        raw_audio = raw.get("audio_config")
+        ac = AudioConfig.from_dict(raw_audio) if raw_audio is not None else None
+
+        return cls(text_config=tc, vision_config=vc, audio_config=ac, root_config=raw)
 
 
 # ---------------------------------------------------------------------------
@@ -96,18 +127,43 @@ class Model(nn.Module):
         from omlx.patches.mlx_vlm_mtp import is_mtp_attach_enabled, set_mtp_attach_enabled
         from omlx.cluster.gemma_native_pipeline import GemmaPipelineTextModel
 
-        # Extract typed TextConfig; build minimal ModelConfig (no VisionTower).
-        tc = _extract_text_config(config)
+        # Accept native ModelConfig, ModelArgs, or bare dict/TextConfig.
+        if isinstance(config, ModelConfig):
+            mc = config
+            tc = mc.text_config
+            _vc = getattr(mc, "vision_config", None)
+            _ac = getattr(mc, "audio_config", None)
+        elif isinstance(config, ModelArgs):
+            tc = config.text_config
+            _vc = config.vision_config
+            _ac = config.audio_config
+            mc = ModelConfig.from_dict(config.root_config) if isinstance(config.root_config, dict) and config.root_config else ModelConfig(text_config=tc)
+            mc.text_config = tc
+            mc.vision_config = _vc
+            mc.audio_config = _ac
+        else:
+            tc = _extract_text_config(config)
+            _vc = None
+            _ac = None
+            mc = ModelConfig(text_config=tc)
+
         if not isinstance(tc, TextConfig):
             raise TypeError(f"Expected TextConfig, got {type(tc)}")
-        self.config = ModelConfig(text_config=tc)
+
+        self.config = mc
         self.args = tc
+
+        # Preserve media token IDs from ModelConfig when available.
+        for _attr in ("image_token_index", "audio_token_index", "boi_token_index", "eoi_token_index"):
+            if hasattr(mc, _attr):
+                setattr(self, _attr, getattr(mc, _attr))
 
         # Determine owned range.
         from omlx.cluster.pipeline_compat import planned_layer_range
         n = tc.num_hidden_layers
         owned = planned_layer_range(n)
         start, end = owned if owned is not None else (0, n)
+        is_first = (start == 0)
         is_last = (end == n)
 
         # Patch trunk class so LanguageModel builds GemmaPipelineTextModel.
@@ -130,6 +186,34 @@ class Model(nn.Module):
             _g4lang.Gemma4TextModel = _orig_trunk
             set_mtp_attach_enabled(_prev_mtp)
 
+        # Allocate vision/audio components only on first stage with explicit config.
+        if is_first and _vc is not None:
+            from mlx_vlm.models.gemma4.vision import VisionModel
+            from mlx_vlm.models.gemma4.gemma4 import MultimodalEmbedder
+            self.vision_tower = VisionModel(_vc)
+            self.embed_vision = MultimodalEmbedder(_vc.hidden_size, tc.hidden_size, _vc.rms_norm_eps)
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
+
+        if is_first and _ac is not None:
+            from mlx_vlm.models.gemma4.audio import AudioEncoder
+            from mlx_vlm.models.gemma4.gemma4 import MultimodalEmbedder
+            self.audio_tower = AudioEncoder(_ac)
+            self.embed_audio = MultimodalEmbedder(
+                _ac.output_proj_dims or _ac.hidden_size, tc.hidden_size, _ac.rms_norm_eps
+            )
+        else:
+            self.audio_tower = None
+            self.embed_audio = None
+
+        # Media request factory (media_serving module added by root).
+        try:
+            from omlx.patches.gemma4_pipeline.media_serving import GemmaMediaRequest
+            self._omlx_media_request_factory = lambda payload: GemmaMediaRequest(self, payload)
+        except ImportError:
+            pass
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -142,32 +226,88 @@ class Model(nn.Module):
     def quant_predicate(self):
         return self.language_model.quant_predicate
 
+    @property
+    def _omlx_vision_cache_layer_count(self) -> int:
+        return len(self.language_model.make_cache())
+
+    def get_input_embeddings(self, *args, **kwargs):
+        from mlx_vlm.models.gemma4.gemma4 import Model as _NativeModel
+        return _NativeModel.get_input_embeddings(self, *args, **kwargs)
+
     def make_cache(self):
         # Native zero-slot containers support merge, split and evaluation
         # without allocating KV tensors for unowned producer positions.
         from mlx_vlm.models.cache import ArraysCache
         caches = self.language_model.make_cache()
         dependencies = set(self.model.cache_dependencies)
-        return [cache if index in dependencies else ArraysCache(0)
-                for index, cache in enumerate(caches)]
+        result = [cache if index in dependencies else ArraysCache(0)
+                  for index, cache in enumerate(caches)]
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import initialize_vision_cache
+        return initialize_vision_cache(self, result)
 
     def _cache_view(self, caches):
         if caches is None:
             return None
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import vision_cache_view
+        caches, _ = vision_cache_view(self, caches, getattr(self, '_omlx_image_request', None))
         dependencies = set(self.model.cache_dependencies)
-        return [cache if index in dependencies else None for index, cache in enumerate(caches)]
+        return [cache if index in dependencies else None
+                for index, cache in enumerate(caches)]
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
+    _omlx_dflash_prefill_capture_required = True
+
     def __call__(self, inputs: mx.array, cache=None, **kwargs):
         return_hidden = kwargs.get("return_hidden", False)
+
+        # Inject vision forward kwargs when an image request is attached.
+        image = getattr(self, "_omlx_image_request", None)
+        if image is not None:
+            kwargs.update(image.forward_kwargs(inputs))
+
+        capture = getattr(self, "_omlx_dflash_prefill_capture", None)
+        drafter = getattr(self.language_model, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        observe = bool(
+            scope
+            and not return_hidden
+            and capture is None
+            and inputs.shape[0] == len(scope)
+            and inputs.shape[1] == 1
+        )
+        if (capture is not None or observe) and not return_hidden:
+            kwargs.update(
+                return_hidden=True,
+                capture_layer_ids=list(drafter.target_layer_ids),
+            )
         out = self.language_model(inputs, cache=self._cache_view(cache), **kwargs)
+        if (capture is not None or observe) and not return_hidden:
+            states = out.hidden_states[: len(drafter.target_layer_ids)]
+            if len(states) != len(drafter.target_layer_ids):
+                raise RuntimeError(
+                    f"dflash: expected {len(drafter.target_layer_ids)} hidden states, got {len(states)}"
+                )
+            if capture:
+                capture(states, int(inputs.shape[1]))
+            else:
+                drafter.observe(scope, states)
+            if not return_hidden:
+                if hasattr(out, "logits"):
+                    logits = out.logits
+                    if image is not None:
+                        image.capture_prefix(cache, logits)
+                    return logits
+                return out
         if return_hidden:
             return out
         if hasattr(out, "logits"):
-            return out.logits
+            logits = out.logits
+            if image is not None:
+                image.capture_prefix(cache, logits)
+            return logits
         return out
 
     # ------------------------------------------------------------------
@@ -200,8 +340,18 @@ class Model(nn.Module):
         from omlx.cluster.pipeline_compat import planned_layer_range
 
         # 1. Normalize root prefixes to language_model.* or language_model.model.* form.
+        # Known media roots: strip leading "model." only, keep their own prefix.
+        _MEDIA_ROOTS = ("vision_tower.", "embed_vision.", "audio_tower.", "embed_audio.")
+
         normalized: Dict[str, Any] = {}
         for k, v in weights.items():
+            # Media roots under model.*: strip only "model." so they surface as
+            # vision_tower.*, embed_vision.*, audio_tower.*, embed_audio.*.
+            if k.startswith("model."):
+                rest = k[len("model."):]
+                if any(rest.startswith(r) for r in _MEDIA_ROOTS):
+                    normalized[rest] = v
+                    continue
             if k.startswith("model.language_model."):
                 nk = k[len("model."):]
             elif k.startswith("model.mtp."):
@@ -212,9 +362,6 @@ class Model(nn.Module):
                 nk = "language_model.model." + rest
             else:
                 nk = k
-            # Drop vision/audio keys unconditionally.
-            if "vision_model" in nk or "audio_model" in nk or "vision_tower" in nk:
-                continue
             normalized[nk] = v
 
         # 2. Split MTP keys.
@@ -222,7 +369,7 @@ class Model(nn.Module):
         backbone = {k: v for k, v in normalized.items() if k not in mtp_keys}
         from types import SimpleNamespace
         from mlx_vlm.models.gemma4 import Model as NativeModel
-        native_context = SimpleNamespace(config=self.config, audio_tower=None)
+        native_context = SimpleNamespace(config=self.config, audio_tower=self.audio_tower)
         backbone = NativeModel.sanitize(native_context, backbone)
 
         # 3. Ownership filter.
@@ -237,6 +384,12 @@ class Model(nn.Module):
             for k, v in backbone.items():
                 rel_prefix = "language_model.model."
                 if not k.startswith(rel_prefix):
+                    # Media encoder keys (vision_tower, embed_vision, audio_tower,
+                    # embed_audio): only load on first stage when encoder allocated.
+                    if any(k.startswith(r) for r in _MEDIA_ROOTS):
+                        if is_first and (self.vision_tower is not None or self.audio_tower is not None):
+                            filtered[k] = v
+                        continue
                     # Non-trunk (lm_head, etc.): last stage only.
                     if is_last:
                         filtered[k] = v

@@ -26,6 +26,9 @@ _PAYLOAD_KEYS = (
     "image_grid_thw",
     "pixel_values_videos",
     "video_grid_thw",
+    "image_position_ids",
+    "video_position_ids",
+    "mm_token_type_ids",
 )
 
 
@@ -183,12 +186,20 @@ def ensure_vision_metadata(cache, layer_count, delta=None, identity=None):
     return tail
 
 
+def _cache_layer_count(model):
+    """Return layer count for vision cache sizing."""
+    explicit = getattr(model, "_omlx_vision_cache_layer_count", None)
+    if isinstance(explicit, int) and explicit >= 0:
+        return explicit
+    return sum(layer is not None for layer in model.model.layers)
+
+
 def vision_cache_view(model, cache, request=None):
     """Keep media identity metadata outside decoder and rollback cache views."""
     if cache is None or not getattr(model, "_omlx_vision_cache_enabled", False):
         return cache, None
     delta = ensure_vision_metadata(
-        cache, sum(layer is not None for layer in model.model.layers),
+        cache, _cache_layer_count(model),
         delta=getattr(request, "deltas", None),
         identity=getattr(request, "capture_identity", None),
     )[0]
@@ -322,7 +333,7 @@ class ImageCohortCache:
         return len(self.cache)
 
     def _layers(self):
-        return sum(layer is not None for layer in self.model.model.layers)
+        return _cache_layer_count(self.model)
 
     def _fail(self, error):
         import mlx.core as mx
@@ -413,8 +424,9 @@ class ImageCohortCache:
         try:
             end = len(prompt) - 1
             while state.offset < end:
-                stop = min(state.offset + prefill_step_size, end)
-                snap = getattr(self.cache, "prefill_snapshot_step", None)
+                atomic = bool(getattr(state, "atomic_prefill", False))
+                stop = end if atomic else min(state.offset + prefill_step_size, end)
+                snap = None if atomic else getattr(self.cache, "prefill_snapshot_step", None)
                 if isinstance(snap, int) and snap > 0:
                     stop = min(stop, (state.offset // snap + 1) * snap)
                 inputs = mx.array(prompt[state.offset : stop])[None]
