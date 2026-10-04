@@ -84,6 +84,15 @@ class LagunaAdapter(PipelineModelAdapter):
         apply_laguna_patch()
         return True
 
+    def verify_contract(self, model, group):
+        stage = model.model.pipeline_stage
+        if stage is None:
+            if group.size() > 1:
+                raise RuntimeError("Laguna model has no configured pipeline stage")
+            return
+        from omlx.cluster.native_capture_pipeline import capture_wire
+        capture_wire().verify_contract(group, stage)
+
     def resident_layers(self, model):
         from mlx.utils import tree_flatten
         return {index for name, _ in tree_flatten(model.parameters())
