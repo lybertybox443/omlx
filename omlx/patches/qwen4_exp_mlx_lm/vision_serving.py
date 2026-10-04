@@ -242,6 +242,11 @@ class VisionRequest:
         return kwargs
 
 
+def _media_request(model, payload):
+    factory = getattr(model, "_omlx_media_request_factory", None)
+    return factory(payload) if factory is not None else VisionRequest(model, payload)
+
+
 class ImageCache:
     """Keep text and different pixel contents in separate rank-local cache keys."""
 
@@ -321,7 +326,7 @@ class ImageCohortCache:
         error = state = cache = rest = drafter = temp_id = None
         namespaced = (key, "image", payload.get("identity"))
         try:
-            state = VisionRequest(self.model, payload)
+            state = _media_request(self.model, payload)
         except Exception as exc:
             error = exc
         self._fail(error)
@@ -449,10 +454,14 @@ class ImageCohortCache:
 
 
 @contextmanager
-def install_vision_serving(model, provider, server):
+def install_vision_serving(
+    model, provider, server, *, match_request=has_images,
+    prepare=prepare_request, load_processor_fn=None,
+):
     import mlx.core as mx
     from mlx_vlm.utils import load_processor
 
+    processor_loader = load_processor_fn or load_processor
     generator = server.ResponseGenerator
     original_share = generator._share_request
     original_batchable = generator._is_batchable
@@ -472,15 +481,15 @@ def install_vision_serving(model, provider, server):
         nonlocal processor
         if request is not None and (not self._is_distributed or self._rank == 0):
             _, body, args = request
-            if has_images(body):
+            if match_request(body):
                 try:
                     if processor is None:
-                        processor = load_processor(
+                        processor = processor_loader(
                             provider.cli_args.model,
                             add_detokenizer=False,
                             trust_remote_code=provider.cli_args.trust_remote_code,
                         )
-                    args._omlx_image = prepare_request(
+                    args._omlx_image = prepare(
                         processor, body, args, provider.cli_args.chat_template_args,
                         model_path=provider.cli_args.model,
                     )
@@ -535,7 +544,7 @@ def install_vision_serving(model, provider, server):
             failure = None
             state = None
             try:
-                state = VisionRequest(model, payload)
+                state = _media_request(model, payload)
             except Exception as exc:
                 failure = exc
             # Every rank decides together whether it can enter the forward collectives.

@@ -10,7 +10,7 @@ _LAYER = re.compile(r"(?:^|\.)model\.layers\.(\d+)(?:\.|$)")
 
 class MiMoAdapter(PipelineModelAdapter):
     model_type = "mimo_v2"
-    media = ("text",)
+    media = ("text", "audio")
     required_imports = ("mlx_lm",)
 
     def supplemental_files(self, model_path):
@@ -73,6 +73,10 @@ class MiMoAdapter(PipelineModelAdapter):
         import mlx_lm.models.mimo_v2 as module
         module.Model._omlx_adapter = self
         return True
+
+    def serving(self, model, provider, mlx_server, options):
+        from .audio_serving import install_mimo_audio_serving
+        return install_mimo_audio_serving(model, provider, mlx_server)
 
     def resident_layers(self, model):
         from mlx.utils import tree_flatten

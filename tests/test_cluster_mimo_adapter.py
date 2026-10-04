@@ -17,7 +17,7 @@ def config():
 def test_mimo_adapter_native_cache_admission(tmp_path):
     assert adapter_for_type("mimo_v2") is ADAPTER
     assert adapter_for_type("mimo_v2_flash") is ADAPTER
-    assert ADAPTER.media == ("text",)
+    assert ADAPTER.media == ("text", "audio")
     assert ADAPTER.trunk_layer_index("model.layers.3.self_attn.weight") == 3
     assert ADAPTER.trunk_layer_index("model.mtp.layers.0.weight") is None
     (tmp_path / "config.json").write_text(json.dumps(config()))
