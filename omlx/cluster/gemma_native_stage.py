@@ -28,6 +28,7 @@ class GemmaStageFrame:
     trimmed_prefix: int = 0
     skip_final_norm: bool = False
     next_layer: int = 0
+    kv_updates: dict = field(default_factory=dict)
 
 
 class GemmaNativeStage(nn.Module):
@@ -193,7 +194,29 @@ class GemmaNativeStage(nn.Module):
             next_layer=0,
         )
 
-    def forward_frame(self, frame: GemmaStageFrame, cache=None) -> GemmaStageFrame:
+    @staticmethod
+    def _call_layer(layer, h, mask, cache, sink=None, layer_idx=None, **kwargs):
+        """Call native layer; record (keys, values) fed to cache.update_and_fetch."""
+        if cache is None or sink is None:
+            return layer(h, mask, cache, **kwargs)
+        had = "update_and_fetch" in vars(cache)
+        prior = vars(cache).get("update_and_fetch")
+        orig = cache.update_and_fetch
+
+        def wrapper(keys, values, *a, **k):
+            sink[layer_idx] = (keys, values)
+            return orig(keys, values, *a, **k)
+
+        cache.update_and_fetch = wrapper
+        try:
+            return layer(h, mask, cache, **kwargs)
+        finally:
+            if had:
+                cache.update_and_fetch = prior
+            else:
+                del cache.update_and_fetch
+
+    def forward_frame(self,frame: GemmaStageFrame, cache=None) -> GemmaStageFrame:
         n = self.num_hidden_layers
         if frame.next_layer != self.start:
             raise ValueError(
@@ -216,8 +239,9 @@ class GemmaNativeStage(nn.Module):
             kvs, offset = inter[self.previous_kvs[idx]]
             if frame.trimmed_prefix:
                 offset = offset + frame.trimmed_prefix
-            h, kvs, offset = layer(
-                h, m, c, per_layer_input=pli, shared_kv=kvs, offset=offset
+            h, kvs, offset = self._call_layer(
+                layer, h, m, c, frame.kv_updates, idx,
+                per_layer_input=pli, shared_kv=kvs, offset=offset,
             )
             inter[idx] = (kvs, offset)
             if frame.hidden_sink is not None and idx in frame.capture_set:

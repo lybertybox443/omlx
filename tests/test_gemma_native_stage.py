@@ -130,6 +130,48 @@ def test_sequential_oracle(ple, bounds, keep, caps):
                 _close(a, b)
 
 
+def test_kv_updates_relay_shadow():
+    mx.random.seed(0)
+    config = make_config(4)
+    lm = LanguageModel(config)
+    ref = Gemma4TextModel(config)
+    mx.eval(ref.parameters())
+    stages = _stages(config, ref, [0, 2, 5, 6])
+    rc, sc, shadow = lm.make_cache(), lm.make_cache(), lm.make_cache()
+    types_ = [type(c) for c in sc]
+    for n in [11] + [1] * 12 + [3]:
+        ids = mx.random.randint(0, 64, (1, n))
+        want = ref(ids, cache=rc)
+        frame = stages[0].prepare_frame(ids, cache=sc)
+        for st in stages:
+            frame = st.forward_frame(frame, sc)
+        _close(frame.hidden, want)
+        assert frame.kv_updates
+        for idx, (k, v) in frame.kv_updates.items():
+            assert k.shape[2] == n and v.shape[2] == n
+            fk, fv = shadow[idx].update_and_fetch(k, v)
+            (ik, iv), _ = frame.intermediates[idx]
+            _close(fk, ik)
+            _close(fv, iv)
+            assert shadow[idx].offset == sc[idx].offset
+        assert [type(c) for c in sc] == types_
+        assert not any("update_and_fetch" in vars(c) for c in sc)
+
+
+def test_call_layer_cleanup_on_failure():
+    cache = lm_cache = LanguageModel(make_config(0)).make_cache()[0]
+    sink = {}
+
+    def boom(h, mask, c, **kw):
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        GemmaNativeStage._call_layer(boom, None, None, cache, sink, 3)
+    assert 3 in sink
+    assert "update_and_fetch" not in vars(lm_cache)
+
+
 def test_chain_rejected():
     config = make_config(0)
     a, b = GemmaNativeStage(config, 0, 3), GemmaNativeStage(config, 3, 6)
