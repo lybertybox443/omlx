@@ -169,21 +169,8 @@ class Model(_VendoredModel):
             image_kwargs = image_request.forward_kwargs(inputs)
             inputs_embeds = image_kwargs.pop("inputs_embeds", inputs_embeds)
             kwargs.update(image_kwargs)
-        tail_delta = None
-        if getattr(self, "_omlx_vision_cache_enabled", False) and cache is not None:
-            from omlx.patches.qwen4_exp_mlx_lm.vision_serving import ensure_vision_metadata
-
-            tail_delta = ensure_vision_metadata(
-                cache,
-                sum(layer is not None for layer in self.model.layers),
-                delta=image_request.deltas if image_request is not None else None,
-                identity=(
-                    image_request.capture_identity
-                    if image_request is not None
-                    else None
-                ),
-            )[0]
-            cache = cache[:-1]
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import vision_cache_view
+        cache, tail_delta = vision_cache_view(self, cache, image_request)
         offset = getattr(self, "_omlx_specprefill_position_offset", None)
         attention_index = self.model.fa_idx
         if image_request is None and tail_delta is not None:
@@ -299,18 +286,8 @@ class Model(_VendoredModel):
         )
 
     def make_cache(self) -> Any:
-        cache = self.language_model.make_cache()
-        if getattr(self, "_omlx_vision_cache_enabled", False):
-            from omlx.patches.qwen4_exp_mlx_lm.vision_serving import ensure_vision_metadata
-
-            request = getattr(self, "_omlx_image_request", None)
-            ensure_vision_metadata(
-                cache,
-                len(cache),
-                getattr(request, "deltas", None),
-                getattr(request, "capture_identity", None),
-            )
-        return cache
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import initialize_vision_cache
+        return initialize_vision_cache(self, self.language_model.make_cache())
 
     def load_weights(self, weights: Any, strict: bool = True) -> Any:
         layer_range = _pipeline.planned_layer_range(

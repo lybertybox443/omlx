@@ -31,6 +31,13 @@ class Model(_Model):
     _omlx_dflash_prefill_capture_required=True
 
     def __call__(self,inputs,cache=None,inputs_embeds=None,**kwargs):
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import vision_cache_view
+        image=getattr(self,"_omlx_image_request",None)
+        if image is not None:
+            media_kwargs=image.forward_kwargs(inputs)
+            inputs_embeds=media_kwargs.pop("inputs_embeds",inputs_embeds)
+            kwargs.update(media_kwargs)
+        cache,_=vision_cache_view(self,cache,image)
         capture=getattr(self,"_omlx_dflash_prefill_capture",None)
         return_hidden=kwargs.get("return_hidden",False)
         drafter=getattr(self.language_model,"_omlx_drafter",None)
@@ -45,6 +52,8 @@ class Model(_Model):
             capture(out.hidden_states[:-1],int(inputs.shape[1]))
         elif observe:
             drafter.observe(scope,out.hidden_states[:-1])
+        if image is not None and not getattr(self.model,"_omlx_rank_local_output",False):
+            image.capture_prefix(cache,out.logits)
         return out if return_hidden else out.logits
 
     def mtp_forward(self,*args,**kwargs):
@@ -54,7 +63,13 @@ class Model(_Model):
         return self.language_model.make_mtp_cache()
 
     def mtp_partial_rollback(self,cache,accepted,num_drafts):
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import vision_cache_view
+        cache,_=vision_cache_view(self,cache)
         return self.language_model.mtp_partial_rollback(cache,accepted,num_drafts)
+
+    def make_cache(self):
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import initialize_vision_cache
+        return initialize_vision_cache(self,self.language_model.make_cache())
 
     def sanitize(self,weights):
         from omlx.cluster.pipeline_compat import planned_layer_range

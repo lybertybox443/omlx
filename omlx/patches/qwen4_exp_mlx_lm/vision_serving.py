@@ -183,6 +183,23 @@ def ensure_vision_metadata(cache, layer_count, delta=None, identity=None):
     return tail
 
 
+def vision_cache_view(model, cache, request=None):
+    """Keep media identity metadata outside decoder and rollback cache views."""
+    if cache is None or not getattr(model, "_omlx_vision_cache_enabled", False):
+        return cache, None
+    delta = ensure_vision_metadata(
+        cache, sum(layer is not None for layer in model.model.layers),
+        delta=getattr(request, "deltas", None),
+        identity=getattr(request, "capture_identity", None),
+    )[0]
+    return cache[:-1], delta
+
+
+def initialize_vision_cache(model, cache):
+    vision_cache_view(model, cache, getattr(model, "_omlx_image_request", None))
+    return cache
+
+
 class VisionRequest:
     def __init__(self, model, payload):
         import mlx.core as mx
@@ -193,11 +210,16 @@ class VisionRequest:
         grid = None if grid is None else mx.array(grid)
         vgrid = payload.get("video_grid_thw")
         vgrid = None if vgrid is None else mx.array(vgrid)
-        if grid is None and vgrid is None:
-            raise ValueError("vision payload has no image or video grid")
-        self.positions, self.deltas = model.language_model.get_rope_index(
-            self.ids, grid, vgrid, None
-        )
+        position_getter = getattr(model.language_model, "get_rope_index", None)
+        if callable(position_getter):
+            if grid is None and vgrid is None:
+                raise ValueError("vision payload has no image or video grid")
+            self.positions, self.deltas = position_getter(self.ids, grid, vgrid, None)
+        else:
+            # Native 1D/NoPE backbones keep position in their KV cache.
+            # The metadata tail still isolates cache entries by media identity.
+            self.positions = None
+            self.deltas = mx.zeros((self.ids.shape[0], 1), mx.int64)
         self.embeddings = None
         if model.model.pipeline_stage.is_first:
             pixels = payload.get("pixel_values")
@@ -234,9 +256,11 @@ class VisionRequest:
     def forward_kwargs(self, inputs):
         start = self.offset
         self.offset += inputs.shape[1]
-        kwargs = {"rope_deltas": self.deltas}
-        if start < self.ids.shape[1]:
-            kwargs["position_ids"] = self.positions
+        kwargs = {}
+        if self.positions is not None:
+            kwargs["rope_deltas"] = self.deltas
+            if start < self.ids.shape[1]:
+                kwargs["position_ids"] = self.positions
         if start < self.ids.shape[1] and self.embeddings is not None:
             kwargs["inputs_embeds"] = self.embeddings[:, start : self.offset]
         return kwargs

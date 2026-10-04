@@ -6,7 +6,7 @@ _LAYER=re.compile(r"(?:^|\.)language_model\.(?:model\.)?layers\.(\d+)(?:\.|$)")
 
 class MuseGlimmerAdapter(PipelineModelAdapter):
     model_type="muse_glimmer"
-    media=("text",)
+    media=("text","image")
     optimizations=("dflash_enabled",)
     required_imports=("mlx_vlm","dflash_mlx")
 
@@ -33,10 +33,11 @@ class MuseGlimmerAdapter(PipelineModelAdapter):
     def serving(self,model,provider,mlx_server,options):
         from contextlib import contextmanager
         from omlx.cluster.dflash import install_dflash_serving
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import install_vision_serving
         from omlx.cluster.mtp_coordination import install_mtp_sampling
         @contextmanager
         def scope():
-            with install_dflash_serving(model,mlx_server,options,provider):
+            with install_vision_serving(model,provider,mlx_server), install_dflash_serving(model,mlx_server,options,provider):
                 with install_mtp_sampling(model,mlx_server,options):
                     yield
         return scope()
