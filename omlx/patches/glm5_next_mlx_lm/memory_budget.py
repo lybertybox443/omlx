@@ -66,5 +66,17 @@ def cache_profile(text, *, speculative=False):
 
 def cache_budget(model_path, options):
     config = json.loads((Path(model_path) / "config.json").read_text())
-    return cache_profile(config.get("text_config", config),
-                         speculative=bool(options.get("dflash_enabled")))
+    text = config.get("text_config", config)
+    native = bool(options.get("mtp_enabled"))
+    profile = cache_profile(text, speculative=bool(native or options.get("dflash_enabled")))
+    if native:
+        heads = text.get("num_nextn_predict_layers", 0)
+        if type(heads) is not int or heads < 1:
+            raise ValueError("native GLM MTP requires a checkpoint head")
+        head_text = dict(text, num_hidden_layers=1, layer_types=["full_attention"])
+        head = cache_profile(head_text, speculative=True)
+        # Persistent head history plus its per-cycle clone; the speculative
+        # profile already accounts for old/new allocations and rollback.
+        profile["replicated_kv_bytes_per_token"] = 2 * heads * head["layer_kv_bytes_per_token"][0]
+        profile["replicated_kv_fixed_bytes"] = 2 * heads * head["layer_kv_fixed_bytes"][0]
+    return profile

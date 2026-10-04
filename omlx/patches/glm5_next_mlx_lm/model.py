@@ -32,6 +32,48 @@ class Model(_Model):
     _omlx_adapter = ADAPTER
     _omlx_dflash_prefill_capture_required = True
 
+    _omlx_mtp_head_prenorm = True
+
+    @property
+    def mtp(self):
+        return getattr(self.language_model, "mtp", None)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache, **kwargs):
+        return self.language_model.mtp_forward(
+            hidden_states, next_token_ids, cache=mtp_cache, **kwargs)
+
+    def mtp_clamp_accept(self, cache, accepted, num_drafts):
+        value = self.language_model.mtp_clamp_accept(cache, accepted, num_drafts)
+        coordinator = getattr(self, "_omlx_mtp_coordinator", None)
+        if coordinator is not None:
+            import mlx.core as mx
+            values = mx.distributed.all_gather(mx.array([value], mx.int32), group=coordinator.group)
+            return int(mx.min(values).item())
+        return value
+
+    def _mtp_row_offsets(self, offsets, size):
+        """Share authoritative attention offsets with recurrent-only stages."""
+        import mlx.core as mx
+        coordinator = getattr(self, "_omlx_mtp_coordinator", None)
+        if coordinator is None:
+            return offsets
+        local = offsets if offsets is not None else [-1] * size
+        gathered = mx.distributed.all_gather(
+            mx.array(local, mx.int32), group=coordinator.group)
+        rows = gathered.reshape(-1, size).tolist()
+        result = []
+        for column in zip(*rows):
+            known = {int(value) for value in column if value >= 0}
+            if len(known) > 1:
+                raise RuntimeError("MTP pipeline cache offsets disagree")
+            if not known:
+                return None
+            result.append(known.pop())
+        return result
+
     @property
     def args(self):
         return self.config

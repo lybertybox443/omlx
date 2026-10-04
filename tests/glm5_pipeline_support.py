@@ -24,13 +24,11 @@ def tiny_config(kind="mixed"):
     return config
 
 
-def write_checkpoint(path):
+def write_checkpoint(path, *, mtp=False):
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from omlx.patches.glm5_next_mlx_lm.adapter import ADAPTER
     from qwen4_pipeline_support import _write_tokenizer
-    ADAPTER.prepare_worker(path, {})
-    import mlx_lm.models.glm5_next as bridge
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     text = asdict(tiny_config())
@@ -43,6 +41,11 @@ def write_checkpoint(path):
     text["eos_token_id"] = [1]
     text["pad_token_id"] = 0
     config = {"model_type": "glm5_next", "text_config": text, "vision_config": {}, "eos_token_id": [1], "pad_token_id": 0}
+    if mtp:
+        text["num_nextn_predict_layers"] = 1
+    (root / "config.json").write_text(json.dumps(config))
+    ADAPTER.prepare_worker(root, {"mtp_enabled": True, "mtp_depth": 2} if mtp else {})
+    import mlx_lm.models.glm5_next as bridge
     mx.random.seed(9)
     model = bridge.Model(bridge.ModelArgs.from_dict(config))
     mx.eval(model.parameters())

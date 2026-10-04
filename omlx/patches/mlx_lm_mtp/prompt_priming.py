@@ -508,7 +508,7 @@ def prefill_scope(model, uids, tokens, cache):
     if state is None or not tokens or len(uids) != len(tokens):
         yield
         return
-    offsets = _row_offsets(cache, len(uids))
+    offsets = _row_offsets(cache, len(uids), host)
     if offsets is None:
         logger.debug("MTP prefill priming discarded: unknown per-row offsets")
         release_uids(model, uids)
@@ -777,19 +777,24 @@ def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
         )
 
 
-def _row_offsets(cache, size):
+def _row_offsets(cache, size, host=None):
     import mlx.core as mx
 
+    offsets = None
     for entry in cache or ():
         for part in (entry, *(getattr(entry, "caches", ()) or ())):
             offset = getattr(part, "offset", None)
             if isinstance(offset, mx.array) and offset.ndim == 1:
                 if offset.size == size:
-                    return offset.tolist()
+                    offsets = offset.tolist()
+                    break
             elif size == 1 and isinstance(offset, int):
-                return [offset]
-    return None
-
+                offsets = [offset]
+                break
+        if offsets is not None:
+            break
+    transport = getattr(host, "_omlx_mtp_row_offsets", None)
+    return transport(offsets, size) if callable(transport) else offsets
 
 def maybe_capture(host, inputs, normed, cache):
     if _suppressed() or not priming_enabled():
@@ -813,7 +818,7 @@ def maybe_capture(host, inputs, normed, cache):
         offsets = (
             prefill["offsets"]
             if prefill is not None
-            else _row_offsets(cache, len(uids))
+            else _row_offsets(cache, len(uids), host)
         )
         if offsets is None:
             logger.debug("MTP priming discarded: unknown batched offsets")
@@ -848,6 +853,12 @@ def maybe_capture(host, inputs, normed, cache):
         if prefill is not None:
             prefill["consumed"] += count
         return
+    if callable(getattr(host, "_omlx_mtp_row_offsets", None)):
+        offsets = _row_offsets(cache, int(inputs.shape[0]), host)
+        if offsets is None or len(offsets) != 1:
+            drop_ctx(host)
+            return
+        cache = [SimpleNamespace(offset=int(offsets[0]))]
     _capture_single(host, inputs, normed, cache)
     if state is not None:
         plan = _find_plan(host)

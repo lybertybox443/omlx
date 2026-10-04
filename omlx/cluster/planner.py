@@ -119,6 +119,8 @@ class ModelLayout:
     layer_kv_bytes_per_token: tuple[int, ...] = ()
     layer_kv_fixed_bytes: tuple[int, ...] = ()
     kv_cache_step: int = 1
+    replicated_kv_bytes_per_token: int = 0
+    replicated_kv_fixed_bytes: int = 0
     # Per-layer bytes every TP member holds whole (not sharded). Empty = none.
     layer_tp_replicated_bytes: tuple[int, ...] = ()
     # Verified expert-axis inventory per layer. All three empty = unverified.
@@ -200,6 +202,9 @@ class ModelLayout:
                 for value in values
             )):
                 raise ValueError("KV layer budgets must match the layer count")
+        for value in (self.replicated_kv_bytes_per_token, self.replicated_kv_fixed_bytes):
+            if type(value) is not int or value < 0:
+                raise ValueError("replicated KV budgets must be non-negative integers")
         if isinstance(self.kv_cache_step, bool) or not isinstance(self.kv_cache_step, int) or self.kv_cache_step < 1:
             raise ValueError("kv_cache_step must be a positive integer")
         if self.fixed_weight_bytes < 0:
@@ -272,6 +277,9 @@ class ModelLayout:
             ),
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
+            **({"replicated_kv_bytes_per_token": self.replicated_kv_bytes_per_token,
+                "replicated_kv_fixed_bytes": self.replicated_kv_fixed_bytes}
+               if self.replicated_kv_bytes_per_token or self.replicated_kv_fixed_bytes else {}),
             **({"layer_tp_replicated_bytes": list(self.layer_tp_replicated_bytes)}
                if self.layer_tp_replicated_bytes else {}),
             **({"layer_kv_tp_replicated_bytes_per_token":
@@ -326,6 +334,8 @@ class ModelLayout:
                 layer_kv_bytes_per_token=tuple(payload.get("layer_kv_bytes_per_token", ())),
                 layer_kv_fixed_bytes=tuple(payload.get("layer_kv_fixed_bytes", ())),
                 kv_cache_step=payload.get("kv_cache_step", 1),
+                replicated_kv_bytes_per_token=payload.get("replicated_kv_bytes_per_token", 0),
+                replicated_kv_fixed_bytes=payload.get("replicated_kv_fixed_bytes", 0),
                 layer_tp_replicated_bytes=tuple(
                     payload.get("layer_tp_replicated_bytes", ())
                 ),
@@ -2244,11 +2254,13 @@ def _kv_bytes_for_stage(
             model, layer_count, tensor_parallel_size, start_layer
         )
         # Fixed bytes stay replicated on every TP member.
-        return per_token * tokens + sum(model.layer_kv_fixed_bytes[start_layer:stop])
+        return (per_token * tokens + sum(model.layer_kv_fixed_bytes[start_layer:stop])
+                + model.replicated_kv_fixed_bytes)
     total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
-    if model.kv_replicated_across_tp:
-        return total
-    return total // max(1, tensor_parallel_size)
+    if not model.kv_replicated_across_tp:
+        total //= max(1, tensor_parallel_size)
+    return (total + model.replicated_kv_bytes_per_token * context_tokens
+            + model.replicated_kv_fixed_bytes)
 
 
 def _kv_bytes_per_token_for_stage(
@@ -2263,19 +2275,19 @@ def _kv_bytes_per_token_for_stage(
         stop = start_layer + layer_count
         full = model.layer_kv_bytes_per_token[start_layer:stop]
         if tensor_parallel_size == 1:
-            return sum(full)
+            return model.replicated_kv_bytes_per_token + sum(full)
         if not model.layer_kv_tp_replicated_bytes_per_token:
             raise PlanningError("per-layer KV budgets require a validated TP cache contract")
         replicas = model.layer_kv_tp_replicated_bytes_per_token[start_layer:stop]
-        return sum(
+        return model.replicated_kv_bytes_per_token + sum(
             r + -(-(f - r) // tensor_parallel_size) for f, r in zip(full, replicas)
         )
     if model.kv_bytes_per_token_per_layer <= 0:
-        return 0
+        return model.replicated_kv_bytes_per_token
     per_token = model.kv_bytes_per_token_per_layer * layer_count
     if model.kv_replicated_across_tp:
-        return per_token
-    return per_token // max(1, tensor_parallel_size)
+        return model.replicated_kv_bytes_per_token + per_token
+    return model.replicated_kv_bytes_per_token + per_token // max(1, tensor_parallel_size)
 
 
 def _max_context_for_stage(
@@ -2302,6 +2314,7 @@ def _max_context_for_stage(
         return 0
     spare = node.usable_bytes - weight_bytes
     spare -= sum(model.layer_kv_fixed_bytes[start_layer:start_layer + layer_count])
+    spare -= model.replicated_kv_fixed_bytes
     tokens = max(0, spare // per_token)
     return tokens // model.kv_cache_step * model.kv_cache_step
 
