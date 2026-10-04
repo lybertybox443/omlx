@@ -709,6 +709,36 @@ class StagingResult:
         }
 
 
+def stage_complete_model(
+    model_path: str | Path, *, node_id: str, source_host: str,
+    destination_host: str, parallel: int = 1,
+) -> StagingResult:
+    """Stage every draft weight and sidecar using the existing transfer contract."""
+    portable = home_relative_model_path(str(model_path))
+    if is_local_host(source_host):
+        inventory = model_staging_inventory(model_path)
+        sizes = {item["name"]: item["size_bytes"] for item in inventory["shards"]}
+        sizes.update(inventory["sidecars"])
+    else:
+        shards, sidecars = remote_model_staging_inventory(source_host, portable)
+        sizes = {item.name: item.size_bytes for item in shards}
+        sizes.update(sidecars)
+    destination = (str(Path(model_path).expanduser()) if is_local_host(destination_host)
+                   else remote_model_dir(destination_host, portable))
+    present = (_local_file_sizes(destination) if is_local_host(destination_host)
+               else remote_file_sizes(destination_host, destination))
+    required = tuple(sorted(sizes))
+    missing = tuple(name for name in required if present.get(name) != sizes[name])
+    total = sum(sizes.values())
+    plan = StagingPlan(node_id, 0, 0, required, missing, total,
+                       sum(sizes[name] for name in missing), total)
+    return stage_files_from_source(
+        plan, model_path=model_path, source_host=source_host,
+        destination_host=destination_host, destination_dir=destination,
+        expected_sizes=sizes, parallel=parallel,
+    )
+
+
 def scp_push(
     *,
     destination_host: str,

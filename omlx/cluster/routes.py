@@ -123,6 +123,7 @@ from .staging import (
     remote_file_sizes,
     remote_model_dir,
     remote_model_staging_inventory,
+    stage_complete_model,
     stage_files_from_source,
     stage_manifest,
 )
@@ -1920,22 +1921,38 @@ def _run_staging_job(
                 progress=progress,
             )
 
+            draft_results = {}
+            staged_drafts = {}
+            if result.ok:
+                for key in ("specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"):
+                    path = deployment.runtime_options.get(key)
+                    if not path or (key != "vlm_mtp_draft_model" and assignment.rank != 0):
+                        continue
+                    if path not in staged_drafts:
+                        staged_drafts[path] = stage_complete_model(
+                            path, node_id=assignment.node_id, source_host=source_host,
+                            destination_host=host.ssh, parallel=parallel,
+                        )
+                    draft_results[key] = staged_drafts[path]
+            ready = result.ok and all(item.ok for item in draft_results.values())
+
             def finish(
                 job: dict[str, Any],
                 *,
                 node_id=assignment.node_id,
-                staging_result=result,
+                staging_result=result, drafts=draft_results, node_ready=ready,
             ) -> None:
                 node = job["nodes"][node_id]
-                node["status"] = "ready" if staging_result.ok else "failed"
+                node["status"] = "ready" if node_ready else "failed"
                 node["result"] = staging_result.to_dict()
-                if not staging_result.ok:
-                    node["error"] = "Failed to copy: " + ", ".join(
-                        staging_result.failed
-                    )
+                node["drafts"] = {key: item.to_dict() for key, item in drafts.items()}
+                failures = list(staging_result.failed)
+                failures.extend(f"{key}/{name}" for key, item in drafts.items() for name in item.failed)
+                if failures:
+                    node["error"] = "Failed to copy: " + ", ".join(failures)
 
             _update_staging_job(job_id, finish)
-            if not result.ok:
+            if not ready:
                 failed_nodes.append(assignment.node_id)
 
         def complete(job: dict[str, Any]) -> None:

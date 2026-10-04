@@ -601,7 +601,7 @@ class ClusterDeployment:
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "path_map": dict(sorted(self.path_map.items())),
-                "runtime_options": dict(sorted(self.runtime_options.items())),
+                "runtime_options": _portable_runtime_options(self.runtime_options),
                 "stage_links": [link.to_dict() for link in self.stage_links],
             },
             sort_keys=True,
@@ -731,6 +731,21 @@ def _validated_runtime_options(value: Any) -> dict[str, Any]:
     return validate_runtime_options(value)
 
 
+_DRAFT_MODEL_PATH_OPTIONS = (
+    "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model",
+)
+
+
+def _portable_runtime_options(options: dict[str, Any]) -> dict[str, Any]:
+    from .staging import home_relative_model_path
+
+    result = dict(options)
+    for name in _DRAFT_MODEL_PATH_OPTIONS:
+        if name in result:
+            result[name] = home_relative_model_path(result[name])
+    return result
+
+
 def decode_worker_runtime_options(encoded: str) -> dict[str, Any]:
     """Model runtime options carried inside the worker contract.
 
@@ -738,9 +753,13 @@ def decode_worker_runtime_options(encoded: str) -> dict[str, Any]:
     then refuses to start rather than guessing.
     """
 
-    return _validated_runtime_options(
+    options = _validated_runtime_options(
         _decode_worker_payload(encoded).get("runtime_options")
     )
+    for name in _DRAFT_MODEL_PATH_OPTIONS:
+        if name in options:
+            options[name] = str(Path(options[name]).expanduser())
+    return options
 
 
 def decode_worker_path_map(encoded: str) -> dict[str, str]:
