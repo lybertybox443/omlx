@@ -15,6 +15,7 @@ import mlx.nn as nn
 from .tensor_strategies import _common_layer_owner, _wrap_sharded_moe
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
+_NEMOTRON_PROJS = ("fc1", "fc2")
 _ARRAYS = ("weight", "scales", "biases", "bias")
 
 
@@ -68,6 +69,40 @@ class LocalExperts(nn.Module):
         elif weighted_sum:
             raise ValueError("scores required when weighted_sum=True")
         return y
+
+
+def _inspect_nemotron(mixer):
+    """Return (num_experts,) for NemotronHMoE or None if not that exact class.
+
+    Raises ValueError on ambiguous/unsupported layouts.
+    Only accepts mlx_lm.models.nemotron_h.NemotronHMoE; all other fc1/fc2
+    layouts remain rejected.
+    """
+    m = type(mixer)
+    if m.__module__ != "mlx_lm.models.nemotron_h" or m.__qualname__ != "NemotronHMoE":
+        return None
+    sw = getattr(mixer, "switch_mlp", None)
+    if sw is None:
+        raise ValueError("unsupported NemotronHMoE layout: missing switch_mlp")
+    for name in _NEMOTRON_PROJS:
+        p = getattr(sw, name, None)
+        if p is None or getattr(p, "weight", None) is None:
+            raise ValueError(f"unsupported NemotronHMoE layout: missing switch_mlp.{name}")
+    experts = sw.fc1.weight.shape[0]
+    if experts < 1:
+        raise ValueError("unsupported NemotronHMoE layout: zero experts")
+    for name in _NEMOTRON_PROJS:
+        p = getattr(sw, name)
+        for a in _ARRAYS:
+            arr = getattr(p, a, None)
+            if arr is None:
+                continue
+            if arr.ndim < 1 or arr.shape[0] != experts:
+                raise ValueError(
+                    f"unsupported NemotronHMoE layout: switch_mlp.{name}.{a} "
+                    f"expert axis {arr.shape[:1]} != {experts}"
+                )
+    return experts
 
 
 def _inspect(mlp, *, _switch_attr=None):
@@ -141,8 +176,21 @@ def inspect_expert_layers(model):
             experts_mod = getattr(layer, "experts", None)
             if experts_mod is not None:
                 num_experts, switch_attr, _ = _inspect(experts_mod)
+        if num_experts is None:
+            # NemotronH: MoE lives at layer.mixer
+            mixer = getattr(layer, "mixer", None)
+            if mixer is not None:
+                ne = _inspect_nemotron(mixer)
+                if ne is not None:
+                    num_experts = ne
+                    switch_attr = "_nemotron"
         if num_experts is not None:
-            target = experts_mod if experts_mod is not None and switch_attr == "switch_glu" else mlp
+            if switch_attr == "_nemotron":
+                target = getattr(layer, "mixer")
+            elif experts_mod is not None and switch_attr == "switch_glu":
+                target = experts_mod
+            else:
+                target = mlp
             plan.append((i, layer, target, num_experts))
     return owner, plan
 
@@ -209,6 +257,33 @@ def shard_expert_layer(layer, mlp, experts, group, *, mx_module):
     """
     size, rank = group.size(), group.rank()
     lo, hi = expert_range(experts, size, rank)
+
+    # NemotronH: mlp IS layer.mixer (a NemotronHMoE); fc1/fc2 expert axis 0.
+    ne = _inspect_nemotron(mlp)
+    if ne is not None:
+        sw = mlp.switch_mlp
+        # hidden width is output dim of fc2: shape (E, hidden, inter)
+        hidden = sw.fc2.weight.shape[-2] if sw.fc2.weight.ndim >= 2 else sw.fc2.weight.shape[-1]
+        for name in _NEMOTRON_PROJS:
+            p = getattr(sw, name)
+            for a in _ARRAYS:
+                arr = getattr(p, a, None)
+                if arr is not None:
+                    setattr(p, a, mx_module.contiguous(arr[lo:hi]))
+                del arr
+        mlp.switch_mlp = LocalExperts(sw, lo, hi, hidden)
+        _se = getattr(mlp, "shared_experts", None)
+        if _se is not None and rank != 0:
+            mlp.shared_experts = _ZeroShared()
+        # Wrap layer.mixer with all_sum reducer.
+        layer.mixer = _wrap_sharded_moe(layer.mixer, group, mx_module)
+        return {
+            "experts": experts,
+            "lo": lo,
+            "hi": hi,
+            "shared_owner": rank == 0 if _se is not None else False,
+        }
+
     # Detect style: mlp is layer.experts for Gemma, layer.mlp for Qwen.
     _, switch_attr, gemma_style = _inspect(mlp)
     sw = getattr(mlp, switch_attr)

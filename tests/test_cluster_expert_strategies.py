@@ -339,6 +339,137 @@ def test_glm5_nonowner_shared_experts_zero(n):
             assert len(nonowner_outputs) >= 1
 
 
+# ---------------------------------------------------------------------------
+# NemotronH EP tests
+# ---------------------------------------------------------------------------
+
+def _make_nemotron_moe(num_experts=4, num_experts_per_tok=2, hidden=16, inter=8):
+    """Build a tiny NemotronHMoE using its native ModelArgs."""
+    try:
+        from mlx_lm.models.nemotron_h import NemotronHMoE, ModelArgs
+    except Exception as exc:
+        pytest.skip(f"mlx_lm.models.nemotron_h not available: {exc}")
+    args = ModelArgs(
+        model_type="nemotron_h",
+        vocab_size=64,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        max_position_embeddings=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        attention_bias=False,
+        mamba_num_heads=2,
+        mamba_head_dim=hidden // 2,
+        mamba_proj_bias=False,
+        ssm_state_size=8,
+        conv_kernel=4,
+        n_groups=1,
+        mlp_bias=False,
+        layer_norm_epsilon=1e-5,
+        use_bias=False,
+        use_conv_bias=True,
+        moe_intermediate_size=inter,
+        moe_shared_expert_intermediate_size=inter,
+        moe_latent_size=hidden // 2,
+        n_group=1,
+        n_routed_experts=num_experts,
+        n_shared_experts=1,
+        topk_group=1,
+        num_experts_per_tok=num_experts_per_tok,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        hybrid_override_pattern=["E"],
+    )
+    return NemotronHMoE(args), args
+
+
+class _MixerLayer(nn.Module):
+    """Minimal layer with .mixer instead of .mlp for NemotronH."""
+
+    def __init__(self, mixer):
+        super().__init__()
+        self.mixer = mixer
+
+
+class _MixerModel(nn.Module):
+    def __init__(self, mixers):
+        super().__init__()
+        self.layers = [_MixerLayer(m) for m in mixers]
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_nemotron_ep_sum_matches_reference(n):
+    """Sum of per-rank EP outputs must equal single-rank native NemotronHMoE forward."""
+    ref, args = _make_nemotron_moe()
+    mx.eval(ref.parameters())
+    x = mx.random.normal((1, 2, args.hidden_size))
+    expected = ref(x)
+    mx.eval(expected)
+
+    total = None
+    for r in range(n):
+        model = _MixerModel([copy.deepcopy(ref)])
+        meta = apply_expert_strategy(model, _group(n, r), mx_module=_FakeMx())
+        assert meta.has_moe
+        lo, hi = expert_range(args.n_routed_experts, n, r)
+        assert (meta.moe_layers[0]["lo"], meta.moe_layers[0]["hi"]) == (lo, hi)
+        y = model.layers[0].mixer(x)
+        total = y if total is None else total + y
+    mx.eval(total)
+    assert mx.allclose(total, expected, atol=1e-4, rtol=1e-4).item(), (
+        f"NemotronH EP sum mismatch n={n}"
+    )
+
+
+def test_nemotron_ep_shared_experts_nonowner_zeroed():
+    """Shared experts on non-owner ranks must be replaced by _ZeroShared."""
+    from omlx.cluster.expert_strategies import _ZeroShared
+
+    ref, args = _make_nemotron_moe()
+    if not hasattr(ref, "shared_experts") or ref.shared_experts is None:
+        pytest.skip("NemotronHMoE has no shared_experts in this build")
+    mx.eval(ref.parameters())
+
+    for r in range(3):
+        model = _MixerModel([copy.deepcopy(ref)])
+        apply_expert_strategy(model, _group(3, r), mx_module=_FakeMx())
+        # Unwrap: layer.mixer is now wrapped; find original mixer inside
+        inner = model.layers[0].mixer
+        # Walk to find shared_experts
+        found = None
+        for _, m in inner.named_modules():
+            if hasattr(m, "shared_experts"):
+                found = m.shared_experts
+                break
+        if r != 0:
+            assert isinstance(found, _ZeroShared), (
+                f"rank {r} shared_experts must be _ZeroShared, got {type(found)}"
+            )
+        else:
+            assert not isinstance(found, _ZeroShared), (
+                f"rank 0 shared_experts must NOT be _ZeroShared"
+            )
+
+
+def test_nemotron_unknown_fc1_fc2_rejected():
+    """A plain nn.Module with switch_mlp.fc1/fc2 (not NemotronHMoE) stays rejected."""
+
+    class _FakeSw(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(4, 8)
+            self.fc2 = nn.Linear(8, 4)
+
+    class _FakeMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.switch_mlp = _FakeSw()
+
+    model = _MixerModel([_FakeMoE()])
+    with pytest.raises(ValueError):
+        apply_expert_strategy(model, _group(2, 0), mx_module=_FakeMx())
+
+
 def test_glm5_alias_inspect_before_mutation():
     """apply_expert_strategy must not silently accept ambiguous shared_experts alias."""
     ref, cfg = _glm5_moe()
