@@ -527,6 +527,7 @@ raise SystemExit(2)
                 "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
+                "moe_expert_offload_enabled",
             )
             if bool(getattr(settings, name, False)) and name not in supported
         ]

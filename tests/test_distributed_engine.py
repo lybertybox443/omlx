@@ -420,6 +420,18 @@ def test_payloads_omit_repetition_context_size_by_default():
     assert "repetition_context_size" not in completion
 
 
+def test_local_moe_expert_offload_is_rejected_by_distributed_engine():
+    engine = DistributedBatchedEngine(
+        _deployment(),
+        model_settings=SimpleNamespace(moe_expert_offload_enabled=True),
+    )
+    with pytest.raises(
+        ValueError,
+        match="distributed inference cannot be combined with moe_expert_offload_enabled",
+    ):
+        engine._validate_model_settings()
+
+
 def test_model_thinking_budget_is_supported_by_distributed_engine():
     engine = DistributedBatchedEngine(
         _deployment(),
