@@ -68,7 +68,8 @@ class NativeTextPipelineMixin(PipelineMixin):
         if self.pipeline_rank != 0:
             h = mx.distributed.send(h, self.pipeline_rank - 1, group=self.pipeline_group)
             if cache and cache[-1] is not None:
-                cache[-1].keys = mx.depends(cache[-1].keys, h)
+                from mlx.utils import tree_map
+                cache[-1].keys = tree_map(lambda a: mx.depends(a, h), cache[-1].keys)
         if self.pipeline_size > 1:
             h = mx.distributed.all_gather(h, group=self.pipeline_group)[:h.shape[0]]
         raw = h
