@@ -4,10 +4,18 @@ from omlx.cluster.model_adapters import PipelineModelAdapter
 
 _LAYER=re.compile(r"(?:^|\.)language_model\.(?:model\.)?layers\.(\d+)(?:\.|$)")
 
+def _convert_muse_turboquant_cache(cache, bits):
+    """Convert a VLM KVCache slot to TurboQuantKVCache; leave all other types unchanged."""
+    from mlx_vlm.models.cache import KVCache as VLMKVCache
+    from omlx.turboquant_kv import TurboQuantKVCache
+    if type(cache) is VLMKVCache:
+        return TurboQuantKVCache(bits=bits)
+    return None
+
 class MuseGlimmerAdapter(PipelineModelAdapter):
     model_type="muse_glimmer"
     media=("text","image")
-    optimizations=("dflash_enabled",)
+    optimizations=("dflash_enabled","turboquant_kv_enabled")
     required_imports=("mlx_vlm","dflash_mlx")
 
     def supports_pipeline(self,config):
@@ -28,23 +36,36 @@ class MuseGlimmerAdapter(PipelineModelAdapter):
 
     def runtime_options(self,config,model_settings):
         from omlx.cluster.dflash import runtime_settings
-        return runtime_settings(model_settings)
+        from omlx.cluster.turboquant import runtime_settings as tq_runtime_settings
+        base=runtime_settings(model_settings)
+        base.update(tq_runtime_settings(model_settings))
+        return base
 
     def serving(self,model,provider,mlx_server,options):
         from contextlib import contextmanager
         from omlx.cluster.dflash import install_dflash_serving
-        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import install_vision_serving
         from omlx.cluster.mtp_coordination import install_mtp_sampling
+        from omlx.cluster.turboquant import install_turboquant_serving
+        from omlx.patches.qwen4_exp_mlx_lm.vision_serving import install_vision_serving
         @contextmanager
         def scope():
-            with install_vision_serving(model,provider,mlx_server), install_dflash_serving(model,mlx_server,options,provider):
-                with install_mtp_sampling(model,mlx_server,options):
-                    yield
+            config=model.config.text_config
+            layer_types=getattr(config,"layer_types",None) or ["full_attention"]*config.num_hidden_layers
+            full_attention=[i for i,t in enumerate(layer_types) if t=="full_attention"]
+            last_full=full_attention[-1] if len(full_attention)>1 else -1
+            with (
+                install_turboquant_serving(model.language_model,mlx_server,options,convert=_convert_muse_turboquant_cache,last_attention_layer=last_full),
+                install_vision_serving(model,provider,mlx_server),
+                install_dflash_serving(model,mlx_server,options,provider),
+                install_mtp_sampling(model,mlx_server,options),
+            ):
+                yield
         return scope()
 
     def prepare_worker(self,model_path,options):
         from types import SimpleNamespace
         from omlx.cluster.dflash import runtime_settings
+        from omlx.cluster.turboquant import runtime_settings as tq_runtime_settings
         expected=set()
         if options.get("dflash_enabled"):
             normalized=runtime_settings(SimpleNamespace(**options))
@@ -55,6 +76,11 @@ class MuseGlimmerAdapter(PipelineModelAdapter):
                 if type(options.get(key)) is not int or options[key]<=0:
                     raise ValueError("DFlash requires an approved memory reservation")
                 expected.add(key)
+        if options.get("turboquant_kv_enabled"):
+            tq_options=tq_runtime_settings(SimpleNamespace(**options))
+            if not tq_options or any(options.get(key)!=value for key,value in tq_options.items()):
+                raise ValueError("Invalid Muse TurboQuant runtime options")
+            expected.update(tq_options)
         if set(options)-expected:
             raise ValueError("Unsupported Muse distributed runtime options")
         if options.get("dflash_enabled"):

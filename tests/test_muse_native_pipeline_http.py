@@ -62,3 +62,29 @@ def test_muse_native_pipeline_http(checkpoint,ranges,tmp_path):
             futures=[pool.submit(run,i) for i in range(2)]
             assert [f.result() for f in futures]==expected
         assert server.chat(prompts[1],max_tokens=12,timeout=90,stream=True)==expected[1]
+
+def test_muse_turboquant_kv_converter():
+    """Unit test for _convert_muse_turboquant_cache: VLM KVCache converts,
+    RotatingKVCache is left unchanged."""
+    from mlx_lm.models.cache import RotatingKVCache
+    from mlx_vlm.models.cache import KVCache as VLMKVCache
+    from omlx.patches.muse_glimmer_mlx_lm.adapter import _convert_muse_turboquant_cache
+    from omlx.turboquant_kv import TurboQuantKVCache
+    assert isinstance(_convert_muse_turboquant_cache(VLMKVCache(),4),TurboQuantKVCache)
+    assert _convert_muse_turboquant_cache(RotatingKVCache(max_size=32),4) is None
+
+def test_muse_turboquant_kv_two_rank_http(checkpoint,tmp_path):
+    """HTTP smoke regression for two sequential requests through the two-rank
+    TurboQuant path (4-bit KV, PP2). Exact token equality with fp is invalid
+    because TurboQuant is lossy; the current harness has no single-rank served
+    reference (served() requires 2+ ranks). Both responses must be non-empty."""
+    from omlx.cluster.planner import inspect_safetensors_layout
+    prompts=["w10 w11","w12 w13 w14 w15 w16 w17 w18 w19 w20 w21"]
+    tq_options={"turboquant_kv_enabled":True,"turboquant_kv_bits":4,"turboquant_skip_last":True}
+    layout=inspect_safetensors_layout(checkpoint)
+    with served(checkpoint,[(2,4),(0,2)],tmp_path,ple_mode=None,prefill_step_size=2,
+                model_layout=layout,extra_runtime_options=tq_options) as server:
+        resp0=_content(server.chat(prompts[0],max_tokens=12,timeout=90))
+        resp1=_content(server.chat(prompts[1],max_tokens=12,timeout=90))
+    assert resp0
+    assert resp1
