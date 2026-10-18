@@ -57,6 +57,11 @@ GLM5_NEXT = TensorStrategy(
     model_types=("glm5_next",),
     source="oMLX adapter for the vendored GLM-5.3 KDA, sparse MLA and MoE layers",
 )
+MUSE_GLIMMER = TensorStrategy(
+    name="muse_glimmer",
+    model_types=("muse_glimmer",),
+    source="oMLX adapter for Muse Glimmer gated-attention VLM text backbone",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -745,6 +750,121 @@ def _shard_glm5_next(
         )
 
 
+@_register(MUSE_GLIMMER)
+def _shard_muse_glimmer(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_linear
+
+    _owner, layers = _common_layer_owner(model)
+    size = int(group.size())
+    total = len(layers)
+
+    # Preflight: validate every layer before any mutation so a shape error is
+    # reported cleanly rather than after partial sharding.
+    for index, layer in enumerate(layers):
+        attn = layer.self_attn
+        prefix = f"layer {index}"
+        _require_divisible(attn.n_heads, size, f"{prefix} attention heads")
+        _require_divisible(attn.n_kv_heads, size, f"{prefix} KV heads")
+
+        head_dim = attn.head_dim
+        expected_q = attn.n_heads * head_dim
+        expected_kv = attn.n_kv_heads * head_dim
+        if int(attn.q_proj.weight.shape[0]) != expected_q:
+            raise ValueError(
+                f"{prefix} q_proj output width {attn.q_proj.weight.shape[0]} "
+                f"!= n_heads*head_dim ({expected_q})"
+            )
+        for proj_name, expected in (
+            ("k_proj", expected_kv),
+            ("v_proj", expected_kv),
+        ):
+            proj = getattr(attn, proj_name)
+            if int(proj.weight.shape[0]) != expected:
+                raise ValueError(
+                    f"{prefix} {proj_name} output width {proj.weight.shape[0]} "
+                    f"!= n_kv_heads*head_dim ({expected})"
+                )
+        # gate_proj output must also align with n_heads*head_dim.
+        if int(attn.gate_proj.weight.shape[0]) != expected_q:
+            raise ValueError(
+                f"{prefix} gate_proj output width {attn.gate_proj.weight.shape[0]} "
+                f"!= n_heads*head_dim ({expected_q})"
+            )
+        # o_proj row-parallel: input width == n_heads*head_dim.
+        if hasattr(attn.o_proj, "scales"):
+            o_proj_in = int(attn.o_proj.scales.shape[-1]) * attn.o_proj.group_size
+        else:
+            o_proj_in = int(attn.o_proj.weight.shape[1])
+        if o_proj_in != expected_q:
+            raise ValueError(
+                f"{prefix} o_proj input width {o_proj_in} "
+                f"!= n_heads*head_dim ({expected_q})"
+            )
+        _require_divisible(expected_q, size, f"{prefix} q/gate output width")
+        _require_divisible(expected_kv, size, f"{prefix} k/v output width")
+        if hasattr(attn.o_proj, "scales"):
+            _require_divisible(
+                int(attn.o_proj.scales.shape[-1]), size, f"{prefix} o_proj quant groups"
+            )
+
+        mlp = layer.mlp
+        gate_out = int(mlp.gate_proj.weight.shape[0])
+        up_out = int(mlp.up_proj.weight.shape[0])
+        if hasattr(mlp.down_proj, "scales"):
+            down_in = int(mlp.down_proj.scales.shape[-1]) * mlp.down_proj.group_size
+        else:
+            down_in = int(mlp.down_proj.weight.shape[1])
+        if gate_out != up_out:
+            raise ValueError(
+                f"{prefix} mlp gate_proj output ({gate_out}) != up_proj output ({up_out})"
+            )
+        if up_out != down_in:
+            raise ValueError(
+                f"{prefix} mlp up_proj output ({up_out}) != down_proj input ({down_in})"
+            )
+        _require_divisible(gate_out, size, f"{prefix} mlp intermediate width")
+        # For quantized down_proj (row-parallel), check that the quant-group
+        # count on the intermediate axis divides the world size.
+        if hasattr(mlp.down_proj, "scales"):
+            down_groups = int(mlp.down_proj.scales.shape[-1])
+            _require_divisible(
+                down_groups, size, f"{prefix} mlp down_proj quant groups"
+            )
+
+    for index, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+
+        attn = layer.self_attn
+        # q/k/v/gate_proj are column-parallel; o_proj is row-parallel.
+        attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+        attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+        attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+        attn.gate_proj = shard_linear(attn.gate_proj, "all-to-sharded", group=group)
+        attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+        attn.n_heads //= size
+        attn.n_kv_heads //= size
+
+        mlp = layer.mlp
+        mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
+        mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+        mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
+
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=MUSE_GLIMMER.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
@@ -771,6 +891,7 @@ def apply_tensor_strategy(
 
 __all__ = [
     "GLM5_NEXT",
+    "MUSE_GLIMMER",
     "NEMOTRON_H",
     "QWEN3_NEXT",
     "TensorStrategy",

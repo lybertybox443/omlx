@@ -6,6 +6,9 @@ intermediate). An even ``mx.split`` cannot divide 29 across two ranks, so the
 strategy slices explicit, possibly-unequal, group ranges. These tests pin the
 range arithmetic and the numeric equivalence of the split against an unsharded
 forward.
+
+Also covers the Muse Glimmer gated-attention adapter: column sharding for
+q/k/v/gate and MLP gate/up, row sharding for o/down, and per-rank head counts.
 """
 
 from __future__ import annotations
@@ -118,3 +121,190 @@ def test_uneven_switch_mlp_shard_shapes():
     assert rank1.fc2.weight.shape[-1] == 112
     # No dropped groups.
     assert rank0.fc2.scales.shape[-1] + rank1.fc2.scales.shape[-1] == 29
+
+
+# ---------------------------------------------------------------------------
+# Muse Glimmer TP tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeGroup:
+    def __init__(self, size, rank):
+        self._s, self._r = size, rank
+
+    def size(self):
+        return self._s
+
+    def rank(self):
+        return self._r
+
+
+def _patch_collectives(monkeypatch):
+    import mlx.nn.layers.distributed as d
+
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, *a, **k: x)
+    monkeypatch.setattr(d, "sum_gradients", lambda group: (lambda x: x))
+
+
+def _muse_layers(
+    hidden_size=16,
+    intermediate_size=32,
+    head_dim=4,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+):
+    from mlx_vlm.models.muse_glimmer.config import TextConfig
+    from mlx_vlm.models.muse_glimmer.language import LanguageModel
+
+    args = TextConfig(
+        vocab_size=64,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=2,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        max_position_embeddings=128,
+        sliding_window=8,
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[10000.0, 0],
+    )
+    model = LanguageModel(args)
+    model.model_type = "muse_glimmer"
+    return model, list(model.model.layers)
+
+
+def test_muse_glimmer_registered():
+    from omlx.cluster import tensor_strategies as ts
+
+    assert "muse_glimmer" in ts.registered_model_types()
+    assert ts.supports_model_type("muse_glimmer")
+
+
+def test_muse_glimmer_attention_tp2_sum_equals_native(monkeypatch):
+    """Sum of TP-2 attention outputs equals native output (sliding and full layers)."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    mx.random.seed(2)
+    model_r0, layers_r0 = _muse_layers()
+    model_r1 = copy.deepcopy(model_r0)
+
+    x = mx.random.normal((1, 3, 16))
+    native_outs = [layer.self_attn(x) for layer in layers_r0]
+    for out in native_outs:
+        mx.eval(out)
+
+    ts._shard_muse_glimmer(model_r0, _FakeGroup(2, 0), mx, None)
+    ts._shard_muse_glimmer(model_r1, _FakeGroup(2, 1), mx, None)
+
+    for i, (l0, l1, native_out) in enumerate(
+        zip(model_r0.model.layers, model_r1.model.layers, native_outs)
+    ):
+        combined = l0.self_attn(x) + l1.self_attn(x)
+        mx.eval(combined)
+        err = mx.abs(combined - native_out).max().item()
+        ref = max(mx.abs(native_out).max().item(), 1.0)
+        assert (
+            err < 1e-4 * ref
+        ), f"layer {i}: TP2 attention sum diverged: {err} vs {ref}"
+
+
+def test_muse_glimmer_mlp_tp2_sum_equals_native(monkeypatch):
+    """Sum of TP-2 MLP outputs equals native MLP output."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    mx.random.seed(3)
+    model_r0, layers_r0 = _muse_layers()
+    model_r1 = copy.deepcopy(model_r0)
+
+    x = mx.random.normal((1, 3, 16))
+    native_outs = [layer.mlp(x) for layer in layers_r0]
+    for out in native_outs:
+        mx.eval(out)
+
+    ts._shard_muse_glimmer(model_r0, _FakeGroup(2, 0), mx, None)
+    ts._shard_muse_glimmer(model_r1, _FakeGroup(2, 1), mx, None)
+
+    for i, (l0, l1, native_out) in enumerate(
+        zip(model_r0.model.layers, model_r1.model.layers, native_outs)
+    ):
+        combined = l0.mlp(x) + l1.mlp(x)
+        mx.eval(combined)
+        err = mx.abs(combined - native_out).max().item()
+        ref = max(mx.abs(native_out).max().item(), 1.0)
+        assert err < 1e-4 * ref, f"layer {i}: TP2 MLP sum diverged: {err} vs {ref}"
+
+
+def test_muse_glimmer_late_bad_layer_refuses_before_mutation(monkeypatch):
+    """preflight rejects an invalid layer before any earlier layer is mutated."""
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    model, layers = _muse_layers()
+
+    # corrupt layer 1 q_proj to be indivisible by 2 (15 rows, expected 16)
+    layers[1].self_attn.q_proj.weight = mx.zeros((15, 16))
+
+    before_q0_rows = layers[0].self_attn.q_proj.weight.shape[0]
+    before_n_heads = layers[0].self_attn.n_heads
+    with pytest.raises((ValueError, RuntimeError)):
+        ts._shard_muse_glimmer(model, _FakeGroup(2, 0), mx, None)
+
+    assert layers[0].self_attn.q_proj.weight.shape[0] == before_q0_rows
+    assert layers[0].self_attn.n_heads == before_n_heads
+
+
+def test_muse_glimmer_quant_bits4_group32_tp2(monkeypatch):
+    """TP-2 on quantized (bits=4, group_size=32): attention and MLP rank sums equal native."""
+    import mlx.nn as nn
+
+    from omlx.cluster import tensor_strategies as ts
+
+    _patch_collectives(monkeypatch)
+    mx.random.seed(4)
+    model_r0, layers_r0 = _muse_layers(
+        hidden_size=64,
+        intermediate_size=64,
+        head_dim=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    nn.quantize(model_r0, group_size=32, bits=4)
+    mx.eval(model_r0.parameters())
+    model_r1 = copy.deepcopy(model_r0)
+    layers_r0 = list(model_r0.model.layers)
+
+    x = mx.random.normal((1, 3, 64))
+    native_attn_outs = [layer.self_attn(x) for layer in layers_r0]
+    native_mlp_outs = [layer.mlp(x) for layer in layers_r0]
+    for out in native_attn_outs + native_mlp_outs:
+        mx.eval(out)
+
+    ts._shard_muse_glimmer(model_r0, _FakeGroup(2, 0), mx, None)
+    ts._shard_muse_glimmer(model_r1, _FakeGroup(2, 1), mx, None)
+
+    for i, (l0, l1, nat_attn, nat_mlp) in enumerate(
+        zip(
+            model_r0.model.layers,
+            model_r1.model.layers,
+            native_attn_outs,
+            native_mlp_outs,
+        )
+    ):
+        combined_attn = l0.self_attn(x) + l1.self_attn(x)
+        mx.eval(combined_attn)
+        err = mx.abs(combined_attn - nat_attn).max().item()
+        ref = max(mx.abs(nat_attn).max().item(), 1.0)
+        assert (
+            err < 1e-3 * ref
+        ), f"layer {i}: quant TP2 attention sum diverged: {err} vs {ref}"
+
+        combined_mlp = l0.mlp(x) + l1.mlp(x)
+        mx.eval(combined_mlp)
+        errm = mx.abs(combined_mlp - nat_mlp).max().item()
+        refm = max(mx.abs(nat_mlp).max().item(), 1.0)
+        assert (
+            errm < 1e-3 * refm
+        ), f"layer {i}: quant TP2 MLP sum diverged: {errm} vs {refm}"

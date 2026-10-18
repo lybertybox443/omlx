@@ -820,6 +820,20 @@ def test_nemotron_h_head_dim_falls_back_to_hidden_over_heads():
     assert 64 in divisors  # (32 * 128) / 64 via the fallback head_dim
 
 
+def test_muse_glimmer_supports_tensor_parallel_and_divisors():
+    from omlx.cluster.planner import (
+        _supports_tensor_parallel,
+        _tensor_parallel_divisors,
+    )
+
+    config = {
+        "model_type": "muse_glimmer",
+        "text_config": {"num_attention_heads": 4, "num_key_value_heads": 2},
+    }
+    assert _supports_tensor_parallel(config) is True
+    assert _tensor_parallel_divisors(config) == (4, 2)
+
+
 def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
     # The text backbone declares a pipeline() in mlx-lm source, but the on-disk
     # checkpoint carries a vision sub-config, so it is served by mlx-vlm and has
